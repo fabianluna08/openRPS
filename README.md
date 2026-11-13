@@ -92,7 +92,15 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install .            # o, para desarrollo: pip install -e .
 ```
 
-Esto instala la librería (`import open_rps`) y el comando `open-rps`. Probado con Python 3.14 y numpy 2.4; no se ha verificado con versiones anteriores.
+Para instalarlo directamente desde GitHub, sin clonar el repositorio:
+
+```bash
+pip install git+https://github.com/fabianluna08/openRPS.git
+# con las dependencias del cuaderno de prácticas (matplotlib y Jupyter):
+pip install "open-rps[notebook] @ git+https://github.com/fabianluna08/openRPS.git"
+```
+
+Cualquiera de las opciones instala la librería (`import open_rps`) y el comando `open-rps`. Probado con Python 3.14 y numpy 2.4; no se ha verificado con versiones anteriores.
 
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
