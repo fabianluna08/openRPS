@@ -104,6 +104,67 @@ result.export_csv("con_sinr.csv")                                 # incluye las 
 
 ---
 
+### D. Muros que obstruyen (nuevo en 1.3.0)
+
+Hasta la versión 1.2.0 un muro solo *añadía* un rayo reflejado: el rayo directo, el de suelo y los de otros muros lo atravesaban sin pérdida. Desde 1.3.0 cada muro puede, además, **atenuar o bloquear** los rayos que lo cruzan. Es opcional y se activa muro a muro:
+
+```python
+PlanarReflector(p0=[500, 0, 0], normal=[1, 0, 0], reflectivity=0.5, transmission_loss_db=12.0)
+```
+
+| `transmission_loss_db` | Efecto sobre un rayo que cruza el muro |
+|---|---|
+| `None` (por defecto) | Ninguno: el muro no obstruye (comportamiento de 1.2.0, resultados idénticos bit a bit). |
+| $L > 0$ (finito) | Pérdida de penetración: la potencia del rayo baja $L$ dB por cada cruce (amplitud $\times 10^{-L/20}$). |
+| `float("inf")` | Muro opaco: el rayo llega con potencia 0. |
+
+`0` equivale a `None`; un valor negativo o `NaN` lanza `ValueError`.
+
+**Qué se comprueba.** Cada tramo recto de cada rayo contra cada muro con `transmission_loss_db`: el rayo directo (Tx→Rx), el de suelo (Tx→punto de rebote y punto de rebote→Rx) y cada rayo reflejado en un muro (Tx→punto de reflexión y punto de reflexión→Rx). Se respeta `bounds` (parche finito; sin `bounds`, el plano entero). Las pérdidas de todos los muros cruzados **se suman en dB** (dos muros de 7 y 5 dB quitan 12 dB; un rayo reflejado que atraviesa un muro a la ida y a la vuelta lo paga dos veces). Un muro **nunca obstruye su propia reflexión**, pero sí es atravesado por los rayos directo, de suelo y reflejados en otros muros.
+
+**Convenciones en los casos límite** (las mismas en las dos implementaciones):
+
+* El tramo es un segmento *abierto*: cruza el muro solo si sus dos extremos quedan estrictamente a lados opuestos del plano, a más de 1 µm de él (`OBSTRUCTION_TOL_M`). Una antena o un píxel situados exactamente sobre el plano de un muro no quedan tapados por ese muro (ven ambos lados; sí los tapan los demás). Un rayo paralelo al muro, o contenido en su plano, no lo cruza.
+* El parche es *cerrado*: un cruce justo por el borde de `bounds` cuenta (mismo margen de 1 nm que el punto de reflexión). Un rayo que pasa exactamente por la arista común de dos muros cruza los dos.
+* Si un rayo rebota exactamente sobre el plano de *otro* muro (al pie de un muro, o en la esquina de un edificio), ese muro cuenta como cruzado una vez cuando queda *entre* los dos tramos del rayo (Tx y Rx a lados opuestos de su plano, y el muro del lado hacia el que se abre el ángulo del rayo): el rayo no se "cuela" por la arista hacia el interior de un edificio ni por debajo de un muro apoyado en el suelo, pero sí puede rozar por fuera el extremo de un muro.
+
+**Qué pasa con un rayo bloqueado.** La obstrucción nunca cambia *qué* rayos existen, solo su amplitud: un rayo tapado por un muro opaco sigue en la lista (`cir.rays`, `RayField.valid`) con su retardo y sus ángulos, pero con amplitud 0. Cada rayo informa de lo que perdió en `MultipathRay.obstruction_loss_db` / `RayField.obstruction_loss_db` (0 = camino despejado, `inf` = bloqueado). Los rayos de potencia 0 no cuentan para la potencia total ni para la dispersión de retardo o angular. Si **todos** los rayos de un transmisor están bloqueados en un píxel, su potencia es `-inf` dBm y su pérdida `NaN`, y no puede ser el mejor servidor; si ningún transmisor llega, el píxel queda sin servidor (`best_server_id = -1`, potencia `-inf`, dispersión y SINR `NaN`) y los mapas lo dibujan como "sin datos". Un interferente bloqueado aporta 0 mW al SINR.
+
+**Suma coherente.** Con `coherent=True` la obstrucción solo escala la amplitud de cada rayo; **no añade fase** (el muro no tiene espesor ni retardo propio).
+
+**Un edificio** son cuatro muros finitos (más un quinto horizontal si se quiere techo):
+
+```python
+from open_rps import PropagationSimulator, Transmitter, PlanarReflector
+
+def edificio(x0, x1, y0, y1, altura, perdida_db=float("inf"), reflectividad=0.5):
+    """Las cuatro fachadas de un edificio rectangular, cada una un muro finito."""
+    caras = [([x0, y0, 0], [1, 0, 0], (x0, x0, y0, y1, 0, altura)),    # oeste
+             ([x1, y0, 0], [1, 0, 0], (x1, x1, y0, y1, 0, altura)),    # este
+             ([x0, y0, 0], [0, 1, 0], (x0, x1, y0, y0, 0, altura)),    # sur
+             ([x0, y1, 0], [0, 1, 0], (x0, x1, y1, y1, 0, altura))]    # norte
+    return [PlanarReflector(p0=p0, normal=n, bounds=b, reflectivity=reflectividad,
+                            transmission_loss_db=perdida_db) for p0, n, b in caras]
+
+sim = PropagationSimulator()
+sim.add_transmitter(Transmitter(tx_id=0, x=200, y=500, z=25, frequency_hz=2.4e9))
+for muro in edificio(450, 550, 400, 600, altura=40):        # opaco: sombra detrás del edificio
+    sim.add_reflector(muro)
+res = sim.run_raytracing_simulation((0, 1000), (0, 1000), resolution_m=5.0)
+
+cir = sim.ray_tracer.trace_paths(sim.transmitters[0], (800.0, 500.0, 1.5))    # receptor detrás del edificio
+print([r.obstruction_loss_db for r in cir.rays], cir.total_received_power_dbm())   # [inf, inf, inf, inf] -inf
+print(sim.ray_tracer.obstruction_loss_db([200, 500, 25], [800, 500, 1.5]))         # inf: no hay línea de vista
+```
+
+`PlanarReflector.crosses(p_inicio, p_fin)` dice si un segmento cruza un muro (geometría pura) y `RayTracer.obstruction_loss_db(p_inicio, p_fin)` suma las pérdidas de todos los muros que cruza un segmento (0 = hay línea de vista). Si el edificio es más bajo que la antena, la sombra tiene longitud finita (el rayo pasa por encima) y, como no hay techo, parte del interior queda iluminada desde arriba: añade un muro horizontal (`normal=[0, 0, 1]`, `bounds=(x0, x1, y0, y1, altura, altura)`) para cerrarlo.
+
+**Lo que no hace** (ver *Limitaciones físicas*): no hay **difracción** en las aristas, así que el borde de la sombra es un salto brusco y, tras un obstáculo opaco, puede no llegar nada; la pérdida es un número fijo por muro (no depende del ángulo, la frecuencia ni el espesor) e independiente de `reflectivity`/`eps_r`; y solo actúa en el modo de ray tracing: los modelos empíricos (FSPL, Two-Ray, Hata…) ignoran los muros.
+
+**Coste.** Sin ningún muro con `transmission_loss_db` no se ejecuta nada nuevo. Con ellos, la ruta vectorizada sigue siendo numpy puro (sin bucles por píxel); en una grilla de 201 × 201 con 2 transmisores y 6 muros, activar la obstrucción en los 6 alarga la simulación en torno a un 30–40 % (medido con Python 3.14 y numpy 2.4).
+
+---
+
 ## 2. Estructura del Proyecto
 
 ```
@@ -115,13 +176,13 @@ open_rps/
 │   ├── __init__.py       # Exportaciones del paquete y __version__
 │   ├── models.py         # Modelos analíticos (FSPL, Two-Ray, Log-Distance, Hata, COST-231 Hata)
 │   ├── multipath.py      # MultipathRay y ChannelImpulseResponse (CIR, Delay/Angular Spread)
-│   ├── raytracer.py      # Motor 3D de trazado de rayos (directo, tierra y muros)
+│   ├── raytracer.py      # Motor 3D de trazado de rayos (directo, tierra y muros; obstrucción opcional)
 │   ├── simulation.py     # Orquestador de grillas 2D (Coverage Maps, Best Server, CSV/JSON)
 │   ├── visualizer.py     # Mapas ASCII para terminal y SVG vectoriales
 │   └── cli.py            # Interfaz de línea de comandos
 ├── examples/
 │   ├── example_sim.py           # Demostración con 2 transmisores y reflector
-│   └── practicas_openrps.ipynb  # Cuaderno con 4 prácticas para alumnos
+│   └── practicas_openrps.ipynb  # Cuaderno con 5 prácticas para alumnos
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -150,8 +211,8 @@ Cualquiera de las opciones instala la librería (`import open_rps`) y el comando
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.2.0-py3-none-any.whl
-pip install dist/open_rps-1.2.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.3.0-py3-none-any.whl
+pip install dist/open_rps-1.3.0-py3-none-any.whl
 ```
 
 ---
@@ -193,6 +254,10 @@ open-rps --mode raytracing --sector --downtilt 4 --sinr --outdir out_sector
 open-rps --mode hata --freq 900e6 --tx-height 30 --size 5000 --res 100 --shadow-sigma 8 --seed 1 --sinr
 open-rps --mode hata --strict        # termina con error (código 1) e indica qué está fuera del rango de COST-231 Hata
 
+# Novedades 1.3.0: muros que obstruyen (pérdida de penetración en dB, o "inf" para un muro opaco)
+open-rps --mode raytracing --wall-loss 15 --outdir out_muro_15dB
+open-rps --mode raytracing --building --wall-loss inf --res 10 --outdir out_edificio   # edificio opaco: sombra
+
 # Ayuda:
 open-rps --help          # o: python3 -m open_rps.cli --help
 ```
@@ -205,7 +270,9 @@ open-rps --help          # o: python3 -m open_rps.cli --help
 | `--freq` | Hz | `2.4e9` | Frecuencia portadora. |
 | `--power` | dBm | `43` | Potencia de Tx0 (Tx1 emite 3 dB menos). |
 | `--tx-height` | metros | `25` | Altura de las dos estaciones base. |
-| `--reflector` | `on`, `off` | `on` | Muro reflector en x = size/2 (solo afecta a `raytracing`). |
+| `--reflector` | `on`, `off` | `on` | Muro reflector en x = size/2, o el edificio de `--building` (solo afecta a `raytracing`). |
+| `--wall-loss` | dB, o `inf` | sin obstrucción | Pérdida de penetración de los muros de demostración: cada rayo que cruza un muro pierde esos dB; `inf` = muros opacos. Si se omite, los muros solo reflejan y no tapan nada (como en 1.2.0). Solo afecta a `raytracing`. |
+| `--building` | (sin valor) | desactivado | Sustituye el muro infinito por un edificio rectangular de 4 muros finitos (x de 0.45 a 0.60 × size, y de 0.35 a 0.50 × size, el doble de alto que las estaciones). Con `--wall-loss inf` proyecta sombra; sin `--wall-loss` solo refleja. |
 | `--coherent` | (sin valor) | desactivado | Suma coherente de los rayos: desvanecimiento rápido (solo afecta a `raytracing`). |
 | `--sector` | (sin valor) | desactivado | Antenas sectoriales 3GPP de 65° apuntando al centro del área (Tx0 a 45°, Tx1 a −135°) en lugar de isotrópicas. |
 | `--downtilt` | grados | `0` | Inclinación hacia abajo de las antenas sectoriales (solo con `--sector`). |
@@ -222,6 +289,8 @@ open-rps --help          # o: python3 -m open_rps.cli --help
 El CLI escribe en `--outdir` los mismos nombres de archivo que el script de demostración: `simulation_results.csv`, `simulation_summary.json`, `coverage_rx_power.svg`, `coverage_best_server.svg`, solo en modo `raytracing` `coverage_delay_spread.svg` y, solo con `--sinr`, `coverage_sinr.svg`. Cada ejecución sobrescribe la anterior: usa un `--outdir` distinto por escenario si quieres conservarlas. En los modos empíricos las columnas de dispersión de retardo y angular del CSV valen `nan` (y `null` en el JSON), porque esos modelos no describen el multitrayecto.
 
 Con los valores por defecto (2.4 GHz, antenas a 25 m, área de 1 km) el modo `hata` queda fuera del rango de validez de ambos modelos de Hata; el CLI lo indica con una línea `[!] Warning: ...`.
+
+Con `--wall-loss` o `--building` el CLI añade una línea `[*] Walls: ...` que describe el escenario. Con `--building --wall-loss inf` los píxeles del interior del edificio no reciben ningún rayo: aparecen como "sin datos" en los SVG, con `best_tx_id = -1` y potencia `-inf` en el CSV (en el mapa ASCII son un hueco en blanco). Con el muro infinito y `--wall-loss inf` cada estación solo cubre su lado del muro.
 
 ### C. Uso como librería de Python:
 ```python
@@ -248,20 +317,20 @@ print(len(cir.rays), cir.rms_delay_spread(), cir.angular_spread(plane="phi", sta
 print(cir.mean_excess_delay(), cir.mean_excess_delay(relative_to_first=True))   # absoluto / en exceso
 ```
 
-Las opciones nuevas de la versión 1.2.0 (`coherent`, antenas `pattern="sector"`, `min_distance_m`, `shadow_fading_sigma_db`/`seed`, `compute_sinr`) se describen, con ejemplos, en la sección 1.C.
+Las opciones nuevas de la versión 1.2.0 (`coherent`, antenas `pattern="sector"`, `min_distance_m`, `shadow_fading_sigma_db`/`seed`, `compute_sinr`) se describen, con ejemplos, en la sección 1.C, y los muros que obstruyen (`transmission_loss_db`, nuevo en 1.3.0), en la sección 1.D.
 
 Notas sobre `SimulationResult`:
 
 * El primer eje de `rx_power_dbm` y `path_loss_db` sigue el **orden en que se añadieron** los transmisores, no su `tx_id`. `tx_ids` da el identificador de cada posición y `best_server_index` la posición del mejor servidor por píxel (`best_server_id` contiene los `tx_id`; `-1` = sin servidor).
 * `path_loss_db` es $P_t - P_r$, es decir, incluye la ganancia de antena del transmisor (y su diagrama, si es sectorial) y la sombra.
-* Valores sin dato: `-inf` dBm significa que no llega potencia; `NaN`, que el valor no es fiable o no existe (píxel a menos de `min_distance_m` de la antena, métrica que el modelo no proporciona, píxel sin servidor).
+* Valores sin dato: `-inf` dBm significa que no llega potencia (p. ej. todos los rayos de ese transmisor están bloqueados por muros opacos); `NaN`, que el valor no es fiable o no existe (píxel a menos de `min_distance_m` de la antena, métrica que el modelo no proporciona, píxel sin servidor).
 * `tx_frequencies_hz` guarda la frecuencia de cada transmisor (la usa el SINR); `sinr_db`, `interference_plus_noise_dbm` y `sinr_settings` valen `None` hasta que se llama a `compute_sinr()`.
-* `PlanarReflector` acepta `bounds=(xmin, xmax, ymin, ymax, zmin, zmax)` para limitar el parche reflectante (sin `bounds` el plano es infinito) y, opcionalmente, `eps_r`/`sigma` para usar el coeficiente de Fresnel dependiente del ángulo en lugar de `reflectivity`.
+* `PlanarReflector` acepta `bounds=(xmin, xmax, ymin, ymax, zmin, zmax)` para limitar el parche reflectante (sin `bounds` el plano es infinito), opcionalmente `eps_r`/`sigma` para usar el coeficiente de Fresnel dependiente del ángulo en lugar de `reflectivity`, y `transmission_loss_db` para que el muro atenúe o bloquee los rayos que lo cruzan (sección 1.D; por defecto no obstruye).
 * `run_raytracing_simulation` evalúa toda la grilla con numpy. `vectorized=False` ejecuta la implementación de referencia punto a punto (mismos resultados, decenas de veces más lenta).
 
 ### D. Cuaderno de prácticas (Jupyter)
 
-`examples/practicas_openrps.ipynb` contiene cuatro prácticas guiadas, con preguntas y ejercicios "Tu turno": (1) pérdida de trayecto vs. distancia entre modelos, (2) cobertura multi-celda y efecto de un muro reflector, (3) respuesta al impulso del canal, dispersión de retardo y angular, (4) suma coherente (desvanecimiento rápido y comparación con Two-Ray) y mapa de SINR con antenas sectoriales frente a isotrópicas. Necesita matplotlib y Jupyter, que se instalan con el extra `notebook`:
+`examples/practicas_openrps.ipynb` contiene cinco prácticas guiadas, con preguntas y ejercicios "Tu turno": (1) pérdida de trayecto vs. distancia entre modelos, (2) cobertura multi-celda y efecto de un muro reflector, (3) respuesta al impulso del canal, dispersión de retardo y angular, (4) suma coherente (desvanecimiento rápido y comparación con Two-Ray) y mapa de SINR con antenas sectoriales frente a isotrópicas, (5) obstrucción: sombra de un edificio opaco y pérdida de penetración. Necesita matplotlib y Jupyter, que se instalan con el extra `notebook`:
 
 ```bash
 pip install -e ".[notebook]"
@@ -278,7 +347,14 @@ Los tests usan `unittest` de la librería estándar (no hace falta pytest). Con 
 python3 -m unittest discover -s tests
 ```
 
-Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del modelo Two-Ray, la dispersión de retardo y angular (incluido el cruce por ±180°), la geometría de los rayos de suelo y de muro, la equivalencia entre el trazado vectorizado y el de referencia punto a punto, simulaciones completas, las exportaciones CSV/JSON/SVG (con `tx_id` no consecutivos y mapas sin datos) y el CLI. `tests/test_v1_2.py` cubre lo añadido en 1.2.0: regresión numérica frente a 1.1.0 con los valores por defecto, `relative_to_first`, el umbral de campo lejano, `strict`, la suma coherente (incluida su igualdad con Two-Ray), la sombra log-normal (reproducibilidad y estadística), el diagrama sectorial, el SINR con valores calculados a mano, la paleta Okabe-Ito y la fusión de celdas de los SVG.
+Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del modelo Two-Ray, la dispersión de retardo y angular (incluido el cruce por ±180°), la geometría de los rayos de suelo y de muro, la equivalencia entre el trazado vectorizado y el de referencia punto a punto, simulaciones completas, las exportaciones CSV/JSON/SVG (con `tx_id` no consecutivos y mapas sin datos) y el CLI. `tests/test_v1_2.py` cubre lo añadido en 1.2.0: regresión numérica frente a 1.1.0 con los valores por defecto, `relative_to_first`, el umbral de campo lejano, `strict`, la suma coherente (incluida su igualdad con Two-Ray), la sombra log-normal (reproducibilidad y estadística), el diagrama sectorial, el SINR con valores calculados a mano, la paleta Okabe-Ito y la fusión de celdas de los SVG. `tests/test_v1_3.py` cubre la obstrucción de 1.3.0: la geometría del cruce segmento–muro (con y sin `bounds`, bordes y tolerancias), muro opaco, pérdida finita exacta, suma de pérdidas en dB, que un muro no se obstruye a sí mismo, casos límite (Tx/Rx sobre el plano, rayos paralelos, rebote justo al pie de un muro o en la esquina de un edificio), la equivalencia vectorizado/punto a punto con muros oblicuos y finitos, la sombra de un edificio de cuatro muros frente a un cálculo geométrico independiente, los mapas y exportaciones con píxeles sin datos, el CLI y la regresión frente a 1.2.0 (valores de referencia calculados con 1.2.0 e igualdad bit a bit cuando no hay obstrucción).
+
+Para repetir la comparación bit a bit contra una copia real de la versión 1.2.0 (el test se omite si la variable no está definida):
+
+```bash
+git worktree add /tmp/openrps-1.2.0 396030c        # commit de la versión 1.2.0 (búscalo con `git log --oneline`)
+OPEN_RPS_REFERENCE_SRC=/tmp/openrps-1.2.0/src python3 -m unittest tests.test_v1_3.RegressionAgainst120Tests
+```
 
 ---
 
@@ -288,8 +364,13 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 
 * **Sin validación experimental.** Los modelos están comprobados contra sus fórmulas, casos calculados a mano y entre sí (p. ej. ray tracing coherente frente a Two-Ray), no contra mediciones ni contra el RPS original u otra herramienta de referencia.
 * **Suma incoherente por defecto; la coherente es idealizada.** Por defecto el trazador suma $|a_k|^2$ rayo a rayo: da la potencia media local, sin interferencia ni desvanecimiento rápido, y por eso difiere de `TwoRayGroundReflection`. Con `coherent=True` aparecen los desvanecimientos (y la igualdad con Two-Ray), pero la posición exacta de cada nulo depende de fases calculadas sobre una geometría perfecta (suelo y muros lisos, posiciones exactas al milímetro, una sola frecuencia): sirve para ver el fenómeno y su estadística, no para predecir dónde habrá un nulo en un entorno real. Además el patrón varía en distancias del orden de λ, así que una grilla de metros solo lo muestrea (los mapas coherentes parecen "ruidosos" por ese motivo).
-* **Solo reflexiones especulares de un rebote.** Rayo directo, un rebote en el suelo y un rebote por muro. No hay rebotes múltiples (ni muro–suelo), difracción en aristas, dispersión difusa ni transmisión a través de obstáculos.
-* **Los muros no obstruyen.** Un reflector añade un rayo reflejado pero no bloquea ni atenúa el rayo directo, el de suelo ni los de otros muros: siempre hay línea de vista. No existen edificios como volúmenes ni zonas de sombra geométrica.
+* **Solo reflexiones especulares de un rebote.** Rayo directo, un rebote en el suelo y un rebote por muro. No hay rebotes múltiples (ni muro–suelo, ni muro–muro), difracción en aristas ni dispersión difusa.
+* **Los muros solo obstruyen si se pide, y sin difracción.** Por defecto un reflector añade un rayo reflejado pero no bloquea ni atenúa ningún otro: siempre hay línea de vista (comportamiento de 1.2.0). Con `transmission_loss_db` (sección 1.D) los rayos que cruzan el muro se atenúan o se bloquean y aparecen zonas de sombra geométrica, pero con estas simplificaciones:
+  * *No hay difracción en las aristas.* El borde de la sombra es un salto brusco de un píxel al siguiente, y detrás de un obstáculo opaco solo llegan los rayos reflejados que lo rodeen: a menudo ninguno (`-inf` dBm, píxel "sin datos"). En la realidad la difracción rellena la sombra con una transición suave (pérdidas del orden de 6 dB en el borde geométrico y de 10–30 dB dentro de ella, según el modelo de filo de cuchillo), de modo que la simulación es **pesimista dentro de la sombra** y demasiado nítida en su borde. No sirve para estimar la cobertura real detrás de un edificio.
+  * *La transmisión es un número fijo por muro.* La pérdida no depende del ángulo de incidencia, la frecuencia, la polarización ni el espesor (el muro es un plano sin grosor), no añade fase ni retardo, y es independiente de `reflectivity`/`eps_r`: no se impone balance de energía entre lo reflejado y lo transmitido. No hay reflexiones múltiples dentro del muro ni entre muros: un rayo que atraviesa un muro no genera reflexiones nuevas al otro lado más allá de las de un rebote ya descritas.
+  * *Los edificios son muros sueltos.* Un edificio se construye con cuatro muros finitos (y un quinto horizontal como techo, si hace falta); no hay volúmenes, ni rayos que pasen sobre el tejado por difracción. Los muros reflejan por las dos caras, así que también existen reflexiones "desde dentro".
+  * *Casos límite por convenio.* Una antena o un píxel exactamente sobre el plano de un muro no quedan tapados por él, y un rayo por la arista común de dos muros cruza ambos (sección 1.D).
+  * *Solo en ray tracing.* Los modelos empíricos (`run_empirical_simulation`: FSPL, Two-Ray, Log-Distance, Hata, COST-231) ignoran por completo los muros: ni reflejan ni obstruyen.
 * **Muros idealizados.** Planos lisos que reflejan por ambas caras; infinitos salvo que se indique `bounds`. Con `reflectivity` el coeficiente es constante (independiente del ángulo, la frecuencia y la polarización) con un desfase fijo de 180°. Con `eps_r` se usa Fresnel para campo eléctrico paralelo al muro, una aproximación válida para polarización vertical, muros verticales y propagación casi horizontal.
 * **Terreno plano.** El suelo es el plano z = 0, liso y homogéneo (por defecto $\epsilon_r = 15$, $\sigma = 0.005$ S/m), con polarización vertical. No hay relieve, curvatura terrestre, vegetación ni efectos atmosféricos.
 * **Antenas: isotrópica o sector parabólico.** El transmisor es isotrópico (por defecto) o usa el diagrama parabólico de 3GPP (`pattern="sector"`), que es un modelo analítico de un lóbulo principal con un suelo de −30 dB: no hay lóbulos laterales reales, diagramas medidos, agrupaciones, MIMO ni conformación de haz. El receptor es siempre isotrópico (0 dBi) y no hay pérdidas por desajuste de polarización. En los modos empíricos el diagrama se aplica en la dirección geométrica Tx→Rx; combinarlo con Hata (que ya promedia el entorno) es una aproximación habitual pero burda.
@@ -303,6 +384,21 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 ---
 
 ## 7. Historial de cambios
+
+### Versión 1.3.0
+
+La obstrucción es opcional y se activa muro a muro: sin `transmission_loss_db` todos los resultados numéricos, el CSV, el JSON y los SVG son idénticos bit a bit a los de 1.2.0 (comprobado contra una copia de 1.2.0; los archivos de `output/` no cambian).
+
+* **Novedades** (detalles, convenciones y ejemplos en la sección 1.D):
+  * `PlanarReflector(..., transmission_loss_db=None)`: pérdida de penetración en dB aplicada a todo rayo que cruce el muro (`float("inf")` = muro opaco). Afecta al rayo directo, al de suelo (sus dos tramos) y a los reflejados en otros muros (sus dos tramos); las pérdidas de varios muros se suman en dB. Funciona en `trace_paths` y `trace_points`, en la simulación vectorizada y en la de referencia punto a punto (mismos resultados), con suma incoherente o coherente, y junto con antenas sectoriales, `min_distance_m`, sombra log-normal y SINR.
+  * `PlanarReflector.crosses()`, `signed_distance()` y la propiedad `obstructs`; `RayTracer.obstruction_loss_db(p_inicio, p_fin)` (pérdida de un segmento: 0 = línea de vista).
+  * `MultipathRay.obstruction_loss_db` y `RayField.obstruction_loss_db`: pérdida por muros de cada rayo (0 si no cruza ninguno, `inf` si lo bloquea un muro opaco).
+  * CLI: `--wall-loss DB` (acepta `inf`) y `--building` (edificio de 4 muros finitos en lugar del muro infinito).
+  * Cuaderno: nueva Práctica 5 (sombra de un edificio y pérdida de penetración).
+* **Cambios que conviene conocer** (ninguno altera resultados existentes):
+  * `MultipathRay` tiene un campo más al final, `obstruction_loss_db = 0.0`: su `repr` lo muestra, y dos rayos solo son iguales (`==`) si también coincide ese campo. `RayField` gana el campo opcional homónimo.
+  * Con muros opacos pueden aparecer píxeles con `-inf` dBm y sin servidor en simulaciones de ray tracing (antes solo ocurría en casos degenerados). El resto del código ya trataba esos valores como "sin dato".
+  * En un `ChannelImpulseResponse` puede haber rayos con amplitud 0 (bloqueados): `10 * log10(ray.power_linear)` da `-inf` con un aviso de numpy; filtra con `ray.power_linear > 0` o mira `ray.obstruction_loss_db`.
 
 ### Versión 1.2.0
 

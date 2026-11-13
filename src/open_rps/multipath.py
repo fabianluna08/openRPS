@@ -71,6 +71,9 @@ class MultipathRay:
     tx_theta_deg: float    # Elevation angle of departure at Transmitter / BS (-90 to 90)
     rx_phi_deg: float      # Azimuth angle of arrival at Receiver / MS (-180 to 180)
     rx_theta_deg: float    # Elevation angle of arrival at Receiver / MS (-90 to 90)
+    # Loss in dB through the walls crossed by the ray, already included in ``magnitude``
+    # (0 = clear path; inf = blocked by an opaque wall, magnitude 0: the ray carries no power)
+    obstruction_loss_db: float = 0.0
 
     @property
     def power_linear(self) -> float:

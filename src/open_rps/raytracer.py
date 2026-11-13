@@ -8,10 +8,12 @@ Two equivalent entry points are provided:
   * ``RayTracer.trace_points`` -- many receiver points at once (numpy), returns a RayField.
 
 Physical scope (see README, "Limitaciones fisicas"): single-bounce specular
-reflections only, no obstruction by walls, no diffraction.  Antennas are isotropic
-unless ``Transmitter(pattern="sector")`` is used.  The tracer returns one complex
-amplitude per ray; whether they are added incoherently (default) or coherently is
-decided by whoever sums them (``RayField.total_power_linear``,
+reflections only, no diffraction.  Walls do not block rays unless they are given a
+``transmission_loss_db`` (see ``PlanarReflector``): then every ray leg that crosses
+the wall is attenuated by that loss (``inf`` = opaque wall, the ray carries no power).
+Antennas are isotropic unless ``Transmitter(pattern="sector")`` is used.  The tracer
+returns one complex amplitude per ray; whether they are added incoherently (default)
+or coherently is decided by whoever sums them (``RayField.total_power_linear``,
 ``ChannelImpulseResponse.total_received_power_linear``, the grid simulation).
 """
 
@@ -23,6 +25,38 @@ import numpy as np
 
 from .models import SPEED_OF_LIGHT, fresnel_reflection_coefficient
 from .multipath import MultipathRay, ChannelImpulseResponse
+
+# Obstruction by walls: an end of a ray leg closer than this to the plane of a wall
+# is *on* the wall and the leg does not cross it (the leg is an open segment).
+OBSTRUCTION_TOL_M = 1e-6
+# Margin of the ``bounds`` box of a finite wall (the patch is closed: its edge belongs to it)
+_BOUNDS_TOL_M = 1e-9
+# A ray that bends exactly on the plane of a wall: fraction of the way from the bend point
+# towards the chord Tx -> Rx at which the wall patch is probed (see ``_crosses_at_bend``)
+_BEND_STEP = 1e-6
+
+
+def _opposite_sides(s_a, s_b, tol: float) -> np.ndarray:
+    """True where two signed distances are strictly on opposite sides of a plane, both farther than ``tol`` from it."""
+    if np.ndim(s_a) == 0:
+        if s_a > tol:
+            return np.asarray(s_b < -tol)
+        if s_a < -tol:
+            return np.asarray(s_b > tol)
+        return np.zeros(np.shape(s_b), dtype=bool)
+    return (np.minimum(s_a, s_b) < -tol) & (np.maximum(s_a, s_b) > tol)
+
+
+def _take(values, rows: np.ndarray, axis: Optional[int] = None):
+    """
+    Entries ``rows`` (flat indices over the points) of a per-point quantity, or the
+    quantity itself if it is shared by all the points.  ``axis`` = None for scalars
+    per point, 0..2 for that coordinate of points of shape [3] or [..., 3].
+    """
+    values = np.asarray(values)
+    if axis is None:
+        return values if values.ndim == 0 else values.reshape(-1)[rows]
+    return values[axis] if values.ndim == 1 else values.reshape(-1, 3)[rows, axis]
 
 
 @dataclass
@@ -46,8 +80,23 @@ class PlanarReflector:
         usual case of vertical polarization on a vertical wall with near-horizontal
         propagation; it is an approximation for any other geometry.
 
-    Reflectors never block rays: the direct, ground and other wall rays pass
-    through them unattenuated.
+    transmission_loss_db: penetration loss of the wall in dB (new in 1.3.0).
+        ``None`` (default): the wall blocks nothing, every ray passes through it
+        unattenuated (behaviour of OpenRPS <= 1.2).  A finite value L > 0: the power
+        of every ray is reduced by L dB each time one of its legs crosses the wall
+        (amplitude x 10^(-L/20), no phase change).  ``float("inf")``: opaque wall,
+        a ray that crosses it carries no power.  0 dB is equivalent to ``None``.
+        What is tested is each straight leg of each ray (direct: Tx->Rx; ground:
+        Tx->bounce point and bounce point->Rx; wall: Tx->reflection point and
+        reflection point->Rx) against the wall patch (``bounds``, or the whole
+        plane); see ``crosses`` for the exact rule.  The losses of all the walls
+        crossed along a ray add up in dB.  A wall never obstructs its own reflected
+        ray.  If a ray bounces exactly on the plane of another wall (at its foot, or
+        on the corner of a building), that wall is crossed once when it stands
+        between the two legs of the ray (Tx and Rx on opposite sides of it).
+        The loss does not depend on ``reflectivity`` / ``eps_r`` (no energy balance
+        between the reflected and the transmitted wave is enforced), on the angle
+        of incidence or on the frequency, and the wall has no thickness.
     """
     p0: np.ndarray      # Reference point on plane [x, y, z]
     normal: np.ndarray  # Normal vector of the plane [nx, ny, nz] (normalized on creation)
@@ -56,6 +105,7 @@ class PlanarReflector:
     bounds: Optional[Sequence[float]] = None  # (xmin, xmax, ymin, ymax, zmin, zmax)
     eps_r: Optional[float] = None             # Relative permittivity (enables Fresnel)
     sigma: float = 0.0                        # Conductivity [S/m], used with eps_r
+    transmission_loss_db: Optional[float] = None  # Penetration loss [dB]; None = blocks nothing, inf = opaque
 
     def __post_init__(self):
         self.p0 = np.array(self.p0, dtype=float)
@@ -77,8 +127,113 @@ class PlanarReflector:
             if b[0] > b[1] or b[2] > b[3] or b[4] > b[5]:
                 raise ValueError("bounds must satisfy xmin <= xmax, ymin <= ymax, zmin <= zmax")
             self.bounds = b
+        if self.transmission_loss_db is not None:
+            try:
+                loss = float(self.transmission_loss_db)
+            except (TypeError, ValueError):
+                loss = float("nan")
+            if not loss >= 0.0:     # also rejects NaN
+                raise ValueError("transmission_loss_db must be None, a loss >= 0 in dB or float('inf') "
+                                 f"(opaque wall), got {self.transmission_loss_db!r}")
+            self.transmission_loss_db = loss
 
-    def contains(self, points: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    @property
+    def obstructs(self) -> bool:
+        """True if rays crossing the wall are attenuated (``transmission_loss_db`` > 0)."""
+        return self.transmission_loss_db is not None and self.transmission_loss_db > 0.0
+
+    def signed_distance(self, points: np.ndarray) -> np.ndarray:
+        """Signed distance in meters from ``points`` (shape [..., 3]) to the plane (> 0 on the side of ``normal``)."""
+        points = np.asarray(points, dtype=float)
+        # (x - x0) * nx + (y - y0) * ny + (z - z0) * nz, skipping the null components of the
+        # normal (they add exactly 0: same value, and most walls are vertical or axis-aligned)
+        total = None
+        for axis in range(3):
+            if self.normal[axis] != 0.0:
+                term = (points[..., axis] - self.p0[axis]) * self.normal[axis]
+                total = term if total is None else total + term
+        return total
+
+    def crosses(self, p_start: np.ndarray, p_end: np.ndarray, tol: float = OBSTRUCTION_TOL_M) -> np.ndarray:
+        """
+        True where the straight segment ``p_start`` -> ``p_end`` crosses the wall
+        (inputs of shape [..., 3], broadcast against each other).  Purely geometric:
+        it does not depend on ``transmission_loss_db``.
+
+        Convention (the one used for the obstruction of rays):
+          * The segment is *open*: it crosses only if its two ends are strictly on
+            opposite sides of the plane, each farther than ``tol`` (1 micrometer) from
+            it.  A segment that starts or ends on the plane (an antenna mounted on the
+            wall, the reflection point of the wall itself or of a coplanar wall), that
+            lies in the plane or that is parallel to it does not cross.
+          * The wall patch is *closed*: with ``bounds``, the crossing point must fall
+            inside the box, edges included (same 1e-9 m margin as the reflection
+            point).  A segment through the common edge of two walls crosses both.
+        """
+        a, b = np.broadcast_arrays(np.asarray(p_start, dtype=float), np.asarray(p_end, dtype=float))
+        if a.shape[-1] != 3:
+            raise ValueError("p_start and p_end must have shape [..., 3]")
+        return self._crosses(self.signed_distance(a), self.signed_distance(b), a, b, tol)
+
+    def _crosses(self, s_a, s_b, a: np.ndarray, b: np.ndarray, tol: float = OBSTRUCTION_TOL_M) -> np.ndarray:
+        """
+        ``crosses`` with the signed distances of the ends already computed.  ``s_a`` /
+        ``s_b`` are floats or arrays of the points shape; ``a`` / ``b`` have shape
+        [3] or [*shape, 3].  The crossing point is only computed for finite walls
+        and only where the ends are on opposite sides.
+        """
+        crossed = _opposite_sides(s_a, s_b, tol)
+        if self.bounds is None or not crossed.any():
+            return crossed
+        return self._keep_inside(crossed, s_a, s_b, a, b)
+
+    def _crosses_at_bend(self, s_before, s_bend, s_after, before: np.ndarray, bend: np.ndarray, after: np.ndarray,
+                         tol: float = OBSTRUCTION_TOL_M) -> np.ndarray:
+        """
+        Crossing of a two-leg path ``before`` -> ``bend`` -> ``after`` exactly at its
+        bend point (the point where a ray is reflected), which neither leg can see
+        because both end there.  True where the bend lies on the plane (within
+        ``tol``), the other ends of the two legs are strictly on opposite sides, and
+        the wall stands between the two legs: the point probed against the patch is
+        the bend point moved a fraction ``_BEND_STEP`` towards the point where the
+        straight chord ``before`` -> ``after`` meets the plane.  So a ray that bounces
+        at the foot of a wall, or on the corner of a building towards its inside, is
+        obstructed; one that only grazes the end of a wall from outside is not.
+        """
+        crossed = np.abs(s_bend) <= tol
+        if crossed.any():
+            crossed = crossed & _opposite_sides(s_before, s_after, tol)
+            if self.bounds is not None and crossed.any():
+                crossed = self._keep_inside(crossed, s_before, s_after, before, after, bend)
+        return crossed
+
+    def _keep_inside(self, crossed: np.ndarray, s_a, s_b, a: np.ndarray, b: np.ndarray,
+                     bend: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        The entries of ``crossed`` whose crossing point x = a + t * (b - a), with
+        t = s_a / (s_a - s_b), falls inside ``bounds`` (same test as ``contains``).
+        With ``bend`` the point tested is bend + _BEND_STEP * (x - bend) instead.
+        Evaluated one axis at a time and only for the candidates that remain.
+        """
+        candidates = np.flatnonzero(crossed)
+        s_a, s_b = _take(s_a, candidates), _take(s_b, candidates)
+        t = np.atleast_1d(s_a / (s_a - s_b))               # 0 < t < 1; the denominator is > 2 * tol
+        for axis in range(3):
+            lo, hi = self.bounds[2 * axis] - _BOUNDS_TOL_M, self.bounds[2 * axis + 1] + _BOUNDS_TOL_M
+            if lo == -np.inf and hi == np.inf:
+                continue
+            a_axis, b_axis = _take(a, candidates, axis), _take(b, candidates, axis)
+            point = a_axis + t * (b_axis - a_axis)
+            if bend is not None:
+                bend_axis = _take(bend, candidates, axis)
+                point = bend_axis + _BEND_STEP * (point - bend_axis)
+            inside = (point >= lo) & (point <= hi)
+            candidates, t = candidates[inside], t[inside]
+        result = np.zeros(crossed.size, dtype=bool)
+        result[candidates] = True
+        return result.reshape(crossed.shape)
+
+    def contains(self, points: np.ndarray, tol: float = _BOUNDS_TOL_M) -> np.ndarray:
         """True where ``points`` (shape [..., 3]) fall inside ``bounds`` (always True if unbounded)."""
         points = np.asarray(points, dtype=float)
         if self.bounds is None:
@@ -204,6 +359,12 @@ class RayField:
     index 0 = direct, 1 = ground reflection, 2.. = one per reflector (in the order
     they were added).  Where a ray does not exist ``valid`` is False, its amplitude
     is 0 and its delay/angles are NaN.
+
+    Obstruction (walls with ``transmission_loss_db``) never changes which rays exist:
+    a ray attenuated or blocked by walls keeps ``valid`` = True, its delay and its
+    angles; only its amplitude is scaled (to exactly 0 behind an opaque wall).
+    ``obstruction_loss_db`` gives the loss applied to each ray: 0 where it crosses
+    no obstructing wall (or does not exist), ``inf`` where an opaque wall blocks it.
     """
     tx_id: int
     amplitude: np.ndarray     # complex; |a|^2 is the ray power in mW
@@ -213,6 +374,7 @@ class RayField:
     rx_phi_deg: np.ndarray
     rx_theta_deg: np.ndarray
     valid: np.ndarray         # bool
+    obstruction_loss_db: Optional[np.ndarray] = None   # dB lost through walls, already included in amplitude
 
     @property
     def power_linear(self) -> np.ndarray:
@@ -244,7 +406,9 @@ class RayTracer:
     Simulates radio ray paths between transmitters and receivers.
     The ground is the plane z = 0 (smooth, homogeneous, vertical polarization).
     Every ray amplitude includes the transmitter gain towards the direction in
-    which that ray leaves the antenna (``Transmitter.gain_dbi`` of its AoD).
+    which that ray leaves the antenna (``Transmitter.gain_dbi`` of its AoD) and
+    the loss through the walls that the ray crosses, for the walls that have a
+    ``transmission_loss_db`` (none by default; see ``PlanarReflector``).
     """
     def __init__(self, ground_eps_r: float = 15.0, ground_sigma: float = 0.005):
         self.ground_eps_r = ground_eps_r
@@ -253,6 +417,84 @@ class RayTracer:
 
     def add_reflector(self, reflector: PlanarReflector):
         self.reflectors.append(reflector)
+
+    def obstruction_loss_db(self, p_start, p_end) -> np.ndarray:
+        """
+        Total penetration loss in dB of the straight segment ``p_start`` -> ``p_end``
+        (shape [..., 3], broadcast) through the walls that have a
+        ``transmission_loss_db``: sum of the losses of the walls crossed (rule in
+        ``PlanarReflector.crosses``), 0 with a clear path, ``inf`` if an opaque wall
+        is crossed.  E.g. ``tracer.obstruction_loss_db(tx_xyz, rx_xyz) == 0`` tells
+        whether there is line of sight.
+        """
+        a, b = np.broadcast_arrays(np.asarray(p_start, dtype=float), np.asarray(p_end, dtype=float))
+        loss = np.zeros(a.shape[:-1])
+        for refl in self.reflectors:
+            if refl.obstructs:
+                loss = loss + np.where(refl.crosses(a, b), refl.transmission_loss_db, 0.0)
+        return loss
+
+    @staticmethod
+    def _attenuate(magnitude: complex, loss_db: float) -> complex:
+        """Ray amplitude after ``loss_db`` dB of penetration loss: x 10^(-L/20), exactly 0 for an opaque wall."""
+        factor = 10.0 ** (-loss_db / 20.0)
+        return magnitude * factor if factor > 0.0 else 0j
+
+    def _scalar_obstacles(self) -> list:
+        """Obstructing walls as plain floats, for the point-by-point tracer: (index, loss, p0, normal, bounds)."""
+        return [(index, refl.transmission_loss_db, refl.p0.tolist(), refl.normal.tolist(), refl.bounds)
+                for index, refl in enumerate(self.reflectors) if refl.obstructs]
+
+    @staticmethod
+    def _path_loss_db(obstacles: list, a: Sequence[float], b: Sequence[float],
+                      via: Optional[Sequence[float]] = None, own: int = -1) -> float:
+        """
+        Scalar reference of the obstruction: loss in dB of the path a -> b, or
+        a -> via -> b for a reflected ray, through the walls of ``_scalar_obstacles``
+        (``own`` = index of the wall on which the ray is reflected, never an obstacle
+        for it).  Same rules and same arithmetic as ``PlanarReflector.crosses``.
+        """
+        tol = OBSTRUCTION_TOL_M
+
+        def crossings_of_leg(s_p, s_q, p, q, bounds) -> int:
+            if not ((s_p > tol and s_q < -tol) or (s_p < -tol and s_q > tol)):
+                return 0
+            if bounds is not None:
+                t = s_p / (s_p - s_q)
+                if not inside([p[axis] + t * (q[axis] - p[axis]) for axis in range(3)], bounds):
+                    return 0
+            return 1
+
+        def inside(point, bounds) -> bool:
+            return all(bounds[2 * axis] - _BOUNDS_TOL_M <= point[axis] <= bounds[2 * axis + 1] + _BOUNDS_TOL_M
+                       for axis in range(3))
+
+        loss = 0.0
+        for index, wall_loss, p0, n, bounds in obstacles:
+            if index == own:
+                continue
+            s_a = (a[0] - p0[0]) * n[0] + (a[1] - p0[1]) * n[1] + (a[2] - p0[2]) * n[2]
+            s_b = (b[0] - p0[0]) * n[0] + (b[1] - p0[1]) * n[1] + (b[2] - p0[2]) * n[2]
+            if via is None:
+                crossings = crossings_of_leg(s_a, s_b, a, b, bounds)
+            else:
+                s_via = (via[0] - p0[0]) * n[0] + (via[1] - p0[1]) * n[1] + (via[2] - p0[2]) * n[2]
+                if abs(s_via) <= tol:
+                    # The ray bends exactly on the plane of this wall: it goes through it if a and b are on
+                    # opposite sides and the wall stands between the two legs (see _crosses_at_bend)
+                    crossings = 0
+                    if (s_a > tol and s_b < -tol) or (s_a < -tol and s_b > tol):
+                        crossings = 1
+                        if bounds is not None:
+                            t = s_a / (s_a - s_b)
+                            probe = [via[axis] + _BEND_STEP * ((a[axis] + t * (b[axis] - a[axis])) - via[axis])
+                                     for axis in range(3)]
+                            crossings = int(inside(probe, bounds))
+                else:
+                    crossings = crossings_of_leg(s_a, s_via, a, via, bounds) + crossings_of_leg(s_via, s_b, via, b, bounds)
+            if crossings:
+                loss += crossings * wall_loss
+        return loss
 
     def _calc_angles(self, p_src: np.ndarray, p_dst: np.ndarray) -> Tuple[float, float]:
         """Calculates azimuth (phi: -180..180) and elevation (theta: -90..90) from src to dst."""
@@ -282,10 +524,18 @@ class RayTracer:
         The complex amplitude of each ray carries its phase (-k*d plus the phase of
         the reflection coefficient), so the returned CIR can be summed incoherently
         or coherently (``cir.total_received_power_dbm(coherent=True)``).
+
+        Walls with a ``transmission_loss_db`` attenuate every ray whose legs cross
+        them (amplitude x 10^(-L/20), phase untouched).  The list of rays does not
+        change: a ray blocked by an opaque wall stays in the CIR with magnitude 0
+        (and ``obstruction_loss_db`` = inf), and every metric of the CIR ignores it.
         """
         cir = ChannelImpulseResponse()
         tx_p = np.array([tx.x, tx.y, tx.z], dtype=float)
         rx_p = np.array(rx_pos, dtype=float)
+        # Walls that attenuate the rays crossing them (none unless transmission_loss_db is used)
+        obstacles = self._scalar_obstacles()
+        tx_xyz, rx_xyz = (tx_p.tolist(), rx_p.tolist()) if obstacles else (None, None)
         wavelength = SPEED_OF_LIGHT / tx.frequency_hz
         k = 2.0 * math.pi / wavelength
         # Field amplitude at 1 m scaled so that |a|^2 is power in mW (Friis):
@@ -306,6 +556,9 @@ class RayTracer:
             rx_phi, rx_theta = self._calc_angles(rx_p, tx_p)
             if sector:
                 mag_direct *= self._pattern_factor(tx, tx_phi, tx_theta)
+            loss_direct = self._path_loss_db(obstacles, tx_xyz, rx_xyz) if obstacles else 0.0
+            if loss_direct > 0.0:
+                mag_direct = self._attenuate(mag_direct, loss_direct)
 
             cir.add_ray(MultipathRay(
                 tx_id=tx.tx_id,
@@ -314,7 +567,8 @@ class RayTracer:
                 tx_phi_deg=tx_phi,
                 tx_theta_deg=tx_theta,
                 rx_phi_deg=rx_phi,
-                rx_theta_deg=rx_theta
+                rx_theta_deg=rx_theta,
+                obstruction_loss_db=loss_direct
             ))
 
         # --- 2. Ground Reflected Ray ---
@@ -343,6 +597,14 @@ class RayTracer:
             rx_phi_g, rx_theta_g = self._calc_angles(rx_p, tx_image_ground)
             if sector:
                 mag_ground *= self._pattern_factor(tx, tx_phi_g, tx_theta_g)
+            loss_ground = 0.0
+            if obstacles:
+                # Both legs of the ray: Tx -> bounce point -> Rx
+                t_bounce = tx.z / (tx.z + rx_p[2])
+                bounce_xyz = (tx_image_ground + t_bounce * (rx_p - tx_image_ground)).tolist()
+                loss_ground = self._path_loss_db(obstacles, tx_xyz, rx_xyz, via=bounce_xyz)
+                if loss_ground > 0.0:
+                    mag_ground = self._attenuate(mag_ground, loss_ground)
 
             cir.add_ray(MultipathRay(
                 tx_id=tx.tx_id,
@@ -351,11 +613,12 @@ class RayTracer:
                 tx_phi_deg=tx_phi_g,
                 tx_theta_deg=tx_theta_g,
                 rx_phi_deg=rx_phi_g,
-                rx_theta_deg=rx_theta_g
+                rx_theta_deg=rx_theta_g,
+                obstruction_loss_db=loss_ground
             ))
 
         # --- 3. Wall Specular Reflections ---
-        for refl in self.reflectors:
+        for wall_index, refl in enumerate(self.reflectors):
             # Signed distances of Tx and Rx to the plane
             s_tx = float(np.dot(tx_p - refl.p0, refl.normal))
             s_rx = float(np.dot(rx_p - refl.p0, refl.normal))
@@ -384,6 +647,13 @@ class RayTracer:
             rx_phi_w, rx_theta_w = self._calc_angles(rx_p, p_wall_hit)
             if sector:
                 mag_wall *= self._pattern_factor(tx, tx_phi_w, tx_theta_w)
+            loss_wall = 0.0
+            if obstacles:
+                # Both legs, Tx -> reflection point -> Rx, against every *other* wall
+                hit_xyz = p_wall_hit.tolist()
+                loss_wall = self._path_loss_db(obstacles, tx_xyz, rx_xyz, via=hit_xyz, own=wall_index)
+                if loss_wall > 0.0:
+                    mag_wall = self._attenuate(mag_wall, loss_wall)
 
             cir.add_ray(MultipathRay(
                 tx_id=tx.tx_id,
@@ -392,7 +662,8 @@ class RayTracer:
                 tx_phi_deg=tx_phi_w,
                 tx_theta_deg=tx_theta_w,
                 rx_phi_deg=rx_phi_w,
-                rx_theta_deg=rx_theta_w
+                rx_theta_deg=rx_theta_w,
+                obstruction_loss_db=loss_wall
             ))
 
         return cir
@@ -403,6 +674,8 @@ class RayTracer:
 
         points: array of shape [..., 3] with the receiver coordinates (x, y, z).
         Returns a RayField whose arrays have shape [2 + n_reflectors, ...].
+        Obstruction by walls with a ``transmission_loss_db`` is applied exactly as in
+        ``trace_paths``; ``RayField.obstruction_loss_db`` holds the loss of each ray.
         """
         pts = np.asarray(points, dtype=float)
         if pts.shape[-1] != 3:
@@ -421,14 +694,48 @@ class RayTracer:
         amp_1m = math.sqrt(tx.power_mw * (10**(tx.antenna_gain_dbi/10.0))) * wavelength / (4.0 * math.pi)
         sector = not tx.is_isotropic
 
-        def store(idx, ok, dist, coeff, tx_target, rx_target):
-            """Fill ray ``idx``: path length ``dist``, reflection coefficient ``coeff``, aim points."""
+        # Walls that attenuate the rays crossing them, with the signed distances of Tx and
+        # of every receiver point to their planes (empty unless transmission_loss_db is used)
+        obstacles = [(index, refl, float(refl.signed_distance(tx_p)), refl.signed_distance(pts))
+                     for index, refl in enumerate(self.reflectors) if refl.obstructs]
+        loss_db = np.zeros((n_rays,) + shape)
+
+        def obstruction(ok, via, own):
+            """
+            Loss in dB of the path Tx -> ``via`` -> points (Tx -> points if ``via`` is
+            None) through the obstructing walls, except the wall number ``own`` (the
+            one the ray is reflected on).  0 where the ray does not exist.
+            """
+            loss = np.zeros(shape)
+            for index, wall, s_tx, s_rx in obstacles:
+                if index == own:
+                    continue
+                if via is None:
+                    crossings = (wall._crosses(s_tx, s_rx, tx_p, pts),)
+                else:
+                    # The two legs, plus the case of a ray that bends exactly on the plane of this wall
+                    s_via = wall.signed_distance(via)
+                    crossings = (wall._crosses(s_tx, s_via, tx_p, via), wall._crosses(s_via, s_rx, via, pts),
+                                 wall._crosses_at_bend(s_tx, s_via, s_rx, tx_p, via, pts))
+                for crossed in crossings:
+                    np.add(loss, wall.transmission_loss_db, out=loss, where=crossed)
+            return np.where(ok, loss, 0.0)
+
+        def store(idx, ok, dist, coeff, tx_target, rx_target, via=None, own=-1):
+            """
+            Fill ray ``idx``: path length ``dist``, reflection coefficient ``coeff``, aim
+            points; ``via`` is the point where the ray bounces (None: straight ray).
+            """
             tx_phi, tx_theta = _angles_deg(tx_p, tx_target)
             rx_phi, rx_theta = _angles_deg(pts, rx_target)
             with np.errstate(divide="ignore", invalid="ignore"):
                 amp = (amp_1m / dist) * coeff * np.exp(-1j * k * dist)
                 if sector:
                     amp = amp * self._pattern_factor(tx, tx_phi, tx_theta)
+                if obstacles:
+                    loss_db[idx] = loss = obstruction(ok, via, own)
+                    if loss.any():
+                        amp = amp * 10.0 ** (-loss / 20.0)          # x1 (exact) where nothing is crossed
             amplitude[idx] = np.where(ok, amp, 0.0)
             tau_ns[idx] = np.where(ok, dist / SPEED_OF_LIGHT * 1e9, np.nan)
             for a, values in enumerate((tx_phi, tx_theta, rx_phi, rx_theta)):
@@ -448,7 +755,14 @@ class RayTracer:
         horiz = np.hypot(pts[..., 0] - tx.x, pts[..., 1] - tx.y)
         grazing = np.arctan2(tx.z + rz, np.maximum(1e-6, horiz))
         gamma_ground = self._fresnel_ground_reflection(grazing, tx.frequency_hz)
-        store(1, ok_ground, d_ground, gamma_ground, rx_image_ground, tx_image_ground)
+        p_bounce = None
+        if obstacles:
+            # Bounce point, as in trace_paths: p = tx_image + t * (rx - tx_image), t = tx.z / (tx.z + rx.z)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t_bounce = tx.z / (tx.z + rz)
+                p_bounce = tx_image_ground + t_bounce[..., None] * (pts - tx_image_ground)
+            p_bounce = np.where(ok_ground[..., None], p_bounce, 0.0)
+        store(1, ok_ground, d_ground, gamma_ground, rx_image_ground, tx_image_ground, via=p_bounce)
 
         # --- 3. Wall Specular Reflections ---
         for r, refl in enumerate(self.reflectors):
@@ -466,7 +780,7 @@ class RayTracer:
             ok_wall &= refl.contains(p_wall_hit)
             gamma_wall = refl.reflection_coefficient(np.where(ok_wall, sin_grazing, 0.0), tx.frequency_hz)
             gamma_wall = np.asarray(gamma_wall)
-            store(2 + r, ok_wall, d_wall, gamma_wall, p_wall_hit, p_wall_hit)
+            store(2 + r, ok_wall, d_wall, gamma_wall, p_wall_hit, p_wall_hit, via=p_wall_hit, own=r)
 
         return RayField(
             tx_id=tx.tx_id,
@@ -477,4 +791,5 @@ class RayTracer:
             rx_phi_deg=angles[2],
             rx_theta_deg=angles[3],
             valid=valid,
+            obstruction_loss_db=loss_db,
         )

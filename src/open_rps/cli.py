@@ -6,6 +6,7 @@ After ``pip install .``:
     open-rps --mode raytracing
     python3 -m open_rps.cli --mode hata --freq 900e6
     open-rps --mode raytracing --coherent --sector --sinr --shadow-sigma 6 --seed 1
+    open-rps --mode raytracing --building --wall-loss inf
 """
 
 import argparse
@@ -31,8 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="OpenRPS: Open Radiowave Propagation Simulator & Multipath Channel Estimator",
         epilog="Demo scenario: two base stations at 30% and 70% of the area diagonal and, in "
-               "raytracing mode, a reflecting wall on the plane x = size/2. With --sector both "
-               "stations use a 65-degree sector antenna pointing at the centre of the area.",
+               "raytracing mode, a reflecting wall on the plane x = size/2 (with --building, a "
+               "rectangular building east of the first station instead). The walls block nothing "
+               "unless --wall-loss is given. With --sector both stations use a 65-degree sector "
+               "antenna pointing at the centre of the area.",
     )
     parser.add_argument("--mode", choices=["raytracing", "tworay", "hata", "fspl"], default="raytracing",
                         help="Propagation model: 'raytracing' (multipath), 'tworay', 'hata' "
@@ -43,7 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--power", type=float, default=43.0, help="Tx power in dBm (default: 43 dBm = 20W)")
     parser.add_argument("--tx-height", type=float, default=25.0, help="Height of both base stations in meters (default: 25m)")
     parser.add_argument("--reflector", choices=["on", "off"], default="on",
-                        help="Add the reflecting wall (only affects --mode raytracing; default: on)")
+                        help="Add the reflecting wall, or the building of --building (only affects "
+                             "--mode raytracing; default: on)")
+    parser.add_argument("--wall-loss", type=float, default=None, metavar="DB",
+                        help="Penetration loss of the demo walls in dB: every ray that crosses a wall loses "
+                             "DB dB ('inf' = opaque walls, which cast a shadow). Omitted: the walls only "
+                             "reflect and block nothing (only affects --mode raytracing)")
+    parser.add_argument("--building", action="store_true",
+                        help="Replace the infinite wall by a rectangular building made of 4 finite walls "
+                             "(0.45-0.60 x size in x, 0.35-0.50 x size in y, twice as tall as the base "
+                             "stations); combine it with --wall-loss to see its shadow")
     parser.add_argument("--coherent", action="store_true",
                         help="Add the complex ray amplitudes (fast fading) instead of the ray powers "
                              "(only affects --mode raytracing)")
@@ -90,6 +102,8 @@ def main(argv=None) -> int:
         parser.error("--min-distance must be >= 0")
     if args.bandwidth <= 0:
         parser.error("--bandwidth must be > 0 (in Hz)")
+    if args.wall_loss is not None and not args.wall_loss >= 0:
+        parser.error("--wall-loss must be >= 0 dB (or 'inf' for opaque walls)")
     cells = (int(args.size / args.res) + 1) ** 2
     if cells > MAX_GRID_CELLS:
         parser.error(f"grid too large ({cells} cells > {MAX_GRID_CELLS}); increase --res or reduce --size")
@@ -106,9 +120,23 @@ def main(argv=None) -> int:
     sim.add_transmitter(tx0)
     sim.add_transmitter(tx1)
 
-    # Reflector for multipath (ray tracing only)
-    if args.reflector == "on":
-        wall = PlanarReflector(p0=[args.size * 0.5, args.size * 0.5, 0.0], normal=[1.0, 0.0, 0.0], reflectivity=0.5)
+    # Walls for multipath (ray tracing only).  They obstruct the rays only with --wall-loss.
+    walls = []
+    if args.reflector == "on" and not args.building:
+        walls.append(PlanarReflector(p0=[args.size * 0.5, args.size * 0.5, 0.0], normal=[1.0, 0.0, 0.0],
+                                     reflectivity=0.5, transmission_loss_db=args.wall_loss))
+    elif args.reflector == "on":
+        # Building east of Tx0: 4 vertical faces, each one a finite wall (no roof: it is taller than the antennas)
+        bx0, bx1, by0, by1, top = (args.size * 0.45, args.size * 0.60, args.size * 0.35, args.size * 0.50,
+                                   2.0 * args.tx_height)
+        for name, p0, normal, bounds in (
+                ("West face", [bx0, by0, 0.0], [1.0, 0.0, 0.0], (bx0, bx0, by0, by1, 0.0, top)),
+                ("East face", [bx1, by0, 0.0], [1.0, 0.0, 0.0], (bx1, bx1, by0, by1, 0.0, top)),
+                ("South face", [bx0, by0, 0.0], [0.0, 1.0, 0.0], (bx0, bx1, by0, by0, 0.0, top)),
+                ("North face", [bx0, by1, 0.0], [0.0, 1.0, 0.0], (bx0, bx1, by1, by1, 0.0, top))):
+            walls.append(PlanarReflector(p0=p0, normal=normal, reflectivity=0.5, name=name, bounds=bounds,
+                                         transmission_loss_db=args.wall_loss))
+    for wall in walls:
         sim.add_reflector(wall)
 
     if args.mode == "raytracing":
@@ -130,6 +158,23 @@ def main(argv=None) -> int:
         print("[*] Note: the reflector is ignored by empirical models (only used with --mode raytracing)")
     if args.mode != "raytracing" and args.coherent:
         print("[*] Note: --coherent is ignored by empirical models (only used with --mode raytracing)")
+    if args.building or args.wall_loss is not None:
+        if args.mode != "raytracing":
+            print("[*] Note: --building and --wall-loss are ignored by empirical models (walls neither "
+                  "reflect nor block there; only used with --mode raytracing)")
+        elif not walls:
+            print("[*] Note: --building and --wall-loss have no effect with --reflector off (there are no walls)")
+        else:
+            what = (f"building of 4 walls, x = {walls[0].bounds[0]:g}-{walls[1].bounds[0]:g} m, "
+                    f"y = {walls[2].bounds[2]:g}-{walls[3].bounds[2]:g} m, {walls[0].bounds[5]:g} m tall"
+                    if args.building else f"infinite wall on x = {args.size * 0.5:g} m")
+            if args.wall_loss is None:
+                blocking = "reflects only, blocks nothing (use --wall-loss to make it obstruct)"
+            elif args.wall_loss == float("inf"):
+                blocking = "opaque (rays that cross a wall are blocked)"
+            else:
+                blocking = f"{args.wall_loss:g} dB of penetration loss per wall crossed"
+            print(f"[*] Walls: {what}; {blocking}")
     if args.mode != "hata" and args.strict:
         print("[*] Note: --strict only applies to --mode hata")
     if args.sector:

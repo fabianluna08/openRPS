@@ -60,9 +60,12 @@ class SimulationResult:
     NOT indexed by tx_id.  ``path_loss_db`` is the link loss P_tx - P_rx, i.e. it
     includes the transmitter antenna gain (and pattern) and the shadow fading.
 
-    Values without data: ``-inf`` dBm means that no power arrives; ``NaN`` means that
-    the value is not reliable or not available (pixel closer to the antenna than
-    ``min_distance_m``, metric not provided by the model, no server).
+    Values without data: ``-inf`` dBm means that no power arrives (e.g. every ray of
+    that transmitter is blocked by opaque walls, see ``PlanarReflector.transmission_loss_db``);
+    ``NaN`` means that the value is not reliable or not available (pixel closer to
+    the antenna than ``min_distance_m``, metric not provided by the model, no
+    server).  A pixel that no transmitter reaches has no server: ``best_server_id``
+    -1, ``max_rx_power_dbm`` -inf, and NaN path loss, spreads and SINR.
 
     ``sinr_db``, ``interference_plus_noise_dbm`` and ``sinr_settings`` stay ``None``
     until ``compute_sinr()`` is called.
@@ -376,6 +379,13 @@ class PropagationSimulator:
         """
         Executes a 2D grid ray-tracing multipath simulation across all transmitters.
 
+        Walls added with ``add_reflector`` reflect, and those that have a
+        ``transmission_loss_db`` also attenuate (or block, if it is ``inf``) every ray
+        that crosses them, in both implementations and with both kinds of sum.  A
+        blocked ray has zero power: it does not count for the received power nor for
+        the delay / angular spreads.  Where every ray of a transmitter is blocked its
+        power is ``-inf`` dBm (path loss NaN) and it cannot be the best server.
+
         vectorized: True (default) traces the whole grid with numpy
             (``RayTracer.trace_points``).  False runs the reference implementation,
             one ``RayTracer.trace_paths`` call per pixel and transmitter: much slower,
@@ -540,7 +550,9 @@ class PropagationSimulator:
         ``run_raytracing_simulation`` (the distance checked is always the 3D one).
 
         Empirical models carry no multipath information: the delay-spread and
-        angular-spread grids of the result are NaN.
+        angular-spread grids of the result are NaN.  They also ignore the walls
+        completely: reflectors neither reflect nor obstruct here (their
+        ``transmission_loss_db`` only acts in ``run_raytracing_simulation``).
         """
         x_coords, y_coords = _make_grid(x_range, y_range, resolution_m)
         nx, ny, num_tx = len(x_coords), len(y_coords), len(self.transmitters)
