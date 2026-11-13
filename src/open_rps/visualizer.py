@@ -17,25 +17,33 @@ _FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 _BLUE_RAMP = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
               "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"]
 
+# Okabe-Ito palette (Okabe & Ito, "Color Universal Design", 2008): eight colors that
+# remain distinguishable under the common forms of color-vision deficiency.  Black goes
+# last so that it is only used with 8 transmitters (it is the least "map-like" color).
+OKABE_ITO = ["#0072b2", "#e69f00", "#009e73", "#d55e00", "#56b4e9", "#cc79a7", "#f0e442", "#000000"]
+
 # Chart chrome and colors per theme.  ``categorical`` is a fixed-order palette: slot i
 # always belongs to the i-th transmitter, and it is never cycled (transmitters beyond
 # the 8th share the neutral ``other`` color and are told apart by their map labels).
+# On the dark theme the black of Okabe-Ito would vanish into the background, so it is
+# swapped for white (the usual dark-background variant of the palette).
 _THEMES = {
     "light": {
         "surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#898781",
         "axis": "#c3c2b7", "nodata": "#e1e0d9", "other": "#898781",
         "ramp": _BLUE_RAMP,                      # low = light (recedes into the surface)
-        "categorical": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"],
+        "categorical": list(OKABE_ITO),
     },
     "dark": {
         "surface": "#1a1a19", "ink": "#f0efec", "ink2": "#c3c2b7", "muted": "#898781",
         "axis": "#383835", "nodata": "#2c2c2a", "other": "#898781",
         "ramp": _BLUE_RAMP[::-1],                # low = dark (recedes into the surface)
-        "categorical": ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"],
+        "categorical": OKABE_ITO[:-1] + ["#ffffff"],
     },
 }
 
-# Above this number of cells the per-cell hover tooltips are dropped to bound the file size
+# Above this number of cells the per-cell hover tooltips are dropped and neighbouring
+# cells of the same color are merged, to bound the file size
 _MAX_TOOLTIP_CELLS = 40_000
 
 
@@ -51,6 +59,51 @@ def _ramp_color(ramp: Sequence[str], norm: float) -> str:
     frac = pos - lo
     a, b = _hex_to_rgb(ramp[lo]), _hex_to_rgb(ramp[lo + 1])
     return "#" + "".join(f"{round(a[c] + (b[c] - a[c]) * frac):02x}" for c in range(3))
+
+
+def _ramp_keys(ramp: Sequence[str], norm: np.ndarray, has_data: np.ndarray) -> np.ndarray:
+    """
+    Vectorized ``_ramp_color``: colors as packed 0xRRGGBB integers for an array of
+    positions ``norm`` (clipped to 0..1); -1 where ``has_data`` is False.
+    """
+    stops = np.array([_hex_to_rgb(c) for c in ramp], dtype=float)           # [n, 3]
+    pos = np.clip(np.where(has_data, norm, 0.0), 0.0, 1.0) * (len(ramp) - 1)
+    lo = np.minimum(pos.astype(int), len(ramp) - 2)
+    frac = (pos - lo)[..., None]
+    rgb = np.rint(stops[lo] + (stops[lo + 1] - stops[lo]) * frac).astype(np.int64)
+    keys = (rgb[..., 0] << 16) | (rgb[..., 1] << 8) | rgb[..., 2]
+    return np.where(has_data, keys, -1)
+
+
+def _merged_rectangles(keys: np.ndarray) -> List[Tuple[int, int, int, int, int]]:
+    """
+    Lossless merge of equal-colored neighbouring cells of a [ny, nx] grid of color
+    keys (negative = nothing to draw).  Each row is run-length encoded; a run that is
+    repeated with the same extent and color in the following rows grows vertically.
+    Returns rectangles (i0, i1, j0, j1, key) covering the cells [j0:j1, i0:i1]; they
+    never overlap and cover exactly the drawable cells.
+    """
+    ny, nx = keys.shape
+    rectangles = []
+    open_runs = {}                      # (i0, i1, key) -> first row of the rectangle
+    for j in range(ny):
+        row = keys[j]
+        starts = np.flatnonzero(np.concatenate(([True], row[1:] != row[:-1])))
+        ends = np.append(starts[1:], nx)
+        current = {}
+        for i0, i1, key in zip(starts.tolist(), ends.tolist(), row[starts].tolist()):
+            if key >= 0:
+                current[(i0, i1, key)] = open_runs.pop((i0, i1, key), j)
+        rectangles.extend((i0, i1, j0, j, key) for (i0, i1, key), j0 in open_runs.items())
+        open_runs = current
+    rectangles.extend((i0, i1, j0, ny, key) for (i0, i1, key), j0 in open_runs.items())
+    return rectangles
+
+
+def _num(value: float) -> str:
+    """Shortest text of a coordinate with at most 2 decimals (72.50 -> 72.5, 3.00 -> 3)."""
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
 
 
 def _nice_ticks(lo: float, hi: float, target: int = 6) -> List[float]:
@@ -147,11 +200,20 @@ class MapVisualizer:
         (equal aspect ratio) with axes in meters, transmitter markers and a legend.
         width_px / height_px are the maximum canvas size: the image is cropped to
         the drawing when the map's aspect ratio leaves part of it unused.
-        metric options: 'rx_power', 'delay_spread' (continuous color scale with
-        intermediate values) or 'best_server' (one color per transmitter).
+        metric options: 'rx_power', 'delay_spread', 'sinr', 'interference' (continuous
+        color scale with intermediate values) or 'best_server' (one color per
+        transmitter, color-blind-safe Okabe-Ito palette; from the 9th transmitter on
+        they share a gray "Other").
+        'sinr' / 'interference' draw the maps stored by ``result.compute_sinr()``; if
+        it was not called they are computed with its default noise settings
+        (noise figure 7 dB, 20 MHz), without modifying the result.
         theme: 'light' or 'dark'.
         Cells without data (NaN, -inf, no server) are left in a neutral color;
         a result with no data at all produces a valid, empty map.
+
+        Up to 40 000 cells every cell is one <rect> with a hover tooltip.  Larger
+        grids drop the tooltips and merge neighbouring cells of the same color into
+        one shape per color, which draws the same picture in a much smaller file.
         """
         if theme not in _THEMES:
             raise ValueError(f"theme must be one of {sorted(_THEMES)}, got {theme!r}")
@@ -172,12 +234,24 @@ class MapVisualizer:
             max_v = float(np.max(valid)) if valid.size else 1.0
             title = "RMS Delay Spread (sigma_tau) Map"
             unit = "ns"
+        elif metric in ("sinr", "interference"):
+            if result.sinr_db is not None and result.interference_plus_noise_dbm is not None:
+                sinr, i_plus_n = result.sinr_db, result.interference_plus_noise_dbm
+            else:
+                sinr, i_plus_n = result.sinr_map()
+            data = np.asarray(sinr if metric == "sinr" else i_plus_n, dtype=float)
+            valid = _finite(data)
+            min_v = float(np.min(valid)) if valid.size else 0.0
+            max_v = float(np.max(valid)) if valid.size else 1.0
+            title = "SINR of the Best Server Map" if metric == "sinr" else "Interference + Noise (I + N) Map"
+            unit = "dB" if metric == "sinr" else "dBm"
         elif categorical:
             data = np.asarray(result.best_server_id)
             title = "Best Serving Cell Map"
             unit = ""
         else:
-            raise ValueError(f"metric must be 'rx_power', 'delay_spread' or 'best_server', got {metric!r}")
+            raise ValueError("metric must be 'rx_power', 'delay_spread', 'sinr', 'interference' "
+                             f"or 'best_server', got {metric!r}")
 
         ny, nx = data.shape
         x_coords = np.asarray(result.x_coords, dtype=float)
@@ -228,29 +302,47 @@ class MapVisualizer:
                 min_v, max_v = min_v - 0.5, max_v + 0.5
             has_data = np.isfinite(data)
 
-        # --- Cells (one rect each; pixel edges shared between neighbours, no anti-aliasing seams) ---
+        # --- Cells (pixel edges shared between neighbours, no anti-aliasing seams) ---
         with_tooltips = nx * ny <= _MAX_TOOLTIP_CELLS
         x_edges = [px(x0 + i * dx) for i in range(nx + 1)]
         y_edges = [py(y0 + j * dy) for j in range(ny + 1)]
         svg.append('<g shape-rendering="crispEdges">')
-        for j in range(ny):
-            top, height = y_edges[j + 1], y_edges[j] - y_edges[j + 1]
-            for i in range(nx):
-                if not has_data[j, i]:
-                    continue
-                val = data[j, i]
-                if categorical:
-                    color = lookup[int(val)]
-                    label = f"Tx {int(val)}"
-                else:
-                    color = _ramp_color(colors["ramp"], (float(val) - min_v) / (max_v - min_v))
-                    label = f"{float(val):.1f} {unit}"
-                rect = (f'<rect x="{x_edges[i]:.2f}" y="{top:.2f}" width="{x_edges[i + 1] - x_edges[i]:.2f}" '
-                        f'height="{height:.2f}" fill="{color}"')
-                if with_tooltips:
-                    svg.append(f'{rect}><title>x={_fmt(x_coords[i])} m, y={_fmt(y_coords[j])} m: {label}</title></rect>')
-                else:
-                    svg.append(rect + '/>')
+        if with_tooltips:
+            # One <rect> per cell, each with its hover tooltip
+            for j in range(ny):
+                top, height = y_edges[j + 1], y_edges[j] - y_edges[j + 1]
+                for i in range(nx):
+                    if not has_data[j, i]:
+                        continue
+                    val = data[j, i]
+                    if categorical:
+                        color = lookup[int(val)]
+                        label = f"Tx {int(val)}"
+                    else:
+                        color = _ramp_color(colors["ramp"], (float(val) - min_v) / (max_v - min_v))
+                        label = f"{float(val):.1f} {unit}"
+                    svg.append(f'<rect x="{x_edges[i]:.2f}" y="{top:.2f}" width="{x_edges[i + 1] - x_edges[i]:.2f}" '
+                               f'height="{height:.2f}" fill="{color}">'
+                               f'<title>x={_fmt(x_coords[i])} m, y={_fmt(y_coords[j])} m: {label}</title></rect>')
+        else:
+            # Large grid: no tooltips.  Equal-colored neighbours are merged into rectangles
+            # (run-length per row, grown over identical rows) and all the rectangles of a
+            # color are written as the sub-paths of a single <path>: same picture, far fewer bytes.
+            if categorical:
+                keys = np.full(data.shape, -1, dtype=np.int64)
+                for tx_id, color in lookup.items():
+                    keys[data == tx_id] = int(color[1:], 16)
+            else:
+                with np.errstate(invalid="ignore"):
+                    norm = (data - min_v) / (max_v - min_v)
+                keys = _ramp_keys(colors["ramp"], norm, has_data)
+            shapes = {}                  # color key -> list of sub-paths
+            for i0, i1, j0, j1, key in _merged_rectangles(keys):
+                # Absolute coordinates: neighbours share exactly the same edge values
+                left, right, top, bottom = (_num(v) for v in (x_edges[i0], x_edges[i1], y_edges[j1], y_edges[j0]))
+                shapes.setdefault(key, []).append(f'M{left} {top}H{right}V{bottom}H{left}z')
+            for key in sorted(shapes):
+                svg.append(f'<path fill="#{key:06x}" d="{"".join(shapes[key])}"/>')
         svg.append('</g>')
 
         if not has_data.any():

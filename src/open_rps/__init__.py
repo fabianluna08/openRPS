@@ -26,9 +26,10 @@ from .raytracer import (
 from .simulation import (
     PropagationSimulator,
     SimulationResult,
+    thermal_noise_dbm,
 )
 from .visualizer import (
     MapVisualizer,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

@@ -8,7 +8,11 @@ Two equivalent entry points are provided:
   * ``RayTracer.trace_points`` -- many receiver points at once (numpy), returns a RayField.
 
 Physical scope (see README, "Limitaciones fisicas"): single-bounce specular
-reflections only, no obstruction/shadowing, no diffraction, isotropic antennas.
+reflections only, no obstruction by walls, no diffraction.  Antennas are isotropic
+unless ``Transmitter(pattern="sector")`` is used.  The tracer returns one complex
+amplitude per ray; whether they are added incoherently (default) or coherently is
+decided by whoever sums them (``RayField.total_power_linear``,
+``ChannelImpulseResponse.total_received_power_linear``, the grid simulation).
 """
 
 import math
@@ -103,12 +107,31 @@ class PlanarReflector:
         return fresnel_reflection_coefficient(psi, frequency_hz, self.eps_r, self.sigma, "horizontal")
 
 
+ANTENNA_PATTERNS = ("isotropic", "sector")
+# Limits of the 3GPP parabolic sector pattern (TR 38.901, Table 7.3-1): A_m = SLA_V = A_max
+SECTOR_MAX_ATTENUATION_DB = 30.0
+
+
 @dataclass
 class Transmitter:
     """
     Represents a Base Station / Transmitter.
-    The antenna is isotropic: ``antenna_gain_dbi`` is applied equally in every
-    direction (no radiation pattern, no sectorization).
+
+    pattern: "isotropic" (default): ``antenna_gain_dbi`` is applied equally in every
+        direction.  "sector": ``antenna_gain_dbi`` is the boresight (maximum) gain and
+        the 3GPP parabolic pattern (TR 36.814 / TR 38.901) attenuates every other
+        direction of departure:
+            A_H(phi)      = -min(12 * (phi / beamwidth_az_deg)^2, 30)
+            A_V(theta)    = -min(12 * ((theta - tilt) / beamwidth_el_deg)^2, 30)
+            A(phi, theta) = -min(-(A_H + A_V), 30)                       [dB]
+        phi being the azimuth measured from ``azimuth_deg`` and theta - tilt the
+        elevation measured from the (down-tilted) boresight.
+    azimuth_deg: azimuth of the boresight, same convention as the ray angles
+        (0 = +x axis, 90 = +y axis, counter-clockwise).
+    beamwidth_az_deg, beamwidth_el_deg: 3 dB beamwidths (the gain is 3 dB down at
+        half the beamwidth off boresight).  Defaults: 65 deg (TR 38.901 element).
+    downtilt_deg: positive values point the beam below the horizon.
+    The last four fields are ignored when ``pattern="isotropic"``.
     """
     tx_id: int
     x: float
@@ -116,15 +139,60 @@ class Transmitter:
     z: float
     tx_power_dbm: float = 43.0  # Default 20 Watts (43 dBm)
     frequency_hz: float = 2.4e9 # Default 2.4 GHz
-    antenna_gain_dbi: float = 14.0 # Applied in all directions
+    antenna_gain_dbi: float = 14.0 # Applied in all directions (isotropic) or on boresight (sector)
+    azimuth_deg: float = 0.0
+    beamwidth_az_deg: float = 65.0
+    beamwidth_el_deg: float = 65.0
+    downtilt_deg: float = 0.0
+    pattern: str = "isotropic"
 
     def __post_init__(self):
         if not (np.isfinite(self.frequency_hz) and self.frequency_hz > 0.0):
             raise ValueError(f"frequency_hz must be a positive finite number, got {self.frequency_hz!r}")
+        if not isinstance(self.pattern, str) or self.pattern.lower() not in ANTENNA_PATTERNS:
+            raise ValueError(f"pattern must be one of {ANTENNA_PATTERNS}, got {self.pattern!r}")
+        self.pattern = self.pattern.lower()
+        for name in ("beamwidth_az_deg", "beamwidth_el_deg"):
+            value = getattr(self, name)
+            if not (np.isfinite(value) and value > 0.0):
+                raise ValueError(f"{name} must be a positive finite angle in degrees, got {value!r}")
+        for name in ("azimuth_deg", "downtilt_deg"):
+            if not np.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be a finite angle in degrees, got {getattr(self, name)!r}")
 
     @property
     def power_mw(self) -> float:
         return 10.0 ** (self.tx_power_dbm / 10.0)
+
+    @property
+    def is_isotropic(self) -> bool:
+        return self.pattern == "isotropic"
+
+    def pattern_gain_db(self, phi_deg, theta_deg):
+        """
+        Gain of the radiation pattern relative to boresight, in dB (always <= 0), for
+        a direction of departure given by its azimuth ``phi_deg`` (-180..180) and
+        elevation ``theta_deg`` (-90..90, positive above the horizon), i.e. the
+        ``tx_phi_deg`` / ``tx_theta_deg`` of a ray.  Floats or numpy arrays.
+        Isotropic antennas return 0 dB everywhere.
+        """
+        scalar = np.ndim(phi_deg) == 0 and np.ndim(theta_deg) == 0
+        phi = np.asarray(phi_deg, dtype=float)
+        theta = np.asarray(theta_deg, dtype=float)
+        if self.is_isotropic:
+            gain = np.zeros(np.broadcast(phi, theta).shape)
+        else:
+            limit = SECTOR_MAX_ATTENUATION_DB
+            d_phi = (phi - self.azimuth_deg + 180.0) % 360.0 - 180.0     # wrapped into [-180, 180)
+            d_theta = theta + self.downtilt_deg                          # elevation off the tilted boresight
+            a_h = np.minimum(12.0 * (d_phi / self.beamwidth_az_deg) ** 2, limit)
+            a_v = np.minimum(12.0 * (d_theta / self.beamwidth_el_deg) ** 2, limit)
+            gain = 0.0 - np.minimum(a_h + a_v, limit)                    # (0.0 - x: boresight gives 0.0, not -0.0)
+        return float(gain) if scalar else gain
+
+    def gain_dbi(self, phi_deg, theta_deg):
+        """Antenna gain in dBi towards a direction of departure: antenna_gain_dbi + pattern_gain_db."""
+        return self.antenna_gain_dbi + self.pattern_gain_db(phi_deg, theta_deg)
 
 
 @dataclass
@@ -151,6 +219,16 @@ class RayField:
         """Power per ray in mW (0 where the ray does not exist)."""
         return np.abs(self.amplitude) ** 2
 
+    def total_power_linear(self, coherent: bool = False) -> np.ndarray:
+        """
+        Total received power per point in mW (shape = points_shape).
+        coherent=False (default): sum of the ray powers, sum_k |a_k|^2.
+        coherent=True: power of the complex sum of the rays, |sum_k a_k|^2 (fast fading).
+        """
+        if coherent:
+            return np.abs(self.amplitude.sum(axis=0)) ** 2
+        return self.power_linear.sum(axis=0)
+
 
 def _angles_deg(p_src: np.ndarray, p_dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Vectorized azimuth/elevation (degrees) of the direction src -> dst; inputs broadcast to [..., 3]."""
@@ -165,6 +243,8 @@ class RayTracer:
     """
     Simulates radio ray paths between transmitters and receivers.
     The ground is the plane z = 0 (smooth, homogeneous, vertical polarization).
+    Every ray amplitude includes the transmitter gain towards the direction in
+    which that ray leaves the antenna (``Transmitter.gain_dbi`` of its AoD).
     """
     def __init__(self, ground_eps_r: float = 15.0, ground_sigma: float = 0.005):
         self.ground_eps_r = ground_eps_r
@@ -182,6 +262,11 @@ class RayTracer:
         theta = math.degrees(math.atan2(v[2], max(1e-6, dist_2d)))
         return phi, theta
 
+    @staticmethod
+    def _pattern_factor(tx: Transmitter, phi_deg, theta_deg):
+        """Amplitude factor (<= 1) of the transmitter pattern towards a direction of departure."""
+        return 10.0 ** (tx.pattern_gain_db(phi_deg, theta_deg) / 20.0)
+
     def _fresnel_ground_reflection(self, theta_grazing_rad, freq_hz: float):
         """Fresnel reflection coefficient for ground plane (vertical polarization, standard for cellular)."""
         return fresnel_reflection_coefficient(theta_grazing_rad, freq_hz,
@@ -193,6 +278,10 @@ class RayTracer:
         1. Direct Line of Sight (LoS) Ray
         2. Ground Reflected Ray
         3. Specular Reflections from Planar Reflectors / Walls
+
+        The complex amplitude of each ray carries its phase (-k*d plus the phase of
+        the reflection coefficient), so the returned CIR can be summed incoherently
+        or coherently (``cir.total_received_power_dbm(coherent=True)``).
         """
         cir = ChannelImpulseResponse()
         tx_p = np.array([tx.x, tx.y, tx.z], dtype=float)
@@ -202,6 +291,8 @@ class RayTracer:
         # Field amplitude at 1 m scaled so that |a|^2 is power in mW (Friis):
         # |a| = sqrt(P_t * G_t) * lambda / (4*pi*d)
         amp_1m = math.sqrt(tx.power_mw * (10**(tx.antenna_gain_dbi/10.0))) * wavelength / (4.0 * math.pi)
+        # Sector antennas: every ray is also scaled by the pattern towards its own AoD
+        sector = not tx.is_isotropic
 
         # --- 1. Direct LoS Ray ---
         d_direct = float(np.linalg.norm(rx_p - tx_p))
@@ -213,6 +304,8 @@ class RayTracer:
 
             tx_phi, tx_theta = self._calc_angles(tx_p, rx_p)
             rx_phi, rx_theta = self._calc_angles(rx_p, tx_p)
+            if sector:
+                mag_direct *= self._pattern_factor(tx, tx_phi, tx_theta)
 
             cir.add_ray(MultipathRay(
                 tx_id=tx.tx_id,
@@ -248,6 +341,8 @@ class RayTracer:
             rx_image_ground = np.array([rx_p[0], rx_p[1], -rx_p[2]], dtype=float)
             tx_phi_g, tx_theta_g = self._calc_angles(tx_p, rx_image_ground)
             rx_phi_g, rx_theta_g = self._calc_angles(rx_p, tx_image_ground)
+            if sector:
+                mag_ground *= self._pattern_factor(tx, tx_phi_g, tx_theta_g)
 
             cir.add_ray(MultipathRay(
                 tx_id=tx.tx_id,
@@ -287,6 +382,8 @@ class RayTracer:
 
             tx_phi_w, tx_theta_w = self._calc_angles(tx_p, p_wall_hit)
             rx_phi_w, rx_theta_w = self._calc_angles(rx_p, p_wall_hit)
+            if sector:
+                mag_wall *= self._pattern_factor(tx, tx_phi_w, tx_theta_w)
 
             cir.add_ray(MultipathRay(
                 tx_id=tx.tx_id,
@@ -322,15 +419,18 @@ class RayTracer:
         wavelength = SPEED_OF_LIGHT / tx.frequency_hz
         k = 2.0 * math.pi / wavelength
         amp_1m = math.sqrt(tx.power_mw * (10**(tx.antenna_gain_dbi/10.0))) * wavelength / (4.0 * math.pi)
+        sector = not tx.is_isotropic
 
         def store(idx, ok, dist, coeff, tx_target, rx_target):
             """Fill ray ``idx``: path length ``dist``, reflection coefficient ``coeff``, aim points."""
-            with np.errstate(divide="ignore", invalid="ignore"):
-                amp = (amp_1m / dist) * coeff * np.exp(-1j * k * dist)
-            amplitude[idx] = np.where(ok, amp, 0.0)
-            tau_ns[idx] = np.where(ok, dist / SPEED_OF_LIGHT * 1e9, np.nan)
             tx_phi, tx_theta = _angles_deg(tx_p, tx_target)
             rx_phi, rx_theta = _angles_deg(pts, rx_target)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                amp = (amp_1m / dist) * coeff * np.exp(-1j * k * dist)
+                if sector:
+                    amp = amp * self._pattern_factor(tx, tx_phi, tx_theta)
+            amplitude[idx] = np.where(ok, amp, 0.0)
+            tau_ns[idx] = np.where(ok, dist / SPEED_OF_LIGHT * 1e9, np.nan)
             for a, values in enumerate((tx_phi, tx_theta, rx_phi, rx_theta)):
                 angles[a, idx] = np.where(ok, values, np.nan)
             valid[idx] = ok

@@ -158,7 +158,8 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as ctx:
             cli.main(["--help"])
         self.assertEqual(ctx.exception.code, 0)
-        for option in ("--mode", "--reflector", "--outdir", "--freq"):
+        for option in ("--mode", "--reflector", "--outdir", "--freq", "--coherent", "--sector", "--downtilt",
+                       "--shadow-sigma", "--seed", "--min-distance", "--strict", "--sinr", "--noise-figure", "--bandwidth"):
             self.assertIn(option, stdout.getvalue())
 
     def test_every_mode_writes_its_outputs(self):
@@ -200,8 +201,104 @@ class CliTests(unittest.TestCase):
                     spreads[setting] = json.load(f)["metrics"]["mean_delay_spread_ns"]
         self.assertGreater(spreads["on"], 2 * spreads["off"])
 
+    def read_outputs(self, tmp):
+        with open(os.path.join(tmp, "simulation_results.csv")) as f:
+            csv_text = f.read()
+        with open(os.path.join(tmp, "simulation_summary.json")) as f:
+            return csv_text, json.load(f)
+
+    def test_sinr_option_adds_columns_json_block_and_map(self):
+        for mode in ("raytracing", "tworay", "hata", "fspl"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                code, out, err = self.run_cli("--mode", mode, "--size", "400", "--res", "50", "--sinr",
+                                              "--noise-figure", "5", "--bandwidth", "10e6", "--outdir", tmp)
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn("coverage_sinr.svg", os.listdir(tmp))
+                ET.parse(os.path.join(tmp, "coverage_sinr.svg"))
+                csv_text, summary = self.read_outputs(tmp)
+                self.assertTrue(csv_text.splitlines()[0].endswith(",sinr_db,interference_plus_noise_dbm"))
+                self.assertEqual(summary["sinr"]["noise_figure_db"], 5.0)
+                self.assertEqual(summary["sinr"]["bandwidth_hz"], 10e6)
+                self.assertIsInstance(summary["sinr"]["mean_sinr_db"], float)
+                self.assertIn("SINR (noise -99.0 dBm in 10 MHz, NF 5 dB)", out)
+        # Without --sinr nothing changes
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_cli("--size", "400", "--res", "50", "--outdir", tmp)
+            csv_text, summary = self.read_outputs(tmp)
+            self.assertEqual(csv_text.splitlines()[0],
+                             "x_m,y_m,best_tx_id,rx_power_dbm,path_loss_db,rms_delay_spread_ns,angular_spread_phi_deg")
+            self.assertNotIn("sinr", summary)
+
+    def test_coherent_sector_and_shadow_options(self):
+        def run(*options):
+            with tempfile.TemporaryDirectory() as tmp:
+                code, out, err = self.run_cli("--size", "400", "--res", "20", "--outdir", tmp, *options)
+                self.assertEqual((code, err), (0, ""))
+                csv_text, summary = self.read_outputs(tmp)
+            return out, csv_text, summary["metrics"]
+
+        out, base_csv, base = run()
+        self.assertIn("ray tracing (reflector on)", out)          # same banner as 1.1.0 by default
+        out, coherent_csv, coherent = run("--coherent")
+        self.assertIn("coherent sum", out)
+        self.assertNotEqual(coherent_csv, base_csv)
+        self.assertLess(coherent["min_rx_power_dbm"], base["min_rx_power_dbm"] - 3.0)      # fades
+        # The spreads still use |a_k|^2; the mean only moves because fades change the best server of some pixels
+        self.assertAlmostEqual(coherent["mean_delay_spread_ns"], base["mean_delay_spread_ns"], delta=5.0)
+        out, _, sector = run("--sector", "--downtilt", "5")
+        self.assertIn("65-degree sectors", out)
+        self.assertLess(sector["mean_rx_power_dbm"], base["mean_rx_power_dbm"] - 1.0)
+        self.assertLessEqual(sector["max_rx_power_dbm"], base["max_rx_power_dbm"])
+        # Shadow fading: reproducible with --seed, different with another seed, off by default
+        out, shadow_a, _ = run("--shadow-sigma", "8", "--seed", "3")
+        self.assertIn("sigma = 8 dB (seed 3)", out)
+        _, shadow_b, _ = run("--shadow-sigma", "8", "--seed", "3")
+        _, shadow_c, _ = run("--shadow-sigma", "8", "--seed", "4")
+        self.assertEqual(shadow_a, shadow_b)
+        self.assertNotEqual(shadow_a, shadow_c)
+        self.assertNotEqual(shadow_a, base_csv)
+        _, seed_only, _ = run("--seed", "3")
+        self.assertEqual(seed_only, base_csv)
+        # The new options are also accepted by the empirical modes (where --coherent only prints a note)
+        out, _, _ = run("--mode", "fspl", "--coherent", "--sector", "--shadow-sigma", "4", "--seed", "1")
+        self.assertIn("--coherent is ignored", out)
+
+    def test_min_distance_option(self):
+        """A 1.5 m mast on a grid node: that pixel has no data unless --min-distance 0."""
+        def nan_rows(*options):
+            with tempfile.TemporaryDirectory() as tmp:
+                code, _, err = self.run_cli("--mode", "fspl", "--size", "100", "--res", "10", "--tx-height", "1.5",
+                                            "--outdir", tmp, *options)
+                self.assertEqual((code, err), (0, ""))
+                csv_text, _ = self.read_outputs(tmp)
+            return [line for line in csv_text.splitlines() if ",nan,nan," in line]
+
+        # Each mast is the only transmitter closer than 1 m to its pixel, so the other one serves it
+        self.assertEqual(nan_rows(), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_cli("--mode", "fspl", "--size", "100", "--res", "10", "--tx-height", "1.5", "--outdir", tmp)
+            near = [line.split(",") for line in self.read_outputs(tmp)[0].splitlines() if line.startswith("30.0,30.0,")][0]
+            self.run_cli("--mode", "fspl", "--size", "100", "--res", "10", "--tx-height", "1.5", "--min-distance", "0",
+                         "--outdir", tmp)
+            raw = [line.split(",") for line in self.read_outputs(tmp)[0].splitlines() if line.startswith("30.0,30.0,")][0]
+        self.assertEqual(near[2], "1")                # Tx0 stands on (30, 30): its own pixel is served by Tx1
+        self.assertEqual(raw[2], "0")                 # 1.1.0 behaviour: P_rx = P_tx + G at d = 0
+        self.assertEqual(float(raw[3]), 55.0)
+
+    def test_strict_hata_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, err = self.run_cli("--mode", "hata", "--strict", "--size", "400", "--res", "100", "--outdir", tmp)
+            self.assertEqual(code, 1)
+            self.assertIn("[x] Error: Cost231Hata (strict=True)", err)
+            self.assertIn("frequency 2400 MHz outside 1500-2000 MHz", err)
+            self.assertEqual(os.listdir(tmp), [])
+            code, out, err = self.run_cli("--mode", "fspl", "--strict", "--size", "400", "--res", "100", "--outdir", tmp)
+            self.assertEqual(code, 0)
+            self.assertIn("--strict only applies to --mode hata", out)
+
     def test_invalid_arguments_exit_with_usage_error(self):
         for args in (["--res", "0"], ["--size", "-10"], ["--freq", "0"], ["--mode", "magic"],
+                     ["--shadow-sigma", "-1"], ["--min-distance", "-1"], ["--bandwidth", "0"], ["--seed", "x"],
                      ["--reflector", "maybe"], ["--size", "100000", "--res", "1"]):
             with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
                 cli.main(args)

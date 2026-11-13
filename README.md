@@ -29,7 +29,7 @@ El simulador proporciona tanto modelos empíricos macrocelulares como un motor d
 * `distance_m` es la distancia 3D entre antenas en FSPL y Log-Distance, y la distancia horizontal en Two-Ray, Hata y COST-231 (las alturas se pasan con `ht_m` / `hr_m`). El atributo de clase `uses_ground_distance` lo indica.
 * Todos aceptan un `float` o un arreglo de numpy como distancia.
 * Entradas inválidas (frecuencia ≤ 0, distancia negativa, alturas ≤ 0 en Hata, entorno desconocido) lanzan `ValueError`.
-* Hata y COST-231 emiten un `ModelRangeWarning` cuando se evalúan fuera de su rango de validez; el resultado en ese caso es una extrapolación.
+* Hata y COST-231 emiten un `ModelRangeWarning` cuando se evalúan fuera de su rango de validez; el resultado en ese caso es una extrapolación. Con `strict=True` (p. ej. `OkumuraHata("urban_medium", strict=True)`) lanzan `ValueError` en lugar de extrapolar, con un mensaje que enumera qué parámetro está fuera de rango.
 
 ---
 
@@ -40,22 +40,67 @@ Cada rayo $k$ simulado en el espacio contiene:
 * Ángulos de Salida (AoD) en la Estación Base: $\phi_{\text{BS}}$ (azimut) y $\theta_{\text{BS}}$ (elevación)
 * Ángulos de Llegada (AoA) en la Estación Móvil: $\phi_{\text{MS}}$ y $\theta_{\text{MS}}$
 
-A partir de cada rayo, se calculan las siguientes métricas (la potencia se suma de forma **incoherente**: la fase de cada rayo se calcula pero no interviene en ninguna métrica):
+A partir de cada rayo, se calculan las siguientes métricas:
 
-1. **Potencia Total Recibida ($P_r$)**:
-   $$P_r = \sum_{k=1}^K |a_k|^2 \quad [\text{mW}], \qquad P_{r,\text{dBm}} = 10\log_{10}(P_r)$$
+1. **Potencia Total Recibida ($P_r$)**. Por defecto la suma es **incoherente** (potencia media local, sin desvanecimiento rápido); con `coherent=True` se suman las amplitudes complejas de los rayos de cada transmisor (interferencia constructiva/destructiva):
+   $$P_r^{\text{incoh}} = \sum_{k=1}^K |a_k|^2, \qquad P_r^{\text{coh}} = \Big|\sum_{k=1}^K a_k\Big|^2 \quad [\text{mW}], \qquad P_{r,\text{dBm}} = 10\log_{10}(P_r)$$
 
 2. **Pérdida de Trayecto (Path Loss)**:
    $$PL = P_{t,\text{dBm}} - P_{r,\text{dBm}} \quad [\text{dB}]$$
 
-3. **Retardo Medio en Exceso ($\overline{\tau}$)**:
+3. **Retardo Medio ($\overline{\tau}$)**, con $P_k = |a_k|^2$:
    $$\overline{\tau} = \frac{\sum_{k} P_k \tau_k}{\sum_{k} P_k} \quad [\text{ns}]$$
+   `cir.mean_excess_delay()` devuelve este retardo medio **absoluto** ($\tau_k = d_k/c$); `cir.mean_excess_delay(relative_to_first=True)` le resta el retardo del primer rayo que llega ($\overline{\tau} - \min_k \tau_k$), que es el retardo medio *en exceso* en sentido estricto.
 
 4. **Dispersión de Retardo RMS (RMS Delay Spread, $\sigma_\tau$)**:
    $$\sigma_\tau = \sqrt{\frac{\sum_{k} P_k \tau_k^2}{\sum_{k} P_k} - (\overline{\tau})^2} \quad [\text{ns}]$$
 
 5. **Dispersión Angular RMS (Angular Spread, $\sigma_\phi$)**:
    Calculado mediante estadísticas circulares vectoriales en $[-180^\circ, 180^\circ]$ respecto al ángulo medio ponderado por potencia.
+
+Las métricas 3–5 ponderan siempre cada rayo con su propia potencia $|a_k|^2$, también cuando la potencia total se calcula con `coherent=True`: describen cómo se reparte la energía entre los rayos, no su suma de banda estrecha.
+
+---
+
+### C. Opciones de la simulación (nuevas en 1.2.0)
+
+Todas son opcionales y, con su valor por defecto, los resultados son los de la versión 1.1.0 (única excepción: los píxeles a menos de 1 m de una antena, ver *Campo lejano*).
+
+**Suma coherente** — `run_raytracing_simulation(..., coherent=True)`, `cir.total_received_power_dbm(coherent=True)`, `RayField.total_power_linear(coherent=True)`. Suma las amplitudes complejas (la fase $-k\,d_k$ más la del coeficiente de reflexión) de los rayos de cada transmisor, lo que produce desvanecimiento rápido. Sin muros (rayo directo + suelo) el resultado coincide con `TwoRayGroundReflection` con el mismo suelo ($\epsilon_r$, $\sigma$), polarización vertical, alturas y ganancia: la diferencia máxima medida es de $2\cdot10^{-10}$ dB (redondeo; grillas de hasta 250 000 píxeles a 0.9, 2.4 y 3.5 GHz) y los tests exigen menos de $10^{-8}$ dB. Ambos usan la misma geometría (distancia horizontal más alturas en Two-Ray, coordenadas 3D en el trazador) y el mismo ángulo rasante. Diferencias de convención que quedan: (a) en un nulo perfecto el trazador devuelve $-\infty$ dBm y Two-Ray limita la pérdida a 200 dB; (b) con antenas coincidentes ($d = 0$) Two-Ray devuelve 0 dB y el trazador no tiene rayo directo (y el píxel queda en `NaN` por `min_distance_m`); (c) con antenas sectoriales el trazador aplica el diagrama a cada rayo según su propio ángulo de salida, mientras que el modo empírico Two-Ray usa para ambos rayos la dirección directa Tx→Rx. El patrón de desvanecimiento tiene un periodo espacial del orden de la longitud de onda: una grilla más gruesa solo lo *muestrea*.
+
+```python
+res = sim.run_raytracing_simulation((0, 1000), (0, 1000), resolution_m=5.0, coherent=True)
+cir = sim.ray_tracer.trace_paths(sim.transmitters[0], (650.0, 450.0, 1.5))
+print(cir.total_received_power_dbm(), cir.total_received_power_dbm(coherent=True))
+```
+
+**Antenas sectoriales** — `Transmitter(..., pattern="sector", azimuth_deg=0, beamwidth_az_deg=65, beamwidth_el_deg=65, downtilt_deg=0)`. Diagrama parabólico de 3GPP (TR 36.814 / TR 38.901), con `antenna_gain_dbi` como ganancia máxima (en el eje):
+$$A_H(\varphi) = -\min\left[12\left(\frac{\varphi}{\varphi_{3\text{dB}}}\right)^2, 30\right], \quad A_V(\theta) = -\min\left[12\left(\frac{\theta - \theta_{\text{tilt}}}{\theta_{3\text{dB}}}\right)^2, 30\right], \quad A(\varphi,\theta) = -\min\left[-(A_H + A_V),\ 30\right] \ \text{dB}$$
+$\varphi$ es el azimut medido desde `azimuth_deg` (0° = eje +x, 90° = eje +y) y $\theta - \theta_{\text{tilt}}$ la elevación medida desde el eje del haz; `downtilt_deg` positivo inclina el haz hacia el suelo. La atenuación es 0 dB en el eje, 3 dB a media anchura de haz y satura en 30 dB (lóbulo trasero). En ray tracing se aplica a **cada rayo** en su dirección de salida (AoD), en los dos modos (vectorizado y punto a punto); en los modos empíricos, en la dirección Tx→Rx. `tx.pattern_gain_db(phi, theta)` devuelve $A$ y `tx.gain_dbi(phi, theta)` la ganancia total. Por defecto `pattern="isotropic"`.
+
+```python
+sim.add_transmitter(Transmitter(tx_id=0, x=500, y=500, z=30, antenna_gain_dbi=17,
+                                pattern="sector", azimuth_deg=90, downtilt_deg=6, beamwidth_el_deg=10))
+```
+
+**Campo lejano** — `min_distance_m` (por defecto 1 m) en `run_raytracing_simulation` y `run_empirical_simulation`. Los píxeles cuya distancia 3D a la antena de un transmisor es menor que el umbral se marcan como `NaN` para ese transmisor (potencia y pérdida no fiables: Friis no vale junto a la antena, y a $d \to 0$ daba valores absurdos como $P_r = P_t + G$). Ese transmisor no puede ser el mejor servidor del píxel: se elige entre los demás, y si no hay ninguno el píxel queda sin servidor (`best_server_id = -1`, potencia `NaN`). Los mapas, el CSV y las estadísticas del JSON tratan esos píxeles como "sin dato", sin avisos de numpy. `min_distance_m=None` (o `0`) lo desactiva. Se eligió 1 m porque es la distancia de referencia $d_0$ habitual de los modelos de pérdida, equivale a 8 λ a 2.4 GHz (3 λ a 900 MHz) y no altera ningún escenario con antenas en mástil (el píxel más cercano queda a $|h_t - h_r|$); por debajo de ~300 MHz (λ > 1 m) conviene subirlo a unas pocas longitudes de onda.
+
+**Desvanecimiento por sombra** — `shadow_fading_sigma_db` (por defecto 0) y `seed` en las dos simulaciones. Con $\sigma > 0$ se suma a la pérdida de cada (transmisor, píxel) una muestra independiente $X \sim \mathcal{N}(0, \sigma^2)$ dB (log-normal en unidades lineales), generada con `numpy.random.default_rng(seed)`: misma semilla y misma grilla ⇒ mismo mapa, en cualquier modo (vectorizado, punto a punto o empírico).
+
+```python
+res = sim.run_empirical_simulation(OkumuraHata("urban_medium"), (0, 5000), (0, 5000), resolution_m=50.0,
+                                   shadow_fading_sigma_db=8.0, seed=1)
+```
+
+**SINR** — `result.compute_sinr(noise_figure_db=7.0, bandwidth_hz=20e6, temperature_k=290.0)` calcula por píxel el SINR del mejor servidor en el enlace descendente:
+$$\text{SINR} = \frac{P_{\text{mejor}}}{\sum_{i \ne \text{mejor},\ f_i = f_{\text{mejor}}} P_i + N}, \qquad N = k\,T\,B\,F \quad (-93.97\ \text{dBm con 20 MHz y } F = 7\ \text{dB})$$
+Solo interfieren los transmisores de la **misma frecuencia** que el servidor (co-canal); los de otra frecuencia se ignoran por completo. El método devuelve el mapa y lo guarda en `result.sinr_db`, junto con `result.interference_plus_noise_dbm` ($I + N$ en dBm) y `result.sinr_settings`. A partir de ese momento `export_csv` añade al final las columnas `sinr_db` e `interference_plus_noise_dbm` y `export_json` un bloque `"sinr"`; si no se llama, los archivos son idénticos a los de 1.1.0. `result.sinr_map(...)` calcula lo mismo sin guardar nada y `thermal_noise_dbm(bandwidth_hz, noise_figure_db)` da $N$. Un píxel sin servidor, o con un interferente co-canal de potencia desconocida (a menos de `min_distance_m` de él), tiene SINR `NaN`.
+
+```python
+sinr = result.compute_sinr(noise_figure_db=7.0, bandwidth_hz=20e6)
+MapVisualizer.export_svg(result, "sinr.svg", metric="sinr")      # o metric="interference" para I + N
+result.export_csv("con_sinr.csv")                                 # incluye las dos columnas nuevas
+```
 
 ---
 
@@ -76,7 +121,7 @@ open_rps/
 │   └── cli.py            # Interfaz de línea de comandos
 ├── examples/
 │   ├── example_sim.py           # Demostración con 2 transmisores y reflector
-│   └── practicas_openrps.ipynb  # Cuaderno con 3 prácticas para alumnos
+│   └── practicas_openrps.ipynb  # Cuaderno con 4 prácticas para alumnos
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -105,8 +150,8 @@ Cualquiera de las opciones instala la librería (`import open_rps`) y el comando
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.1.0-py3-none-any.whl
-pip install dist/open_rps-1.1.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.2.0-py3-none-any.whl
+pip install dist/open_rps-1.2.0-py3-none-any.whl
 ```
 
 ---
@@ -142,6 +187,12 @@ open-rps --mode hata --size 2000 --res 50 --freq 900e6 --tx-height 30
 open-rps --mode tworay --size 1000 --res 25
 open-rps --mode fspl
 
+# Novedades 1.2.0: suma coherente, antenas sectoriales, sombra log-normal reproducible y mapa de SINR
+open-rps --mode raytracing --res 5 --coherent --outdir out_coherente
+open-rps --mode raytracing --sector --downtilt 4 --sinr --outdir out_sector
+open-rps --mode hata --freq 900e6 --tx-height 30 --size 5000 --res 100 --shadow-sigma 8 --seed 1 --sinr
+open-rps --mode hata --strict        # termina con error (código 1) e indica qué está fuera del rango de COST-231 Hata
+
 # Ayuda:
 open-rps --help          # o: python3 -m open_rps.cli --help
 ```
@@ -155,10 +206,20 @@ open-rps --help          # o: python3 -m open_rps.cli --help
 | `--power` | dBm | `43` | Potencia de Tx0 (Tx1 emite 3 dB menos). |
 | `--tx-height` | metros | `25` | Altura de las dos estaciones base. |
 | `--reflector` | `on`, `off` | `on` | Muro reflector en x = size/2 (solo afecta a `raytracing`). |
+| `--coherent` | (sin valor) | desactivado | Suma coherente de los rayos: desvanecimiento rápido (solo afecta a `raytracing`). |
+| `--sector` | (sin valor) | desactivado | Antenas sectoriales 3GPP de 65° apuntando al centro del área (Tx0 a 45°, Tx1 a −135°) en lugar de isotrópicas. |
+| `--downtilt` | grados | `0` | Inclinación hacia abajo de las antenas sectoriales (solo con `--sector`). |
+| `--shadow-sigma` | dB | `0` | Desviación típica del desvanecimiento por sombra log-normal (0 = sin sombra). |
+| `--seed` | entero | aleatoria | Semilla de la sombra, para repetir exactamente un mapa. |
+| `--min-distance` | metros | `1` | Los píxeles más cercanos que esto a una antena quedan sin dato; `0` lo desactiva. |
+| `--strict` | (sin valor) | desactivado | Con `--mode hata`: termina con error (código de salida 1) en lugar de extrapolar fuera del rango de validez. En el escenario de demostración las estaciones están dentro del área, así que siempre hay píxeles a menos de 1 km y `--strict` falla siempre: sirve para ver qué parámetros están fuera de rango. |
+| `--sinr` | (sin valor) | desactivado | Calcula el SINR del mejor servidor: columnas extra en el CSV, bloque `"sinr"` en el JSON y `coverage_sinr.svg`. |
+| `--noise-figure` | dB | `7` | Figura de ruido del receptor (para `--sinr`). |
+| `--bandwidth` | Hz | `20e6` | Ancho de banda de ruido (para `--sinr`). |
 | `--theme` | `light`, `dark` | `light` | Tema de color de los SVG. |
 | `--outdir` | ruta | `./output` | Carpeta de salida, **relativa al directorio actual**. |
 
-El CLI escribe en `--outdir` los mismos nombres de archivo que el script de demostración: `simulation_results.csv`, `simulation_summary.json`, `coverage_rx_power.svg`, `coverage_best_server.svg` y, solo en modo `raytracing`, `coverage_delay_spread.svg`. Cada ejecución sobrescribe la anterior: usa un `--outdir` distinto por escenario si quieres conservarlas. En los modos empíricos las columnas de dispersión de retardo y angular del CSV valen `nan` (y `null` en el JSON), porque esos modelos no describen el multitrayecto.
+El CLI escribe en `--outdir` los mismos nombres de archivo que el script de demostración: `simulation_results.csv`, `simulation_summary.json`, `coverage_rx_power.svg`, `coverage_best_server.svg`, solo en modo `raytracing` `coverage_delay_spread.svg` y, solo con `--sinr`, `coverage_sinr.svg`. Cada ejecución sobrescribe la anterior: usa un `--outdir` distinto por escenario si quieres conservarlas. En los modos empíricos las columnas de dispersión de retardo y angular del CSV valen `nan` (y `null` en el JSON), porque esos modelos no describen el multitrayecto.
 
 Con los valores por defecto (2.4 GHz, antenas a 25 m, área de 1 km) el modo `hata` queda fuera del rango de validez de ambos modelos de Hata; el CLI lo indica con una línea `[!] Warning: ...`.
 
@@ -179,23 +240,28 @@ result = sim.run_raytracing_simulation(x_range=(0, 1000), y_range=(0, 1000), res
 print(f"Potencia máxima: {result.max_rx_power_dbm.max():.2f} dBm")
 result.export_csv("mi_simulacion.csv")
 result.export_json("mi_simulacion.json")
-MapVisualizer.export_svg(result, "mi_mapa.svg", metric="rx_power")   # o "delay_spread", "best_server"
+MapVisualizer.export_svg(result, "mi_mapa.svg", metric="rx_power")   # o "delay_spread", "best_server", "sinr", "interference"
 
 # Respuesta al impulso (CIR) en un punto concreto:
 cir = sim.ray_tracer.trace_paths(sim.transmitters[0], (650.0, 450.0, 1.5))
 print(len(cir.rays), cir.rms_delay_spread(), cir.angular_spread(plane="phi", station="bs"))
+print(cir.mean_excess_delay(), cir.mean_excess_delay(relative_to_first=True))   # absoluto / en exceso
 ```
+
+Las opciones nuevas de la versión 1.2.0 (`coherent`, antenas `pattern="sector"`, `min_distance_m`, `shadow_fading_sigma_db`/`seed`, `compute_sinr`) se describen, con ejemplos, en la sección 1.C.
 
 Notas sobre `SimulationResult`:
 
 * El primer eje de `rx_power_dbm` y `path_loss_db` sigue el **orden en que se añadieron** los transmisores, no su `tx_id`. `tx_ids` da el identificador de cada posición y `best_server_index` la posición del mejor servidor por píxel (`best_server_id` contiene los `tx_id`; `-1` = sin servidor).
-* `path_loss_db` es $P_t - P_r$, es decir, incluye la ganancia de antena del transmisor.
+* `path_loss_db` es $P_t - P_r$, es decir, incluye la ganancia de antena del transmisor (y su diagrama, si es sectorial) y la sombra.
+* Valores sin dato: `-inf` dBm significa que no llega potencia; `NaN`, que el valor no es fiable o no existe (píxel a menos de `min_distance_m` de la antena, métrica que el modelo no proporciona, píxel sin servidor).
+* `tx_frequencies_hz` guarda la frecuencia de cada transmisor (la usa el SINR); `sinr_db`, `interference_plus_noise_dbm` y `sinr_settings` valen `None` hasta que se llama a `compute_sinr()`.
 * `PlanarReflector` acepta `bounds=(xmin, xmax, ymin, ymax, zmin, zmax)` para limitar el parche reflectante (sin `bounds` el plano es infinito) y, opcionalmente, `eps_r`/`sigma` para usar el coeficiente de Fresnel dependiente del ángulo en lugar de `reflectivity`.
 * `run_raytracing_simulation` evalúa toda la grilla con numpy. `vectorized=False` ejecuta la implementación de referencia punto a punto (mismos resultados, decenas de veces más lenta).
 
 ### D. Cuaderno de prácticas (Jupyter)
 
-`examples/practicas_openrps.ipynb` contiene tres prácticas guiadas, con preguntas y ejercicios "Tu turno": (1) pérdida de trayecto vs. distancia entre modelos, (2) cobertura multi-celda y efecto de un muro reflector, (3) respuesta al impulso del canal, dispersión de retardo y angular. Necesita matplotlib y Jupyter, que se instalan con el extra `notebook`:
+`examples/practicas_openrps.ipynb` contiene cuatro prácticas guiadas, con preguntas y ejercicios "Tu turno": (1) pérdida de trayecto vs. distancia entre modelos, (2) cobertura multi-celda y efecto de un muro reflector, (3) respuesta al impulso del canal, dispersión de retardo y angular, (4) suma coherente (desvanecimiento rápido y comparación con Two-Ray) y mapa de SINR con antenas sectoriales frente a isotrópicas. Necesita matplotlib y Jupyter, que se instalan con el extra `notebook`:
 
 ```bash
 pip install -e ".[notebook]"
@@ -212,7 +278,7 @@ Los tests usan `unittest` de la librería estándar (no hace falta pytest). Con 
 python3 -m unittest discover -s tests
 ```
 
-Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del modelo Two-Ray, la dispersión de retardo y angular (incluido el cruce por ±180°), la geometría de los rayos de suelo y de muro, la equivalencia entre el trazado vectorizado y el de referencia punto a punto, simulaciones completas, las exportaciones CSV/JSON/SVG (con `tx_id` no consecutivos y mapas sin datos) y el CLI.
+Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del modelo Two-Ray, la dispersión de retardo y angular (incluido el cruce por ±180°), la geometría de los rayos de suelo y de muro, la equivalencia entre el trazado vectorizado y el de referencia punto a punto, simulaciones completas, las exportaciones CSV/JSON/SVG (con `tx_id` no consecutivos y mapas sin datos) y el CLI. `tests/test_v1_2.py` cubre lo añadido en 1.2.0: regresión numérica frente a 1.1.0 con los valores por defecto, `relative_to_first`, el umbral de campo lejano, `strict`, la suma coherente (incluida su igualdad con Two-Ray), la sombra log-normal (reproducibilidad y estadística), el diagrama sectorial, el SINR con valores calculados a mano, la paleta Okabe-Ito y la fusión de celdas de los SVG.
 
 ---
 
@@ -220,23 +286,43 @@ Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del mo
 
 OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados conviene tener presente lo que **no** modela:
 
-* **Sin validación experimental.** Los modelos están comprobados contra sus fórmulas y casos calculados a mano, no contra mediciones ni contra el RPS original u otra herramienta de referencia.
-* **Suma incoherente de potencias.** El trazador suma $|a_k|^2$ rayo a rayo: no hay interferencia constructiva/destructiva, ni desvanecimiento rápido, ni la caída $d^4$ tras el punto de quiebre. Por eso el modo `raytracing` (directo + suelo) y el modelo `TwoRayGroundReflection` (suma coherente de los mismos dos rayos) dan resultados distintos.
+* **Sin validación experimental.** Los modelos están comprobados contra sus fórmulas, casos calculados a mano y entre sí (p. ej. ray tracing coherente frente a Two-Ray), no contra mediciones ni contra el RPS original u otra herramienta de referencia.
+* **Suma incoherente por defecto; la coherente es idealizada.** Por defecto el trazador suma $|a_k|^2$ rayo a rayo: da la potencia media local, sin interferencia ni desvanecimiento rápido, y por eso difiere de `TwoRayGroundReflection`. Con `coherent=True` aparecen los desvanecimientos (y la igualdad con Two-Ray), pero la posición exacta de cada nulo depende de fases calculadas sobre una geometría perfecta (suelo y muros lisos, posiciones exactas al milímetro, una sola frecuencia): sirve para ver el fenómeno y su estadística, no para predecir dónde habrá un nulo en un entorno real. Además el patrón varía en distancias del orden de λ, así que una grilla de metros solo lo muestrea (los mapas coherentes parecen "ruidosos" por ese motivo).
 * **Solo reflexiones especulares de un rebote.** Rayo directo, un rebote en el suelo y un rebote por muro. No hay rebotes múltiples (ni muro–suelo), difracción en aristas, dispersión difusa ni transmisión a través de obstáculos.
-* **Los muros no obstruyen.** Un reflector añade un rayo reflejado pero no bloquea ni atenúa el rayo directo, el de suelo ni los de otros muros: siempre hay línea de vista. No existen edificios como volúmenes ni zonas de sombra.
+* **Los muros no obstruyen.** Un reflector añade un rayo reflejado pero no bloquea ni atenúa el rayo directo, el de suelo ni los de otros muros: siempre hay línea de vista. No existen edificios como volúmenes ni zonas de sombra geométrica.
 * **Muros idealizados.** Planos lisos que reflejan por ambas caras; infinitos salvo que se indique `bounds`. Con `reflectivity` el coeficiente es constante (independiente del ángulo, la frecuencia y la polarización) con un desfase fijo de 180°. Con `eps_r` se usa Fresnel para campo eléctrico paralelo al muro, una aproximación válida para polarización vertical, muros verticales y propagación casi horizontal.
 * **Terreno plano.** El suelo es el plano z = 0, liso y homogéneo (por defecto $\epsilon_r = 15$, $\sigma = 0.005$ S/m), con polarización vertical. No hay relieve, curvatura terrestre, vegetación ni efectos atmosféricos.
-* **Antenas isotrópicas.** `antenna_gain_dbi` se aplica por igual en todas las direcciones (sin diagrama de radiación, sectores ni inclinación); el receptor tiene 0 dBi; no hay pérdidas por desajuste de polarización.
-* **Campo lejano siempre.** Se aplica Friis a cualquier distancia; los píxeles a pocos metros (o pocas longitudes de onda) de una antena no son fiables.
-* **Modelos empíricos.** Hata y COST-231 son ajustes estadísticos para macroceldas (1–20 km, antena base de 30–200 m). Usarlos a 2.4 GHz, con antenas más bajas o a menos de 1 km es extrapolar; el código avisa pero no lo impide. No se añade desvanecimiento por sombra (log-normal) y estos modos no producen dispersión de retardo ni angular.
-* **Mejor servidor = mayor potencia recibida.** No se calcula interferencia, ruido ni SINR. La dispersión de retardo y angular de cada píxel se refiere solo a los rayos del mejor servidor.
-* **`mean_excess_delay`** devuelve el retardo medio absoluto (ponderado por potencia), no el exceso respecto al primer rayo.
-* **Banda estrecha.** Una única frecuencia por transmisor; los coeficientes no dependen del ancho de banda.
-* **Mapas SVG.** Un rectángulo por celda: para grillas de cientos de miles de celdas los archivos son muy grandes (use el CSV). El mapa de mejor servidor usa una paleta fija de 8 colores; a partir del noveno transmisor comparten un gris ("Other"), y con más de 3 transmisores algunos pares de colores son difíciles de distinguir (sobre todo con daltonismo), por lo que cada transmisor se rotula además sobre el mapa.
+* **Antenas: isotrópica o sector parabólico.** El transmisor es isotrópico (por defecto) o usa el diagrama parabólico de 3GPP (`pattern="sector"`), que es un modelo analítico de un lóbulo principal con un suelo de −30 dB: no hay lóbulos laterales reales, diagramas medidos, agrupaciones, MIMO ni conformación de haz. El receptor es siempre isotrópico (0 dBi) y no hay pérdidas por desajuste de polarización. En los modos empíricos el diagrama se aplica en la dirección geométrica Tx→Rx; combinarlo con Hata (que ya promedia el entorno) es una aproximación habitual pero burda.
+* **Campo lejano con un umbral fijo.** Se aplica Friis a cualquier distancia por encima de `min_distance_m`; por debajo el píxel se marca `NaN`. El valor por defecto (1 m) es un umbral sencillo, no la distancia de Fraunhofer $2D^2/\lambda$ de una antena concreta (su tamaño $D$ no se modela): con antenas grandes o frecuencias bajas hay que subirlo a mano. Los píxeles a pocos metros de la antena siguen siendo poco representativos de un despliegue real.
+* **Modelos empíricos.** Hata y COST-231 son ajustes estadísticos para macroceldas (1–20 km, antena base de 30–200 m). Usarlos a 2.4 GHz, con antenas más bajas o a menos de 1 km es extrapolar; por defecto el código avisa pero no lo impide (`strict=True` sí lo impide). Estos modos no producen dispersión de retardo ni angular.
+* **Sombra sin correlación espacial.** `shadow_fading_sigma_db` añade una muestra log-normal independiente en cada píxel y para cada transmisor. La sombra real está correlacionada a lo largo de decenas de metros y entre emplazamientos; aquí el mapa resultante tiene aspecto de "sal y pimienta". Es adecuada para estudiar estadísticas (márgenes, probabilidad de cobertura), no para obtener mapas de aspecto realista. No depende del entorno ni de la distancia.
+* **SINR simplificado.** Enlace descendente, todos los transmisores emitiendo siempre (carga completa), receptor ideal salvo por su figura de ruido. Solo interfieren los transmisores con exactamente la misma frecuencia portadora; no hay interferencia de canal adyacente, ni reparto de recursos, ni control de potencia, ni traspasos. El mejor servidor sigue siendo el de mayor potencia recibida (no el de mayor SINR). La dispersión de retardo y angular de cada píxel se refiere solo a los rayos del mejor servidor.
+* **Banda estrecha.** Una única frecuencia por transmisor; los coeficientes no dependen del ancho de banda (`bandwidth_hz` solo interviene en la potencia de ruido).
+* **Mapas SVG.** Hasta 40 000 celdas hay un rectángulo por celda con su valor al pasar el ratón. Por encima se omiten esos valores y las celdas vecinas del mismo color se fusionan: una grilla de 400 × 400 pasa de 11.5 MB a unos 2 MB en los mapas continuos y a 15 kB en el de mejor servidor (misma imagen), pero para grillas mucho mayores sigue siendo preferible el CSV. El mapa de mejor servidor usa la paleta Okabe-Ito de 8 colores, distinguibles con las formas habituales de daltonismo; a partir del noveno transmisor comparten un gris ("Other"), por lo que cada transmisor se rotula además sobre el mapa.
 
 ---
 
-## 7. Cambios en la versión 1.1.0
+## 7. Historial de cambios
+
+### Versión 1.2.0
+
+Todo lo nuevo es opcional: con los argumentos por defecto, los resultados numéricos, el CSV y el JSON son idénticos a los de 1.1.0, salvo en los dos puntos indicados como *cambios de comportamiento*.
+
+* **Novedades** (detalles y ejemplos en la sección 1.C):
+  * `coherent=True` en `run_raytracing_simulation`, `ChannelImpulseResponse.total_received_power_linear/dbm` y `RayField.total_power_linear`: suma coherente de los rayos (desvanecimiento rápido), equivalente a Two-Ray cuando solo hay rayo directo y de suelo.
+  * Antenas sectoriales 3GPP: `Transmitter(pattern="sector", azimuth_deg, beamwidth_az_deg, beamwidth_el_deg, downtilt_deg)`, con `Transmitter.pattern_gain_db()` y `gain_dbi()`.
+  * `min_distance_m` (campo lejano), `shadow_fading_sigma_db` y `seed` (sombra log-normal) en las dos simulaciones.
+  * SINR: `SimulationResult.compute_sinr()`, `sinr_map()`, los campos `sinr_db`, `interference_plus_noise_dbm`, `sinr_settings` y `tx_frequencies_hz`, la función `thermal_noise_dbm()` y los mapas `metric="sinr"` / `"interference"`; columnas y bloque JSON extra solo si se calculó.
+  * `mean_excess_delay(relative_to_first=True)`: retardo medio en exceso respecto al primer rayo.
+  * `OkumuraHata(..., strict=True)` y `Cost231Hata(..., strict=True)`: `ValueError` fuera del rango de validez.
+  * CLI: `--coherent`, `--sector`, `--downtilt`, `--shadow-sigma`, `--seed`, `--min-distance`, `--strict`, `--sinr`, `--noise-figure`, `--bandwidth`.
+  * Cuaderno: nueva Práctica 4 (suma coherente y SINR con antenas sectoriales).
+* **Cambios de comportamiento**:
+  * Los píxeles a menos de 1 m (distancia 3D) de la antena de un transmisor valen ahora `NaN` para ese transmisor en lugar de un valor no físico, y ese transmisor no puede ser su mejor servidor. Solo afecta a escenarios con la antena a la altura del receptor y sobre un nodo de la grilla; `min_distance_m=None` recupera el comportamiento anterior. En un píxel sin servidor, `max_rx_power_dbm` vale `NaN` (en vez de `-inf`) si la potencia de algún transmisor es desconocida.
+  * El mapa SVG de mejor servidor usa la paleta Okabe-Ito (cambian los colores, no la geometría); `output/coverage_best_server.svg` se ha regenerado. En el tema oscuro el negro de la paleta se sustituye por blanco.
+* **SVG más pequeños**: en grillas de más de 40 000 celdas (las que ya no llevaban valores al pasar el ratón) las celdas contiguas del mismo color se fusionan por filas y columnas y se escriben como un `<path>` por color. Misma imagen (comprobado píxel a píxel con librsvg), entre 5 y 760 veces menos bytes en una grilla de 400 × 400. Los SVG de grillas pequeñas no cambian.
+
+### Versión 1.1.0
 
 * **Correcciones**: ángulos de elevación del rayo de suelo (el punto de rebote se calculaba mal); `export_csv` con `tx_id` que no fueran 0..n-1 (fallaba o tomaba la pérdida de otro transmisor); el JSON ya no contiene `NaN`/`Infinity`; los mapas sin datos ya no generan avisos de numpy.
 * **Cambios de comportamiento**: todos los modelos empíricos aplican la ganancia de antena (Two-Ray y Hata la ignoraban: sus mapas suben `antenna_gain_dbi` dB); FSPL ya no recorta a 0 dB la pérdida con ganancias; Two-Ray y Hata reciben la distancia horizontal en la simulación de grilla (antes la 3D); en los modos empíricos la dispersión de retardo/angular es `NaN` en lugar de 0; `tx_id` duplicados o negativos, normales nulas y reflectividades fuera de [0, 1] lanzan `ValueError`.

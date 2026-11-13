@@ -2,9 +2,14 @@
 OpenRPS - Multipath & Channel Metrics
 Implementation of Channel Impulse Response, Delay Spread, and Angular Spread.
 
-Power is always combined *incoherently* (P = sum |a_k|^2): the phase carried by
-each ray amplitude is kept for the user but is not used by any metric here, so
-small-scale (fast) fading is not represented.
+By default power is combined *incoherently* (P = sum |a_k|^2): the phase carried
+by each ray amplitude is ignored and small-scale (fast) fading does not appear.
+With ``coherent=True`` the received power is P = |sum a_k|^2 instead (complex
+sum, constructive/destructive interference between the rays of a transmitter).
+
+The delay-spread and angular-spread metrics always weight each ray by its own
+power |a_k|^2, whatever the value of ``coherent``: they describe how the energy
+is distributed among the rays, not the narrowband sum of the rays.
 """
 
 import math
@@ -87,39 +92,61 @@ class ChannelImpulseResponse:
     def _select(self, tx_id: Optional[int]) -> List[MultipathRay]:
         return [r for r in self.rays if tx_id is None or r.tx_id == tx_id]
 
-    def total_received_power_linear(self, tx_id: Optional[int] = None) -> float:
+    def total_received_power_linear(self, tx_id: Optional[int] = None, coherent: bool = False) -> float:
         """
-        Total received power in mW from a specific transmitter (or all transmitters),
-        summed incoherently: P_r = sum_k |a_k|^2
-        """
-        return float(sum(r.power_linear for r in self._select(tx_id)))
+        Total received power in mW from a specific transmitter (or all transmitters).
 
-    def total_received_power_dbm(self, tx_id: Optional[int] = None) -> float:
-        """Received power in dBm (10 * log10(P_r_mW)); -inf if there is no power."""
-        p_linear = self.total_received_power_linear(tx_id)
+        coherent=False (default): incoherent sum, P_r = sum_k |a_k|^2.
+        coherent=True: complex (phasor) sum of the rays of each transmitter,
+            P_r = |sum_k a_k|^2, which shows fast fading.  Rays of *different*
+            transmitters are independent signals, so with ``tx_id=None`` the
+            coherent powers of the transmitters are added incoherently.
+        """
+        rays = self._select(tx_id)
+        if not coherent:
+            return float(sum(r.power_linear for r in rays))
+        field_by_tx = {}
+        for r in rays:
+            field_by_tx[r.tx_id] = field_by_tx.get(r.tx_id, 0j) + r.magnitude
+        return float(sum(abs(field) ** 2 for field in field_by_tx.values()))
+
+    def total_received_power_dbm(self, tx_id: Optional[int] = None, coherent: bool = False) -> float:
+        """
+        Received power in dBm (10 * log10(P_r_mW)); -inf if there is no power
+        (no rays, or a perfect cancellation with ``coherent=True``).
+        """
+        p_linear = self.total_received_power_linear(tx_id, coherent=coherent)
         if p_linear <= 0:
             return float("-inf")
         return 10.0 * math.log10(p_linear)
 
-    def mean_excess_delay(self, tx_id: Optional[int] = None) -> float:
+    def mean_excess_delay(self, tx_id: Optional[int] = None, relative_to_first: bool = False) -> float:
         """
         Power-weighted mean delay (tau_bar) in nanoseconds:
         tau_bar = sum(P_k * tau_k) / sum(P_k)
-        Note: tau_k are absolute propagation delays (d_k / c), so this is the mean
-        *absolute* delay; subtract the delay of the first arrival to obtain the
-        excess delay in the strict sense.
+
+        relative_to_first=False (default, behaviour of OpenRPS <= 1.1): tau_k are the
+            absolute propagation delays (d_k / c), so the result is the mean
+            *absolute* delay.
+        relative_to_first=True: the delay of the first arrival (the ray with the
+            smallest delay among those carrying power) is subtracted, which gives
+            the mean excess delay in the strict sense (0 for a single ray).
         """
         target_rays = self._select(tx_id)
         p_tot = sum(r.power_linear for r in target_rays)
         if p_tot <= 0:
             return float("nan")
-        return sum(r.power_linear * r.tau_ns for r in target_rays) / p_tot
+        mean_delay = sum(r.power_linear * r.tau_ns for r in target_rays) / p_tot
+        if relative_to_first:
+            mean_delay -= min(r.tau_ns for r in target_rays if r.power_linear > 0)
+        return mean_delay
 
     def rms_delay_spread(self, tx_id: Optional[int] = None) -> float:
         """
         Root Mean Square (RMS) Delay Spread (sigma_tau) in nanoseconds:
         sigma_tau = sqrt( sum(P_k * tau_k^2)/P_tot - (tau_bar)^2 )
         (evaluated in the equivalent, numerically safer centered form).
+        The weights are always the ray powers P_k = |a_k|^2 (never a coherent sum).
         """
         target_rays = self._select(tx_id)
         p_tot = sum(r.power_linear for r in target_rays)
@@ -135,7 +162,8 @@ class ChannelImpulseResponse:
         plane: 'phi' (azimuth) or 'theta' (elevation)
         station: 'bs' (transmitter) or 'ms' (receiver)
 
-        Uses circular angle wrapping in [-180, 180] around mean angle.
+        Uses circular angle wrapping in [-180, 180] around mean angle, weighting
+        every ray by its own power |a_k|^2 (never a coherent sum).
         Returns: (mean_angle_deg, rms_angular_spread_deg)
         """
         plane = plane.lower()

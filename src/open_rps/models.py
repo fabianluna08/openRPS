@@ -220,8 +220,12 @@ class LogDistancePathLoss(PropagationModel):
         return _match_input(pl, distance_m)
 
 
-def _warn_out_of_range(model_name: str, f_mhz: float, f_range, ht_m: float, hr_m: float, d_km: np.ndarray):
-    """Emit a single ModelRangeWarning listing every parameter outside the model's validity range."""
+def _check_validity_range(model_name: str, f_mhz: float, f_range, ht_m: float, hr_m: float, d_km: np.ndarray,
+                          strict: bool = False):
+    """
+    Check every parameter against the model's validity range.  Outside it, emit a
+    single ModelRangeWarning listing the problems, or raise ValueError if ``strict``.
+    """
     problems = []
     if not (f_range[0] <= f_mhz <= f_range[1]):
         problems.append(f"frequency {f_mhz:g} MHz outside {f_range[0]:g}-{f_range[1]:g} MHz")
@@ -231,11 +235,17 @@ def _warn_out_of_range(model_name: str, f_mhz: float, f_range, ht_m: float, hr_m
         problems.append(f"mobile antenna height {hr_m:g} m outside 1-10 m")
     if d_km.size and (np.nanmin(d_km) < 1.0 or np.nanmax(d_km) > 20.0):
         problems.append("distance outside 1-20 km")
-    if problems:
-        warnings.warn(
-            f"{model_name} evaluated outside its validity range ({'; '.join(problems)}); "
-            "the result is an extrapolation and may be badly wrong.",
-            ModelRangeWarning, stacklevel=5)
+    if not problems:
+        return
+    if strict:
+        raise ValueError(
+            f"{model_name} (strict=True) cannot be evaluated outside its validity range: "
+            f"{'; '.join(problems)}. Create the model with strict=False to extrapolate "
+            "(a ModelRangeWarning is emitted instead).")
+    warnings.warn(
+        f"{model_name} evaluated outside its validity range ({'; '.join(problems)}); "
+        "the result is an extrapolation and may be badly wrong.",
+        ModelRangeWarning, stacklevel=5)
 
 
 class OkumuraHata(PropagationModel):
@@ -246,6 +256,10 @@ class OkumuraHata(PropagationModel):
     the formula is extrapolated (use ``Cost231Hata`` for 1500-2000 MHz).
     Environment types: 'urban_large', 'urban_medium', 'suburban', 'open' (rural).
 
+    strict: False (default) extrapolates with a ``ModelRangeWarning``.  True raises
+        ``ValueError`` instead whenever the frequency, an antenna height or any of
+        the distances is outside the validity range (nothing is extrapolated).
+
     ``distance_m`` is the horizontal distance; it is clamped to a minimum of 10 m.
     """
     ENVIRONMENTS = ("urban_large", "urban_medium", "suburban", "open")
@@ -253,11 +267,12 @@ class OkumuraHata(PropagationModel):
     supports_arrays = True
     uses_ground_distance = True
 
-    def __init__(self, environment: str = "urban_medium"):
+    def __init__(self, environment: str = "urban_medium", strict: bool = False):
         env = environment.lower()
         if env not in self.ENVIRONMENTS:
             raise ValueError(f"environment must be one of {self.ENVIRONMENTS}, got {environment!r}")
         self.env = env
+        self.strict = bool(strict)
 
     def _mobile_height_correction(self, f_mhz: float, hr_m: float) -> float:
         """a(h_r): correction factor for the mobile antenna height, in dB."""
@@ -272,7 +287,7 @@ class OkumuraHata(PropagationModel):
         ht_m = _validate_height(ht_m, "ht_m")
         hr_m = _validate_height(hr_m, "hr_m")
         d_km = np.maximum(0.01, _validate_distance(distance_m) / 1000.0)
-        _warn_out_of_range(type(self).__name__, f_mhz, self.FREQ_RANGE_MHZ, ht_m, hr_m, d_km)
+        _check_validity_range(type(self).__name__, f_mhz, self.FREQ_RANGE_MHZ, ht_m, hr_m, d_km, self.strict)
         return f_mhz, ht_m, hr_m, d_km
 
     def basic_path_loss(self, distance_m: ArrayLike, frequency_hz: float,
@@ -298,7 +313,7 @@ class Cost231Hata(OkumuraHata):
     PL = 46.3 + 33.9*log10(f) - 13.82*log10(ht) - a(hr) + (44.9 - 6.55*log10(ht))*log10(d) + C
     with C = 3 dB for metropolitan centres ('urban_large', which also uses the
     large-city a(hr)) and C = 0 dB for 'urban_medium' and 'suburban'.
-    Same height and distance ranges as Okumura-Hata.
+    Same height and distance ranges as Okumura-Hata, and same ``strict`` option.
     """
     ENVIRONMENTS = ("urban_large", "urban_medium", "suburban")
     FREQ_RANGE_MHZ = (1500.0, 2000.0)
