@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Herramientas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editores / sistema
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Los resultados generados en output/ se dejan versionables a proposito (sirven de
+# ejemplo en el README). Descomenta la linea siguiente si prefieres ignorarlos:
+# output/

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-rps"
+dynamic = ["version"]
+description = "Simulador de propagación de radio y estimador de canal multitrayecto (ray-tracing 3D y modelos empíricos) para uso docente"
+readme = "README.md"
+license = "GPL-2.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+keywords = ["radio", "propagation", "ray-tracing", "multipath", "wireless"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+notebook = ["matplotlib", "jupyterlab"]
+
+[project.scripts]
+open-rps = "open_rps.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "open_rps.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

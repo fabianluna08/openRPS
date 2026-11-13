@@ -1,0 +1,22 @@
+{
+  "grid": {
+    "x_min": 0.0,
+    "x_max": 1000.0,
+    "y_min": 0.0,
+    "y_max": 1000.0,
+    "nx": 41,
+    "ny": 41
+  },
+  "tx_ids": [
+    0,
+    1
+  ],
+  "metrics": {
+    "max_rx_power_dbm": -11.422001907277014,
+    "min_rx_power_dbm": -41.47882082772033,
+    "mean_rx_power_dbm": -34.29400232734933,
+    "mean_delay_spread_ns": 172.85653143227617,
+    "max_delay_spread_ns": 357.9753366677444,
+    "mean_angular_spread_phi_deg": 8.850242152296197
+  }
+}

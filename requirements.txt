@@ -1,0 +1,2 @@
+# Unica dependencia de OpenRPS (ver tambien pyproject.toml).
+numpy
