@@ -27,7 +27,9 @@
     "ground_sigma": 0.005,
     "reference_frequency_hz": null,
     "diffraction": true,
-    "max_reflections": 1
+    "max_reflections": 1,
+    "max_diffractions": 1,
+    "mixed_interactions": false
   },
   "materials": [
     {

@@ -15,6 +15,7 @@ export class View3D {
     this.visible = false;
     this.ok = false;
     this.layerKey = null;
+    this.layerRef = null;
     try {
       this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
     } catch (error) {
@@ -211,10 +212,12 @@ export class View3D {
     if (!this.ok || !this.store.project) return;
     const layer = currentLayer(this.store);
     const v = this.store.view;
-    const key = [layer ? layer.image : null, v.relief, v.opacity, this.store.outdated, v.smooth,
-      JSON.stringify(this.store.project.area)].join("|");
-    if (!force && key === this.layerKey && this.groundGroup.children.length) return;
+    // The layer is compared by identity: currentLayer() makes a new one whenever the result, the metric, the
+    // transmitter or the scale change (a canvas in a joined string would always read "[object ...]")
+    const key = [v.relief, v.opacity, this.store.outdated, v.smooth, JSON.stringify(this.store.project.area)].join("|");
+    if (!force && layer === this.layerRef && key === this.layerKey && this.groundGroup.children.length) return;
     this.layerKey = key;
+    this.layerRef = layer;
     disposeGroup(this.groundGroup);
     const { a, cx, cy, size } = this.areaInfo();
     // suelo neutro alrededor del área
@@ -283,7 +286,8 @@ export class View3D {
             transparent: true, opacity: 0.35 + 0.65 * rel });
           for (let k = 0; k + 1 < points.length; k++) this.rayGroup.add(segment(points[k], points[k + 1], radius, material));
           for (let k = 1; k + 1 < points.length; k++) {
-            const geometry = r.kind === "diffraction" ? new THREE.BoxGeometry(radius * 4, radius * 4, radius * 4)
+            const atEdge = r.interactions && r.interactions[k - 1] && r.interactions[k - 1][0] === "edge";
+            const geometry = atEdge ? new THREE.BoxGeometry(radius * 4, radius * 4, radius * 4)
               : new THREE.SphereGeometry(radius * 2.2, 10, 8);
             const hit = new THREE.Mesh(geometry, material);
             hit.position.copy(points[k]);

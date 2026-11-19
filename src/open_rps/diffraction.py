@@ -61,14 +61,24 @@ def _continued_fraction(t: np.ndarray) -> np.ndarray:
     d = 1.0 / b
     h = d.copy()
     n = -1
+    # Only the points that have not converged yet keep iterating (large t converge in 3-7 steps, t = 1.5 in ~50)
+    todo = np.arange(t.size)
+    b, cc, d = b.reshape(-1), cc.reshape(-1), d.reshape(-1)
+    h_flat = h.reshape(-1)
     for _ in range(_CF_ITERATIONS):
         n += 2
         a = -float(n * (n + 1))
         b = b + 4.0
         d = 1.0 / (a * d + b)
         cc = b + a / cc
-        h = h * (cc * d)
-    return (t - 1j * t) * h
+        delta = cc * d
+        h_flat[todo] *= delta
+        busy = np.abs(delta - 1.0) >= 4e-16
+        if not busy.all():
+            todo, b, cc, d = todo[busy], b[busy], cc[busy], d[busy]
+            if not todo.size:
+                break
+    return (t - 1j * t) * h_flat.reshape(t.shape)
 
 
 def fresnel_integrals(t):

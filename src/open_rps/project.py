@@ -501,12 +501,17 @@ class Settings:
     reference_frequency_hz: Optional[float] = None
     diffraction: bool = True          # UTD diffraction at the edges of buildings and walls (new in 1.5.0)
     max_reflections: int = 1          # 2: also double reflections wall-wall and wall-ground (new in 1.5.0)
+    max_diffractions: int = 1         # 2: also rays diffracted by two edges in a row (new in 1.6.0)
+    mixed_interactions: bool = False  # reflection then diffraction and diffraction then reflection (new in 1.6.0)
 
     def validate(self):
         _choice(self.mode, SIMULATION_MODES, "settings.mode")
         self.diffraction = bool(self.diffraction)
         if isinstance(self.max_reflections, bool) or self.max_reflections not in (1, 2):
             raise ProjectError(f"settings.max_reflections: debe ser 1 o 2, se recibió {self.max_reflections!r}")
+        if isinstance(self.max_diffractions, bool) or self.max_diffractions not in (1, 2):
+            raise ProjectError(f"settings.max_diffractions: debe ser 1 o 2, se recibió {self.max_diffractions!r}")
+        self.mixed_interactions = bool(self.mixed_interactions)
         _choice(self.hata_environment, HATA_ENVIRONMENTS, "settings.hata_environment")
         self.coherent = bool(self.coherent)
         self.sinr = bool(self.sinr)
@@ -673,6 +678,9 @@ class Project:
             sim.add_reflector(wall.reflector(materials[wall.material], frequency))
         tracer = sim.ray_tracer
         tracer.max_reflections = self.settings.max_reflections
+        # Two diffractions and reflection + diffraction need edges: without diffraction they do nothing
+        tracer.max_diffractions = self.settings.max_diffractions if self.settings.diffraction else 1
+        tracer.mixed_interactions = self.settings.mixed_interactions and self.settings.diffraction
         if self.settings.diffraction:
             for building in self.buildings:
                 for edge in building.edges(materials[building.material], frequency):
@@ -750,6 +758,10 @@ class Project:
             "obstructing_reflectors": sum(1 for r in sim.ray_tracer.reflectors if r.obstructs),
             "edges": len(sim.ray_tracer.edges),
             "max_reflections": sim.ray_tracer.max_reflections,
+            "max_diffractions": sim.ray_tracer.max_diffractions,
+            "mixed_interactions": sim.ray_tracer.mixed_interactions,
+            "active_rays_per_tx": [2 + len(sim.ray_tracer.reflectors) + len(sim.ray_tracer.edges)
+                                   + len(sim.ray_tracer._active_higher_order(t)) for t in sim.transmitters],
             "candidate_rays": len(sim.ray_tracer.candidate_rays()),
             "reference_frequency_hz": self.reference_frequency_hz(),
             "mode": self.settings.mode,
@@ -826,6 +838,12 @@ def _ray_dict(ray, names: List[str], edge_names: Sequence[str] = ()) -> Dict[str
         label = f"Difracción: {plane(*ray.interactions[0])}"
     elif ray.kind == "double":
         label = "Doble reflexión: " + " → ".join(plane(*i) for i in ray.interactions)
+    elif ray.kind == "double-diffraction":
+        label = "Doble difracción: " + " → ".join(plane(*i) for i in ray.interactions)
+    elif ray.kind == "reflection-diffraction":
+        label = "Reflexión + difracción: " + " → ".join(plane(*i) for i in ray.interactions)
+    elif ray.kind == "diffraction-reflection":
+        label = "Difracción + reflexión: " + " → ".join(plane(*i) for i in ray.interactions)
     elif 0 <= ray.reflector_index < len(names):
         label = f"Reflexión: {names[ray.reflector_index]}"
     else:

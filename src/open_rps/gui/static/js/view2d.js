@@ -363,7 +363,8 @@ export class View2D {
           const [bx, by] = this.w2s(r.path[k][0], r.path[k][1]);
           const size = isHover ? 4 : 2.5;
           ctx.beginPath();
-          if (r.kind === "diffraction") ctx.rect(bx - size - 0.5, by - size - 0.5, 2 * size + 1, 2 * size + 1);
+          const atEdge = r.interactions && r.interactions[k - 1] && r.interactions[k - 1][0] === "edge";
+          if (atEdge) ctx.rect(bx - size - 0.5, by - size - 0.5, 2 * size + 1, 2 * size + 1);
           else ctx.arc(bx, by, size, 0, 2 * Math.PI);
           ctx.fill();
         }
