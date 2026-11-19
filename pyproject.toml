@@ -24,9 +24,14 @@ notebook = ["matplotlib", "jupyterlab"]
 
 [project.scripts]
 open-rps = "open_rps.cli:main"
+open-rps-gui = "open_rps.gui:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "open_rps.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Interfaz gráfica: HTML, CSS, JavaScript y three.js (ver src/open_rps/gui/static/vendor/README.md)
+"open_rps.gui" = ["static/*.html", "static/css/*.css", "static/js/*.js", "static/vendor/*"]

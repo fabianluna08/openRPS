@@ -47,6 +47,63 @@ def _opposite_sides(s_a, s_b, tol: float) -> np.ndarray:
     return (np.minimum(s_a, s_b) < -tol) & (np.maximum(s_a, s_b) > tol)
 
 
+def _same_side(s_tx: float, s_rx, tol: float) -> np.ndarray:
+    """
+    True where the receiver(s) are strictly on the same side of a plane as the
+    transmitter, both farther than ``tol`` from it (``s_tx`` float, ``s_rx`` float or array).
+    """
+    if s_tx > tol:
+        return np.asarray(s_rx > tol)
+    if s_tx < -tol:
+        return np.asarray(s_rx < -tol)
+    return np.zeros(np.shape(s_rx), dtype=bool)
+
+
+def _in_polygon(x: np.ndarray, y: np.ndarray, polygon: np.ndarray, tol: float = _BOUNDS_TOL_M) -> np.ndarray:
+    """
+    True where the points (x, y) fall inside the simple polygon ``polygon`` ([N, 2]),
+    its edges included (closed patch: a point within ``tol`` of an edge is inside).
+    Even-odd rule for the interior.  Same arithmetic as ``_in_polygon_scalar``.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    inside = np.zeros(np.broadcast(x, y).shape, dtype=bool)
+    on_edge = np.zeros_like(inside)
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = float(polygon[i][0]), float(polygon[i][1])
+        x2, y2 = float(polygon[(i + 1) % n][0]), float(polygon[(i + 1) % n][1])
+        straddles = (y1 > y) != (y2 > y)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_cross = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+        inside ^= straddles & (x < x_cross)
+        dx, dy = x2 - x1, y2 - y1
+        length2 = dx * dx + dy * dy
+        t = np.clip(((x - x1) * dx + (y - y1) * dy) / length2, 0.0, 1.0) if length2 > 0.0 else 0.0
+        on_edge |= (x - (x1 + t * dx)) ** 2 + (y - (y1 + t * dy)) ** 2 <= tol * tol
+    return inside | on_edge
+
+
+def _in_polygon_scalar(x: float, y: float, polygon, tol: float = _BOUNDS_TOL_M) -> bool:
+    """Scalar reference of ``_in_polygon`` (same rules, same arithmetic)."""
+    inside = False
+    on_edge = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i][0], polygon[i][1]
+        x2, y2 = polygon[(i + 1) % n][0], polygon[(i + 1) % n][1]
+        if (y1 > y) != (y2 > y):
+            x_cross = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < x_cross:
+                inside = not inside
+        dx, dy = x2 - x1, y2 - y1
+        length2 = dx * dx + dy * dy
+        t = min(1.0, max(0.0, ((x - x1) * dx + (y - y1) * dy) / length2)) if length2 > 0.0 else 0.0
+        if (x - (x1 + t * dx)) ** 2 + (y - (y1 + t * dy)) ** 2 <= tol * tol:
+            on_edge = True
+    return inside or on_edge
+
+
 def _take(values, rows: np.ndarray, axis: Optional[int] = None):
     """
     Entries ``rows`` (flat indices over the points) of a per-point quantity, or the
@@ -97,6 +154,16 @@ class PlanarReflector:
         The loss does not depend on ``reflectivity`` / ``eps_r`` (no energy balance
         between the reflected and the transmitted wave is enforced), on the angle
         of incidence or on the frequency, and the wall has no thickness.
+
+    footprint: optional polygon [(x0, y0), (x1, y1), ...] (new in 1.4.0) that limits a
+        *horizontal* patch (normal along z), e.g. the roof of a building whose
+        footprint is not an axis-aligned rectangle.  A point belongs to the patch if
+        it is inside the polygon, edges included (same closed-patch rule and 1e-9 m
+        margin as ``bounds``).  The polygon must be simple (no self-intersections);
+        it is closed automatically.  Without ``bounds`` the box is set to the
+        bounding box of the polygon at the height of the plane.  It acts everywhere
+        a patch is tested: reflection point (``contains``) and obstruction
+        (``crosses``), in both implementations of the tracer.
     """
     p0: np.ndarray      # Reference point on plane [x, y, z]
     normal: np.ndarray  # Normal vector of the plane [nx, ny, nz] (normalized on creation)
@@ -106,6 +173,7 @@ class PlanarReflector:
     eps_r: Optional[float] = None             # Relative permittivity (enables Fresnel)
     sigma: float = 0.0                        # Conductivity [S/m], used with eps_r
     transmission_loss_db: Optional[float] = None  # Penetration loss [dB]; None = blocks nothing, inf = opaque
+    footprint: Optional[Sequence[Sequence[float]]] = None  # Polygon [(x, y), ...] of a horizontal patch
 
     def __post_init__(self):
         self.p0 = np.array(self.p0, dtype=float)
@@ -136,6 +204,22 @@ class PlanarReflector:
                 raise ValueError("transmission_loss_db must be None, a loss >= 0 in dB or float('inf') "
                                  f"(opaque wall), got {self.transmission_loss_db!r}")
             self.transmission_loss_db = loss
+        if self.footprint is not None:
+            polygon = np.array(self.footprint, dtype=float)
+            if polygon.ndim != 2 or polygon.shape[1] != 2 or len(polygon) < 3 or not np.all(np.isfinite(polygon)):
+                raise ValueError("footprint must be a list of at least 3 finite (x, y) vertices")
+            if len(polygon) > 3 and np.array_equal(polygon[0], polygon[-1]):
+                polygon = polygon[:-1]          # explicitly closed polygon: drop the repeated vertex
+            if self.normal[0] != 0.0 or self.normal[1] != 0.0:
+                raise ValueError("footprint is only supported on horizontal planes (normal along z)")
+            area2 = float(np.sum(polygon[:, 0] * np.roll(polygon[:, 1], -1) - np.roll(polygon[:, 0], -1) * polygon[:, 1]))
+            if area2 == 0.0:
+                raise ValueError("footprint polygon has zero area")
+            self.footprint = polygon
+            if self.bounds is None:
+                z = float(self.p0[2])
+                self.bounds = (float(polygon[:, 0].min()), float(polygon[:, 0].max()),
+                               float(polygon[:, 1].min()), float(polygon[:, 1].max()), z, z)
 
     @property
     def obstructs(self) -> bool:
@@ -218,23 +302,35 @@ class PlanarReflector:
         candidates = np.flatnonzero(crossed)
         s_a, s_b = _take(s_a, candidates), _take(s_b, candidates)
         t = np.atleast_1d(s_a / (s_a - s_b))               # 0 < t < 1; the denominator is > 2 * tol
-        for axis in range(3):
-            lo, hi = self.bounds[2 * axis] - _BOUNDS_TOL_M, self.bounds[2 * axis + 1] + _BOUNDS_TOL_M
-            if lo == -np.inf and hi == np.inf:
-                continue
+
+        def crossing_point(axis: int) -> np.ndarray:
+            """Coordinate ``axis`` of the point tested, for the remaining candidates."""
             a_axis, b_axis = _take(a, candidates, axis), _take(b, candidates, axis)
             point = a_axis + t * (b_axis - a_axis)
             if bend is not None:
                 bend_axis = _take(bend, candidates, axis)
                 point = bend_axis + _BEND_STEP * (point - bend_axis)
+            return point
+
+        for axis in range(3):
+            lo, hi = self.bounds[2 * axis] - _BOUNDS_TOL_M, self.bounds[2 * axis + 1] + _BOUNDS_TOL_M
+            if lo == -np.inf and hi == np.inf:
+                continue
+            point = crossing_point(axis)
             inside = (point >= lo) & (point <= hi)
             candidates, t = candidates[inside], t[inside]
+        if self.footprint is not None and candidates.size:
+            inside = _in_polygon(crossing_point(0), crossing_point(1), self.footprint)
+            candidates = candidates[inside]
         result = np.zeros(crossed.size, dtype=bool)
         result[candidates] = True
         return result.reshape(crossed.shape)
 
     def contains(self, points: np.ndarray, tol: float = _BOUNDS_TOL_M) -> np.ndarray:
-        """True where ``points`` (shape [..., 3]) fall inside ``bounds`` (always True if unbounded)."""
+        """
+        True where ``points`` (shape [..., 3]) fall inside ``bounds`` and, if there is
+        one, inside ``footprint`` (always True if unbounded).
+        """
         points = np.asarray(points, dtype=float)
         if self.bounds is None:
             return np.ones(points.shape[:-1], dtype=bool)
@@ -242,6 +338,8 @@ class PlanarReflector:
         inside = np.ones(points.shape[:-1], dtype=bool)
         for axis in range(3):
             inside &= (points[..., axis] >= b[2 * axis] - tol) & (points[..., axis] <= b[2 * axis + 1] + tol)
+        if self.footprint is not None and inside.any():
+            inside &= _in_polygon(points[..., 0], points[..., 1], self.footprint, tol)
         return inside
 
     def reflection_coefficient(self, sin_grazing, frequency_hz: float):
@@ -441,8 +539,12 @@ class RayTracer:
         return magnitude * factor if factor > 0.0 else 0j
 
     def _scalar_obstacles(self) -> list:
-        """Obstructing walls as plain floats, for the point-by-point tracer: (index, loss, p0, normal, bounds)."""
-        return [(index, refl.transmission_loss_db, refl.p0.tolist(), refl.normal.tolist(), refl.bounds)
+        """
+        Obstructing walls as plain floats, for the point-by-point tracer:
+        (index, loss, p0, normal, bounds, footprint as a list of [x, y] or None).
+        """
+        return [(index, refl.transmission_loss_db, refl.p0.tolist(), refl.normal.tolist(), refl.bounds,
+                 None if refl.footprint is None else refl.footprint.tolist())
                 for index, refl in enumerate(self.reflectors) if refl.obstructs]
 
     @staticmethod
@@ -456,27 +558,29 @@ class RayTracer:
         """
         tol = OBSTRUCTION_TOL_M
 
-        def crossings_of_leg(s_p, s_q, p, q, bounds) -> int:
+        def crossings_of_leg(s_p, s_q, p, q, bounds, footprint) -> int:
             if not ((s_p > tol and s_q < -tol) or (s_p < -tol and s_q > tol)):
                 return 0
             if bounds is not None:
                 t = s_p / (s_p - s_q)
-                if not inside([p[axis] + t * (q[axis] - p[axis]) for axis in range(3)], bounds):
+                if not inside([p[axis] + t * (q[axis] - p[axis]) for axis in range(3)], bounds, footprint):
                     return 0
             return 1
 
-        def inside(point, bounds) -> bool:
-            return all(bounds[2 * axis] - _BOUNDS_TOL_M <= point[axis] <= bounds[2 * axis + 1] + _BOUNDS_TOL_M
-                       for axis in range(3))
+        def inside(point, bounds, footprint) -> bool:
+            if not all(bounds[2 * axis] - _BOUNDS_TOL_M <= point[axis] <= bounds[2 * axis + 1] + _BOUNDS_TOL_M
+                       for axis in range(3)):
+                return False
+            return footprint is None or _in_polygon_scalar(point[0], point[1], footprint)
 
         loss = 0.0
-        for index, wall_loss, p0, n, bounds in obstacles:
+        for index, wall_loss, p0, n, bounds, footprint in obstacles:
             if index == own:
                 continue
             s_a = (a[0] - p0[0]) * n[0] + (a[1] - p0[1]) * n[1] + (a[2] - p0[2]) * n[2]
             s_b = (b[0] - p0[0]) * n[0] + (b[1] - p0[1]) * n[1] + (b[2] - p0[2]) * n[2]
             if via is None:
-                crossings = crossings_of_leg(s_a, s_b, a, b, bounds)
+                crossings = crossings_of_leg(s_a, s_b, a, b, bounds, footprint)
             else:
                 s_via = (via[0] - p0[0]) * n[0] + (via[1] - p0[1]) * n[1] + (via[2] - p0[2]) * n[2]
                 if abs(s_via) <= tol:
@@ -489,9 +593,10 @@ class RayTracer:
                             t = s_a / (s_a - s_b)
                             probe = [via[axis] + _BEND_STEP * ((a[axis] + t * (b[axis] - a[axis])) - via[axis])
                                      for axis in range(3)]
-                            crossings = int(inside(probe, bounds))
+                            crossings = int(inside(probe, bounds, footprint))
                 else:
-                    crossings = crossings_of_leg(s_a, s_via, a, via, bounds) + crossings_of_leg(s_via, s_b, via, b, bounds)
+                    crossings = (crossings_of_leg(s_a, s_via, a, via, bounds, footprint)
+                                 + crossings_of_leg(s_via, s_b, via, b, bounds, footprint))
             if crossings:
                 loss += crossings * wall_loss
         return loss
@@ -568,7 +673,9 @@ class RayTracer:
                 tx_theta_deg=tx_theta,
                 rx_phi_deg=rx_phi,
                 rx_theta_deg=rx_theta,
-                obstruction_loss_db=loss_direct
+                obstruction_loss_db=loss_direct,
+                kind="direct",
+                path=(tuple(tx_p.tolist()), tuple(rx_p.tolist())),
             ))
 
         # --- 2. Ground Reflected Ray ---
@@ -598,10 +705,11 @@ class RayTracer:
             if sector:
                 mag_ground *= self._pattern_factor(tx, tx_phi_g, tx_theta_g)
             loss_ground = 0.0
+            # Bounce point of the ray: Tx -> bounce point -> Rx
+            t_bounce = tx.z / (tx.z + rx_p[2])
+            bounce_xyz = (tx_image_ground + t_bounce * (rx_p - tx_image_ground)).tolist()
             if obstacles:
-                # Both legs of the ray: Tx -> bounce point -> Rx
-                t_bounce = tx.z / (tx.z + rx_p[2])
-                bounce_xyz = (tx_image_ground + t_bounce * (rx_p - tx_image_ground)).tolist()
+                # Both legs of the ray
                 loss_ground = self._path_loss_db(obstacles, tx_xyz, rx_xyz, via=bounce_xyz)
                 if loss_ground > 0.0:
                     mag_ground = self._attenuate(mag_ground, loss_ground)
@@ -614,7 +722,9 @@ class RayTracer:
                 tx_theta_deg=tx_theta_g,
                 rx_phi_deg=rx_phi_g,
                 rx_theta_deg=rx_theta_g,
-                obstruction_loss_db=loss_ground
+                obstruction_loss_db=loss_ground,
+                kind="ground",
+                path=(tuple(tx_p.tolist()), tuple(bounce_xyz), tuple(rx_p.tolist())),
             ))
 
         # --- 3. Wall Specular Reflections ---
@@ -623,8 +733,9 @@ class RayTracer:
             s_tx = float(np.dot(tx_p - refl.p0, refl.normal))
             s_rx = float(np.dot(rx_p - refl.p0, refl.normal))
 
-            # A specular reflection needs Tx and Rx strictly on the same side of the wall
-            if s_tx * s_rx <= 0.0 or abs(s_tx + s_rx) < 1e-6:
+            # A specular reflection needs Tx and Rx strictly on the same side of the wall, each one
+            # farther than OBSTRUCTION_TOL_M from the plane (a point on the plane has no reflection)
+            if not _same_side(s_tx, s_rx, OBSTRUCTION_TOL_M):
                 continue
 
             # Reflection image of Tx across plane: Tx_img = Tx - 2 * ((Tx - P0) . N) * N
@@ -663,7 +774,10 @@ class RayTracer:
                 tx_theta_deg=tx_theta_w,
                 rx_phi_deg=rx_phi_w,
                 rx_theta_deg=rx_theta_w,
-                obstruction_loss_db=loss_wall
+                obstruction_loss_db=loss_wall,
+                kind="wall",
+                path=(tuple(tx_p.tolist()), tuple(p_wall_hit.tolist()), tuple(rx_p.tolist())),
+                reflector_index=wall_index,
             ))
 
         return cir
@@ -768,7 +882,7 @@ class RayTracer:
         for r, refl in enumerate(self.reflectors):
             s_tx = float(np.dot(tx_p - refl.p0, refl.normal))
             s_rx = (pts - refl.p0) @ refl.normal
-            ok_wall = (s_tx * s_rx > 0.0) & (np.abs(s_tx + s_rx) >= 1e-6)
+            ok_wall = _same_side(s_tx, s_rx, OBSTRUCTION_TOL_M)
 
             tx_image_wall = tx_p - 2.0 * s_tx * refl.normal
             d_wall = np.linalg.norm(pts - tx_image_wall, axis=-1)

@@ -3,6 +3,8 @@
 
 `OpenRPS` es un simulador modular de propagación de radio y estimador de canal multitrayecto, escrito en Python y publicado bajo licencia **GPL-2.0** (la misma licencia que el kernel de Linux). Incluye modelos empíricos de pérdida de trayecto y un motor de ray-tracing 3D, y está pensado como herramienta de apoyo para estudiantes.
 
+Desde la versión 1.4.0 incluye una **interfaz gráfica** al estilo de las herramientas de planificación como RPS (`open-rps-gui`). Tiene un editor 2D del escenario con edificios 2.5D, muros, materiales y antenas, una vista 3D con los rayos, mapas de cobertura y la respuesta al impulso en cualquier punto. Se abre en el navegador y no necesita nada más que numpy (sección 4.E).
+
 ---
 
 ## 1. Arquitectura y Modelos Físicos Implementados
@@ -165,6 +167,39 @@ print(sim.ray_tracer.obstruction_loss_db([200, 500, 25], [800, 500, 1.5]))      
 
 ---
 
+### E. Edificios 2.5D, techos poligonales y geometría de los rayos (nuevo en 1.4.0)
+
+**Techos poligonales.** `PlanarReflector(..., footprint=[(x0, y0), (x1, y1), ...])` limita un muro *horizontal* (normal según z) a un polígono simple, por ejemplo el techo de un edificio en L o con fachadas oblicuas. Hasta 1.3.0 `bounds` solo admitía una caja alineada con los ejes, así que el techo de un edificio que no fuera un rectángulo alineado no se podía representar. Un punto pertenece al techo si cae dentro del polígono, bordes incluidos, con el mismo criterio de parche cerrado y el mismo margen de 1 nm que `bounds`. Actúa en el punto de reflexión y en la obstrucción, en las dos implementaciones del trazador, que siguen dando los mismos resultados. Sin `bounds`, la caja se toma del polígono a la altura del plano.
+
+```python
+from open_rps import PlanarReflector
+en_L = [(0, 0), (40, 0), (40, 15), (15, 15), (15, 40), (0, 40)]
+techo = PlanarReflector(p0=[0, 0, 12], normal=[0, 0, 1], footprint=en_L, transmission_loss_db=float("inf"))
+```
+
+Las fachadas oblicuas no necesitan nada nuevo: un muro vertical sobre el segmento (x0, y0)→(x1, y1) con `bounds` igual a la caja del segmento es exacto, porque su plano corta esa caja justo a lo largo del segmento. `open_rps.project.vertical_wall(start, end, z_min, z_max, nombre)` lo construye.
+
+**Geometría de cada rayo.** `RayTracer.trace_paths` rellena tres campos nuevos de `MultipathRay`, que sirven para dibujar los rayos. No forman parte de `==` ni del `repr`, así que los rayos se comparan y se imprimen como en 1.3.0:
+
+* `kind`: `"direct"`, `"ground"` o `"wall"`.
+* `path`: los vértices del rayo, Tx → [punto de rebote] → Rx, como tuplas (x, y, z).
+* `reflector_index`: la posición del muro en `RayTracer.reflectors`, o −1.
+
+```python
+cir = sim.ray_tracer.trace_paths(sim.transmitters[0], (300.0, 190.0, 1.5))
+for ray in cir.rays:
+    print(ray.kind, ray.path, ray.obstruction_loss_db)
+```
+
+**Materiales.** `open_rps.project.Material` describe de qué está hecho un muro:
+
+* **Reflexión:** coeficiente constante, o Fresnel con εr y σ = c·f_GHz^d de la Recomendación ITU-R P.2040 (Tabla 3).
+* **Penetración:** puede ser nula, fija, lineal en la frecuencia (L = a + b·f_GHz, la forma de la Tabla 7.4.3-1 de 3GPP TR 38.901) u opaca.
+
+La biblioteca por defecto (`default_materials()`) trae concreto, ladrillo, vidrio, vidrio IRR, madera, tablaroca, metal y un "muro ideal" que solo refleja. Como un muro lo comparten todos los transmisores, los valores que dependen de la frecuencia se evalúan a una sola **frecuencia de referencia**: la de `settings.reference_frequency_hz` o, si no se indica, la del primer transmisor activo.
+
+---
+
 ## 2. Estructura del Proyecto
 
 ```
@@ -179,10 +214,16 @@ open_rps/
 │   ├── raytracer.py      # Motor 3D de trazado de rayos (directo, tierra y muros; obstrucción opcional)
 │   ├── simulation.py     # Orquestador de grillas 2D (Coverage Maps, Best Server, CSV/JSON)
 │   ├── visualizer.py     # Mapas ASCII para terminal y SVG vectoriales
-│   └── cli.py            # Interfaz de línea de comandos
+│   ├── cli.py            # Interfaz de línea de comandos
+│   ├── project.py        # Proyectos .orps.json: escenario, edificios 2.5D, materiales (nuevo en 1.4.0)
+│   └── gui/              # Interfaz gráfica (nuevo en 1.4.0)
+│       ├── server.py     # Servidor local (http.server) y API JSON
+│       └── static/       # Página: HTML, CSS, JavaScript y three.js (vendor/)
 ├── examples/
 │   ├── example_sim.py           # Demostración con 2 transmisores y reflector
-│   └── practicas_openrps.ipynb  # Cuaderno con 5 prácticas para alumnos
+│   ├── practicas_openrps.ipynb  # Cuaderno con 5 prácticas para alumnos
+│   ├── proyecto_urbano.orps.json   # Microcelda urbana (ábrelo en la interfaz gráfica)
+│   └── proyecto_oficina.orps.json  # Planta de oficinas con Wi-Fi a 5.2 GHz
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -206,13 +247,13 @@ pip install git+https://github.com/fabianluna08/openRPS.git
 pip install "open-rps[notebook] @ git+https://github.com/fabianluna08/openRPS.git"
 ```
 
-Cualquiera de las opciones instala la librería (`import open_rps`) y el comando `open-rps`. Probado con Python 3.14 y numpy 2.4; no se ha verificado con versiones anteriores.
+Cualquiera de las opciones instala la librería (`import open_rps`) y los comandos `open-rps` y `open-rps-gui`. Probado con Python 3.14 y numpy 2.4; no se ha verificado con versiones anteriores.
 
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.3.0-py3-none-any.whl
-pip install dist/open_rps-1.3.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.4.0-py3-none-any.whl
+pip install dist/open_rps-1.4.0-py3-none-any.whl
 ```
 
 ---
@@ -337,17 +378,64 @@ pip install -e ".[notebook]"
 jupyter lab examples/practicas_openrps.ipynb
 ```
 
+### E. Interfaz gráfica (nuevo en 1.4.0)
+
+```bash
+open-rps-gui                                   # abre el navegador con el ejemplo urbano
+open-rps-gui examples/proyecto_oficina.orps.json
+python3 -m open_rps.gui --port 0 --no-browser  # puerto libre, sin abrir el navegador
+```
+
+El comando levanta un servidor local en `http://127.0.0.1:8765/`, que solo es accesible desde tu equipo, y abre la interfaz en el navegador. Para cerrarla, pulsa Ctrl+C en la consola. La página la sirve el propio paquete, three.js va incluido y funciona sin internet. Necesita un navegador moderno con WebGL para la vista 3D. Su distribución sigue la de una herramienta de planificación:
+
+* **Árbol del proyecto** (izquierda): área de predicción, configuración, transmisores, edificios, muros y materiales.
+* **Propiedades** (derecha): el formulario del elemento seleccionado. Incluye la posición, potencia, frecuencia y diagrama de cada antena, la altura y el material de cada edificio, los vértices de su planta, y los parámetros ITU-R/3GPP de cada material.
+* **Vista 2D:** editor a escala con cuadrícula en metros. Puedes colocar transmisores (T), dibujar edificios rectangulares (R) o poligonales (P), muros (W), mover objetos y vértices (V), medir (M) y desplazar la vista con la rueda o el botón derecho. Se puede deshacer y rehacer (Ctrl+Z / Ctrl+Y).
+* **Vista 3D** (2, o 3 para verla junto a la 2D): edificios extruidos, muros, antenas con el cono del sector y el mapa de cobertura en el plano del receptor, opcionalmente en relieve. Se gira con el ratón.
+* **Mapas:** potencia recibida, pérdida de trayecto, mejor servidor, SINR, interferencia + ruido, dispersión de retardo y dispersión angular. La potencia y la pérdida se pueden ver por transmisor. La escala es automática o manual, con la misma rampa de color y la misma paleta Okabe-Ito que los SVG. Al pasar el cursor se ve el valor de cada transmisor.
+* **Receptor de prueba** (S): haz clic o arrastra en 2D o 3D. Se dibujan todos los rayos, incluidos los bloqueados, en discontinua. El panel inferior muestra la potencia y las dispersiones por transmisor, el perfil potencia–retardo (respuesta al impulso) y la tabla de rayos con sus ángulos y pérdidas por muros. Se recalcula al mover cualquier objeto.
+* **Estadísticas:** porcentaje del área cubierta sobre un umbral de potencia, área con SINR ≥ 0 dB, percentiles e histograma de la métrica, y reparto del área entre servidores.
+* **Archivo:** abrir y guardar proyectos `.orps.json`; el último proyecto se guarda además en el navegador. Hay ejemplos incluidos y se puede exportar el resultado como CSV, JSON o SVG (los mismos archivos que el CLI) o la vista como PNG.
+
+Cada edificio se convierte en el motor en un muro vertical por arista y un techo poligonal (sección 1.E). Con el material por defecto (concreto) las fachadas atenúan 14.6 dB a 2.4 GHz. Con "Metal" son opacas y con "Muro ideal" solo reflejan. Los modelos empíricos ignoran edificios y muros, como en la librería.
+
+### F. Proyectos desde Python (nuevo en 1.4.0)
+
+Un proyecto `.orps.json` es el escenario completo, y la interfaz y los scripts usan el mismo archivo:
+
+```python
+from open_rps.project import Project
+project = Project.load("examples/proyecto_urbano.orps.json")
+project.settings.mode = "raytracing"
+project.area.resolution_m = 2.0
+result = project.run()                      # SimulationResult, como run_raytracing_simulation
+result.export_csv("urbano.csv")
+probe = project.probe((300.0, 190.0))       # rayos y métricas en un punto (sin sombra log-normal)
+sim = project.build_simulator()             # PropagationSimulator con todos los muros
+project.save("copia.orps.json")
+```
+
+`Project.from_dict` valida todo el documento. Rechaza campos desconocidos, polígonos que se cruzan, materiales inexistentes, `tx_id` repetidos y grillas de más de 4 millones de píxeles, y en cada caso lanza un `ProjectError` (subclase de `ValueError`) que dice qué elemento y qué campo fallan.
+
 ---
 
 ## 5. Tests
 
-Los tests usan `unittest` de la librería estándar (no hace falta pytest). Con el paquete instalado, desde la raíz del proyecto:
+Los tests usan `unittest` de la librería estándar (no hace falta pytest). Con el paquete instalado (o con `PYTHONPATH=src`), desde la raíz del proyecto:
 
 ```bash
 python3 -m unittest discover -s tests
 ```
 
 Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del modelo Two-Ray, la dispersión de retardo y angular (incluido el cruce por ±180°), la geometría de los rayos de suelo y de muro, la equivalencia entre el trazado vectorizado y el de referencia punto a punto, simulaciones completas, las exportaciones CSV/JSON/SVG (con `tx_id` no consecutivos y mapas sin datos) y el CLI. `tests/test_v1_2.py` cubre lo añadido en 1.2.0: regresión numérica frente a 1.1.0 con los valores por defecto, `relative_to_first`, el umbral de campo lejano, `strict`, la suma coherente (incluida su igualdad con Two-Ray), la sombra log-normal (reproducibilidad y estadística), el diagrama sectorial, el SINR con valores calculados a mano, la paleta Okabe-Ito y la fusión de celdas de los SVG. `tests/test_v1_3.py` cubre la obstrucción de 1.3.0: la geometría del cruce segmento–muro (con y sin `bounds`, bordes y tolerancias), muro opaco, pérdida finita exacta, suma de pérdidas en dB, que un muro no se obstruye a sí mismo, casos límite (Tx/Rx sobre el plano, rayos paralelos, rebote justo al pie de un muro o en la esquina de un edificio), la equivalencia vectorizado/punto a punto con muros oblicuos y finitos, la sombra de un edificio de cuatro muros frente a un cálculo geométrico independiente, los mapas y exportaciones con píxeles sin datos, el CLI y la regresión frente a 1.2.0 (valores de referencia calculados con 1.2.0 e igualdad bit a bit cuando no hay obstrucción).
+
+`tests/test_v1_4.py` cubre lo añadido en 1.4.0:
+
+* La geometría de los rayos, incluida la ley de la reflexión y el hecho de que no cambia `==` ni `repr`.
+* El punto en polígono vectorizado frente al escalar, los techos poligonales (reflexión y obstrucción contra una referencia geométrica independiente) y la equivalencia entre el trazado vectorizado y el punto a punto con edificios en L y oblicuos.
+* La corrección del receptor situado sobre el plano de un muro, los materiales (valores de ITU-R P.2040 a 9 GHz y modelos de penetración) y los proyectos: ida y vuelta por JSON, validación, que el receptor de prueba coincida con la grilla y todos los modos de simulación.
+
+`tests/test_gui_server.py` arranca el servidor de la interfaz en un puerto libre y prueba la API: archivos estáticos, protección frente a rutas `../`, simulación y decodificación de las grillas, exportaciones, receptor de prueba, errores y rechazo de peticiones de otros orígenes.
 
 Para repetir la comparación bit a bit contra una copia real de la versión 1.2.0 (el test se omite si la variable no está definida):
 
@@ -379,11 +467,26 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 * **Sombra sin correlación espacial.** `shadow_fading_sigma_db` añade una muestra log-normal independiente en cada píxel y para cada transmisor. La sombra real está correlacionada a lo largo de decenas de metros y entre emplazamientos; aquí el mapa resultante tiene aspecto de "sal y pimienta". Es adecuada para estudiar estadísticas (márgenes, probabilidad de cobertura), no para obtener mapas de aspecto realista. No depende del entorno ni de la distancia.
 * **SINR simplificado.** Enlace descendente, todos los transmisores emitiendo siempre (carga completa), receptor ideal salvo por su figura de ruido. Solo interfieren los transmisores con exactamente la misma frecuencia portadora; no hay interferencia de canal adyacente, ni reparto de recursos, ni control de potencia, ni traspasos. El mejor servidor sigue siendo el de mayor potencia recibida (no el de mayor SINR). La dispersión de retardo y angular de cada píxel se refiere solo a los rayos del mejor servidor.
 * **Banda estrecha.** Una única frecuencia por transmisor; los coeficientes no dependen del ancho de banda (`bandwidth_hz` solo interviene en la potencia de ruido).
+* **Materiales a una sola frecuencia.** Un muro lo comparten todos los transmisores, así que la conductividad y la penetración de un material se evalúan a la frecuencia de referencia del proyecto (sección 1.E) aunque haya transmisores en varias bandas. La pérdida por penetración sigue siendo un número fijo por cruce: no depende del ángulo ni del espesor.
+* **Reflexiones desde el interior de los edificios.** Como cada fachada es un muro suelto que refleja por las dos caras, puede aparecer un rayo que entra por una fachada, se refleja en la opuesta por dentro y vuelve a salir. Paga la pérdida de penetración de cada cruce, así que con materiales opacos o muy atenuantes no aporta nada.
 * **Mapas SVG.** Hasta 40 000 celdas hay un rectángulo por celda con su valor al pasar el ratón. Por encima se omiten esos valores y las celdas vecinas del mismo color se fusionan: una grilla de 400 × 400 pasa de 11.5 MB a unos 2 MB en los mapas continuos y a 15 kB en el de mejor servidor (misma imagen), pero para grillas mucho mayores sigue siendo preferible el CSV. El mapa de mejor servidor usa la paleta Okabe-Ito de 8 colores, distinguibles con las formas habituales de daltonismo; a partir del noveno transmisor comparten un gris ("Other"), por lo que cada transmisor se rotula además sobre el mapa.
 
 ---
 
 ## 7. Historial de cambios
+
+### Versión 1.4.0
+
+* **Novedades:**
+  * Interfaz gráfica `open-rps-gui` (`python3 -m open_rps.gui`): editor 2D, vista 3D, mapas, receptor de prueba con respuesta al impulso, estadísticas, proyectos y exportaciones (sección 4.E). Solo usa la biblioteca estándar y numpy en Python; incluye three.js r187 (MIT) para la vista 3D.
+  * `open_rps.project`: proyectos `.orps.json` con área, configuración, transmisores, edificios 2.5D poligonales, muros y biblioteca de materiales (ITU-R P.2040 y 3GPP TR 38.901); `Project.run()`, `probe()`, `build_simulator()`, `load()` y `save()`. Dos ejemplos en `examples/`.
+  * `PlanarReflector(footprint=...)`: muros horizontales (techos) limitados por un polígono.
+  * `MultipathRay.kind`, `path` y `reflector_index`: geometría de cada rayo, rellenada por `trace_paths`.
+* **Corrección.** Un receptor o un transmisor situado sobre el plano de un muro (a menos de 1 µm, `OBSTRUCTION_TOL_M`) ya no recibe un rayo reflejado en ese muro. Es el mismo criterio que la obstrucción ya usaba: un punto sobre el plano ve las dos caras.
+  * Antes, con muros oblicuos, que el rayo existiera dependía del signo con que se redondeaba la distancia al plano: ±5·10⁻¹⁷.
+  * Cuando existía, duplicaba el rayo directo, con unos +1.2 dB en el escenario de referencia de los tests.
+  * Además, el trazado vectorizado y el punto a punto podían discrepar en esos píxeles.
+  * Solo cambian los píxeles que caen exactamente sobre el plano de un muro. Todo lo demás es idéntico bit a bit a 1.2.0 y 1.3.0: el test de regresión contra 1.2.0 excluye solo esos píxeles, y se comprobó también contra 1.3.0 y con los archivos de `output/`.
 
 ### Versión 1.3.0
 

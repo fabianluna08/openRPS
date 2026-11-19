@@ -787,6 +787,27 @@ def reference_arrays(wall_options=None):
 _reference = {}
 exec(REFERENCE_SCENARIO, _reference)
 reference_sim, reference_arrays = _reference["reference_sim"], _reference["reference_arrays"]
+reference_walls = _reference["reference_walls"]
+
+
+def _wall_plane_pixels(name, shape):
+    """
+    Mask (broadcast to ``shape``) of the grid pixels of the run ``name`` of ``reference_arrays``
+    whose receiver lies within OBSTRUCTION_TOL_M of the plane of a reference wall; None for the
+    arrays that are not ray-tracing grids (random points, CIRs, empirical models).
+    """
+    run = name.split("/")[0]
+    resolution = {"default": 5.0, "coherent": 5.0, "shadow": 5.0, "ground_level": 5.0, "sector": 5.0,
+                  "pointwise": 20.0, "pointwise_coherent": 20.0}.get(run)
+    if resolution is None:
+        return None
+    xs, ys = np.arange(0.0, 400.0 + 1e-5, resolution), np.arange(0.0, 300.0 + 1e-5, resolution)
+    gx, gy = np.meshgrid(xs, ys)
+    points = np.stack([gx, gy, np.full(gx.shape, 0.0 if run == "ground_level" else 1.5)], axis=-1)
+    mask = np.zeros(gx.shape, dtype=bool)
+    for wall in reference_walls():
+        mask |= np.abs(PlanarReflector(**wall).signed_distance(points)) <= OBSTRUCTION_TOL_M
+    return np.broadcast_to(mask, shape)
 
 
 class RegressionAgainst120Tests(unittest.TestCase):
@@ -867,9 +888,20 @@ class RegressionAgainst120Tests(unittest.TestCase):
         new = reference_arrays()
         self.assertEqual(sorted(old), sorted(new))
         self.assertGreater(sum(a.size for a in new.values()), 300_000)
+        # 1.4.0 fixed one degenerate case: a receiver lying on the plane of a wall (within 1 um) no
+        # longer gets a reflection from that wall (1.2.0 / 1.3.0 gave one or not depending on the
+        # rounding of its signed distance, and it duplicated the direct ray).  Those pixels are
+        # excluded; every other number must still be bit-identical to 1.2.0.
+        masked_pixels = 0
         for name in new:
             self.assertEqual(old[name].dtype, new[name].dtype, name)
-            self.assertEqual(old[name].tobytes(), new[name].tobytes(), name)
+            a, b = old[name], new[name]
+            mask = _wall_plane_pixels(name, a.shape)
+            if mask is not None:
+                masked_pixels += int(mask.sum())
+                a, b = np.where(mask, 0, a), np.where(mask, 0, b)
+            self.assertEqual(a.tobytes(), b.tobytes(), name)
+        self.assertGreater(masked_pixels, 0)
 
     def test_empirical_models_ignore_the_obstruction(self):
         with warnings.catch_warnings():
