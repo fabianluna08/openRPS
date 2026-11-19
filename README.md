@@ -5,6 +5,8 @@
 
 Desde la versión 1.4.0 incluye una **interfaz gráfica** al estilo de las herramientas de planificación como RPS (`open-rps-gui`). Tiene un editor 2D del escenario con edificios 2.5D, muros, materiales y antenas, una vista 3D con los rayos, mapas de cobertura y la respuesta al impulso en cualquier punto. Se abre en el navegador y no necesita nada más que numpy (sección 4.E).
 
+La versión 1.5.0 añade la **difracción en aristas con la Teoría Uniforme de la Difracción (UTD)**. Se aplica en las esquinas y los bordes de techo de los edificios y en los bordes de los muros, y con ella la sombra detrás de un obstáculo ya no queda vacía. También añade las **reflexiones dobles** muro–muro y muro–suelo (sección 1.F).
+
 ---
 
 ## 1. Arquitectura y Modelos Físicos Implementados
@@ -161,7 +163,7 @@ print(sim.ray_tracer.obstruction_loss_db([200, 500, 25], [800, 500, 1.5]))      
 
 `PlanarReflector.crosses(p_inicio, p_fin)` dice si un segmento cruza un muro (geometría pura) y `RayTracer.obstruction_loss_db(p_inicio, p_fin)` suma las pérdidas de todos los muros que cruza un segmento (0 = hay línea de vista). Si el edificio es más bajo que la antena, la sombra tiene longitud finita (el rayo pasa por encima) y, como no hay techo, parte del interior queda iluminada desde arriba: añade un muro horizontal (`normal=[0, 0, 1]`, `bounds=(x0, x1, y0, y1, altura, altura)`) para cerrarlo.
 
-**Lo que no hace** (ver *Limitaciones físicas*): no hay **difracción** en las aristas, así que el borde de la sombra es un salto brusco y, tras un obstáculo opaco, puede no llegar nada; la pérdida es un número fijo por muro (no depende del ángulo, la frecuencia ni el espesor) e independiente de `reflectivity`/`eps_r`; y solo actúa en el modo de ray tracing: los modelos empíricos (FSPL, Two-Ray, Hata…) ignoran los muros.
+**Lo que no hace** (ver *Limitaciones físicas*): por sí sola la obstrucción no difracta, así que el borde de la sombra es un salto brusco y, tras un obstáculo opaco, puede no llegar nada (desde 1.5.0 las aristas `DiffractionEdge` rellenan la sombra, sección 1.F); la pérdida es un número fijo por muro (no depende del ángulo, la frecuencia ni el espesor) e independiente de `reflectivity`/`eps_r`; y solo actúa en el modo de ray tracing: los modelos empíricos (FSPL, Two-Ray, Hata…) ignoran los muros.
 
 **Coste.** Sin ningún muro con `transmission_loss_db` no se ejecuta nada nuevo. Con ellos, la ruta vectorizada sigue siendo numpy puro (sin bucles por píxel); en una grilla de 201 × 201 con 2 transmisores y 6 muros, activar la obstrucción en los 6 alarga la simulación en torno a un 30–40 % (medido con Python 3.14 y numpy 2.4).
 
@@ -198,6 +200,39 @@ for ray in cir.rays:
 
 La biblioteca por defecto (`default_materials()`) trae concreto, ladrillo, vidrio, vidrio IRR, madera, tablaroca, metal y un "muro ideal" que solo refleja. Como un muro lo comparten todos los transmisores, los valores que dependen de la frecuencia se evalúan a una sola **frecuencia de referencia**: la de `settings.reference_frequency_hz` o, si no se indica, la del primer transmisor activo.
 
+### F. Difracción UTD y reflexiones dobles (nuevo en 1.5.0)
+
+**Difracción en aristas.** Un `DiffractionEdge` es el borde recto de una cuña: la esquina de un edificio, el borde de su techo o el borde de un muro. Añade un rayo Tx → Q → Rx, con el punto Q sobre la arista elegido por la ley de Keller (ángulos iguales con la arista). Su amplitud es la del campo incidente en Q por el coeficiente de difracción $D$ de Kouyoumjian y Pathak (UTD) y por el factor de dispersión de una onda esférica:
+
+$$E_d = E_i(Q)\, D\, \sqrt{\frac{s'}{s\,(s'+s)}}\, e^{-jks}, \qquad D = \frac{-e^{-j\pi/4}}{2n\sqrt{2\pi k}\,\sin\beta_0}\Big[T_1 + T_2 + R_0\,T_3 + R_n\,T_4\Big]$$
+
+* **Términos y caras.** Los cuatro términos $T_i = \cot(\cdot)\, F(kLa^\pm)$ usan la función de transición $F$, que va calculada con integrales de Fresnel propias (sin scipy), y la cuña tiene un ángulo exterior $n\pi$. Las caras entran con los coeficientes heurísticos de Luebbers ($R_0$, $R_n$), que son de Fresnel con los $\varepsilon_r$ y $\sigma$ del material, o $\mp\rho$ con una reflectividad constante: $\rho = 1$ es el conductor perfecto.
+* **Polarización.** En una arista vertical se usa el caso *soft* (campo E paralelo a la arista) y en una horizontal el caso *hard*. Es coherente con la polarización vertical del resto del motor.
+* **Validación** (`tests/test_v1_5.py`):
+  * Una pantalla delgada coincide con el filo de cuchillo exacto de Fresnel–Kirchhoff de ITU-R P.526 con menos de 0.35 dB de diferencia, en las dos polarizaciones, para ν de −1.5 a 3.2. Las funciones especiales coinciden con mpmath a 10⁻¹³.
+  * En el borde de sombra de la esquina de un edificio opaco, el campo total (directo + difractado) es continuo: varía menos de 0.3 dB entre receptores separados 10 cm y vale −6 dB respecto al espacio libre justo en el borde.
+  * El rayo difractado de una cuña conductora es recíproco.
+* **Cuñas que dejan pasar parte del campo.** Con `shadow_loss_db` finito, los términos del borde de sombra incidente se escalan por $1 - 10^{-L/20}$, de modo que el campo transmitido más el difractado también es continuo.
+
+```python
+from open_rps import RayTracer, DiffractionEdge
+tracer = RayTracer()
+# Esquina de un edificio en (40, 40), de 30 m de alto: la cara 0 va hacia -x y su exterior hacia +y
+tracer.add_edge(DiffractionEdge(start=[40, 40, 0], end=[40, 40, 30], face_direction=[-1, 0, 0],
+                                face_normal=[0, 1, 0], wedge_n=1.5, polarization="soft", eps_r=5.24, sigma=0.09))
+```
+
+En un proyecto (`Settings.diffraction`, activado por defecto) las aristas salen solas de la geometría:
+
+* **Edificios:** una arista vertical por cada esquina convexa de la planta (la esquina interior de una L no difracta hacia fuera) y, si el edificio tiene techo, una horizontal por cada lado del techo ($n = 1.5$).
+* **Muros:** el borde superior, el inferior si el muro no llega al suelo, y los dos extremos verticales, que son semiplanos ($n = 2$). Un extremo que toca otro muro o un edificio no se considera arista libre.
+
+Los muros y fachadas del escenario obstruyen los dos tramos de cada rayo difractado como a cualquier otro rayo.
+
+**Reflexiones dobles.** `RayTracer(max_reflections=2)` (en un proyecto, `Settings.max_reflections = 2`) añade, por el método de las imágenes, un rayo Tx → P1 → P2 → Rx por cada par ordenado de planos distintos: muro–muro, suelo–muro y muro–suelo. Usa los coeficientes de reflexión de cada plano en su ángulo rasante, los mismos parches (`bounds` y `footprint`) y la misma obstrucción tramo a tramo. Con N muros son N·(N+1) rayos candidatos más, así que es bastante más lento: unos 9 s en lugar de 3.5 s en el ejemplo urbano a 4 m. Los pares en los que el parche del segundo muro queda entero detrás del primero se descartan sin calcular.
+
+`MultipathRay.kind` vale `"diffraction"` o `"double"` en estos rayos, `MultipathRay.interactions` dice qué tocaron, por ejemplo `(("wall", 3), ("ground", -1))` o `(("edge", 7),)`, y `RayTracer.candidate_rays()` da el orden del eje K de `trace_points`. Sin aristas y con `max_reflections=1` (los valores por defecto de la librería), los resultados son idénticos bit a bit a los de 1.4.0.
+
 ---
 
 ## 2. Estructura del Proyecto
@@ -211,7 +246,8 @@ open_rps/
 │   ├── __init__.py       # Exportaciones del paquete y __version__
 │   ├── models.py         # Modelos analíticos (FSPL, Two-Ray, Log-Distance, Hata, COST-231 Hata)
 │   ├── multipath.py      # MultipathRay y ChannelImpulseResponse (CIR, Delay/Angular Spread)
-│   ├── raytracer.py      # Motor 3D de trazado de rayos (directo, tierra y muros; obstrucción opcional)
+│   ├── raytracer.py      # Motor 3D de trazado de rayos (directo, tierra, muros, aristas UTD, dobles rebotes)
+│   ├── diffraction.py    # Integrales de Fresnel, función de transición y coeficiente UTD (nuevo en 1.5.0)
 │   ├── simulation.py     # Orquestador de grillas 2D (Coverage Maps, Best Server, CSV/JSON)
 │   ├── visualizer.py     # Mapas ASCII para terminal y SVG vectoriales
 │   ├── cli.py            # Interfaz de línea de comandos
@@ -252,8 +288,8 @@ Cualquiera de las opciones instala la librería (`import open_rps`) y los comand
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.4.0-py3-none-any.whl
-pip install dist/open_rps-1.4.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.5.0-py3-none-any.whl
+pip install dist/open_rps-1.5.0-py3-none-any.whl
 ```
 
 ---
@@ -435,6 +471,13 @@ Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del mo
 * El punto en polígono vectorizado frente al escalar, los techos poligonales (reflexión y obstrucción contra una referencia geométrica independiente) y la equivalencia entre el trazado vectorizado y el punto a punto con edificios en L y oblicuos.
 * La corrección del receptor situado sobre el plano de un muro, los materiales (valores de ITU-R P.2040 a 9 GHz y modelos de penetración) y los proyectos: ida y vuelta por JSON, validación, que el receptor de prueba coincida con la grilla y todos los modos de simulación.
 
+`tests/test_v1_5.py` cubre lo añadido en 1.5.0:
+
+* **Funciones especiales:** integrales de Fresnel y función de transición contra valores calculados con mpmath, y filo de cuchillo de ITU-R P.526.
+* **UTD:** comparación con el filo de cuchillo en las dos polarizaciones, continuidad del campo en el borde de sombra con cuñas opacas y semitransparentes, reciprocidad, y casos en los que no hay rayo (receptor dentro de la cuña, punto de Keller fuera de la arista).
+* **Reflexiones dobles:** geometría en un pasillo (ley de la reflexión, longitud de la imagen, amplitud), parches finitos, obstrucción y pares descartados.
+* **Motor y proyectos:** el orden de `candidate_rays`, la igualdad entre el trazado vectorizado y el punto a punto con aristas y reflexiones dobles, la evaluación por bloques, las aristas que genera un proyecto (esquinas convexas, techos y extremos libres de muros) y la sombra rellenada detrás de un edificio bajo.
+
 `tests/test_gui_server.py` arranca el servidor de la interfaz en un puerto libre y prueba la API: archivos estáticos, protección frente a rutas `../`, simulación y decodificación de las grillas, exportaciones, receptor de prueba, errores y rechazo de peticiones de otros orígenes.
 
 Para repetir la comparación bit a bit contra una copia real de la versión 1.2.0 (el test se omite si la variable no está definida):
@@ -452,11 +495,15 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 
 * **Sin validación experimental.** Los modelos están comprobados contra sus fórmulas, casos calculados a mano y entre sí (p. ej. ray tracing coherente frente a Two-Ray), no contra mediciones ni contra el RPS original u otra herramienta de referencia.
 * **Suma incoherente por defecto; la coherente es idealizada.** Por defecto el trazador suma $|a_k|^2$ rayo a rayo: da la potencia media local, sin interferencia ni desvanecimiento rápido, y por eso difiere de `TwoRayGroundReflection`. Con `coherent=True` aparecen los desvanecimientos (y la igualdad con Two-Ray), pero la posición exacta de cada nulo depende de fases calculadas sobre una geometría perfecta (suelo y muros lisos, posiciones exactas al milímetro, una sola frecuencia): sirve para ver el fenómeno y su estadística, no para predecir dónde habrá un nulo en un entorno real. Además el patrón varía en distancias del orden de λ, así que una grilla de metros solo lo muestrea (los mapas coherentes parecen "ruidosos" por ese motivo).
-* **Solo reflexiones especulares de un rebote.** Rayo directo, un rebote en el suelo y un rebote por muro. No hay rebotes múltiples (ni muro–suelo, ni muro–muro), difracción en aristas ni dispersión difusa.
-* **Los muros solo obstruyen si se pide, y sin difracción.** Por defecto un reflector añade un rayo reflejado pero no bloquea ni atenúa ningún otro: siempre hay línea de vista (comportamiento de 1.2.0). Con `transmission_loss_db` (sección 1.D) los rayos que cruzan el muro se atenúan o se bloquean y aparecen zonas de sombra geométrica, pero con estas simplificaciones:
-  * *No hay difracción en las aristas.* El borde de la sombra es un salto brusco de un píxel al siguiente, y detrás de un obstáculo opaco solo llegan los rayos reflejados que lo rodeen: a menudo ninguno (`-inf` dBm, píxel "sin datos"). En la realidad la difracción rellena la sombra con una transición suave (pérdidas del orden de 6 dB en el borde geométrico y de 10–30 dB dentro de ella, según el modelo de filo de cuchillo), de modo que la simulación es **pesimista dentro de la sombra** y demasiado nítida en su borde. No sirve para estimar la cobertura real detrás de un edificio.
+* **Hasta dos reflexiones y una sola difracción por rayo.** Rayo directo, un rebote en el suelo, un rebote por muro y, opcionalmente, los dobles muro–muro y muro–suelo (sección 1.F). Las limitaciones de la difracción son estas:
+  * Cada rayo difractado toca una sola arista: no hay difracción doble, que haría falta detrás de un edificio alto y ancho, donde ninguna arista ve a la vez al Tx y al Rx, ni combinaciones de reflexión y difracción. Tampoco hay dispersión difusa.
+  * Los coeficientes de Luebbers son heurísticos para cuñas con pérdidas y no exactamente recíprocos fuera del conductor perfecto.
+  * En incidencia rasante sobre una cara se usa la misma polarización (soft/hard) en todo el rayo.
+  * Un receptor exactamente sobre un borde de sombra se evalúa a 10⁻⁷ rad del borde, del lado que el trazador decide con sus parches cerrados.
+* **Los muros solo obstruyen si se pide.** Por defecto un reflector añade un rayo reflejado pero no bloquea ni atenúa ningún otro: siempre hay línea de vista (comportamiento de 1.2.0). Con `transmission_loss_db` (sección 1.D) los rayos que cruzan el muro se atenúan o se bloquean y aparecen zonas de sombra geométrica, pero con estas simplificaciones:
+  * *Sin aristas no hay difracción.* La obstrucción por sí sola deja el borde de la sombra como un salto brusco de un píxel al siguiente, y detrás de un obstáculo opaco solo llegan los rayos reflejados que lo rodeen: a menudo ninguno (`-inf` dBm, píxel "sin datos"). Con las aristas de la sección 1.F la sombra se rellena con una transición suave, de unos −6 dB en el borde geométrico. Siguen faltando las difracciones sucesivas, así que en las sombras profundas la simulación aún es **pesimista**. En los proyectos y en la interfaz las aristas se generan solas (`Settings.diffraction`). Si construyes los muros a mano con la librería, tienes que añadirlas con `add_edge`.
   * *La transmisión es un número fijo por muro.* La pérdida no depende del ángulo de incidencia, la frecuencia, la polarización ni el espesor (el muro es un plano sin grosor), no añade fase ni retardo, y es independiente de `reflectivity`/`eps_r`: no se impone balance de energía entre lo reflejado y lo transmitido. No hay reflexiones múltiples dentro del muro ni entre muros: un rayo que atraviesa un muro no genera reflexiones nuevas al otro lado más allá de las de un rebote ya descritas.
-  * *Los edificios son muros sueltos.* Un edificio se construye con cuatro muros finitos (y un quinto horizontal como techo, si hace falta); no hay volúmenes, ni rayos que pasen sobre el tejado por difracción. Los muros reflejan por las dos caras, así que también existen reflexiones "desde dentro".
+  * *Los edificios son muros sueltos.* Un edificio se construye con cuatro muros finitos (y un quinto horizontal como techo, si hace falta); no hay volúmenes. Los rayos que pasan sobre el tejado lo hacen por difracción en el borde del techo, si se añaden sus aristas (1.F). Los muros reflejan por las dos caras, así que también existen reflexiones "desde dentro".
   * *Casos límite por convenio.* Una antena o un píxel exactamente sobre el plano de un muro no quedan tapados por él, y un rayo por la arista común de dos muros cruza ambos (sección 1.D).
   * *Solo en ray tracing.* Los modelos empíricos (`run_empirical_simulation`: FSPL, Two-Ray, Log-Distance, Hata, COST-231) ignoran por completo los muros: ni reflejan ni obstruyen.
 * **Muros idealizados.** Planos lisos que reflejan por ambas caras; infinitos salvo que se indique `bounds`. Con `reflectivity` el coeficiente es constante (independiente del ángulo, la frecuencia y la polarización) con un desfase fijo de 180°. Con `eps_r` se usa Fresnel para campo eléctrico paralelo al muro, una aproximación válida para polarización vertical, muros verticales y propagación casi horizontal.
@@ -474,6 +521,23 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 ---
 
 ## 7. Historial de cambios
+
+### Versión 1.5.0
+
+* **Novedades** (sección 1.F):
+  * **Difracción UTD:**
+    * Las clases y funciones nuevas son `DiffractionEdge`, `RayTracer.add_edge` y `PropagationSimulator.add_edge`, junto con el módulo `open_rps.diffraction`: integrales de Fresnel, función de transición, coeficiente de Kouyoumjian–Pathak con Luebbers y filo de cuchillo de ITU-R P.526.
+    * Funciona en `trace_paths` y en `trace_points` (mismos rayos), con suma incoherente o coherente, antenas sectoriales, obstrucción, sombra log-normal y SINR.
+  * **Reflexiones dobles:** `RayTracer(max_reflections=2)` añade los rayos muro–muro, suelo–muro y muro–suelo. `RayTracer.candidate_rays()` da el orden de todos los rayos candidatos.
+  * **Proyectos:** `Settings.diffraction` (activada por defecto) y `Settings.max_reflections`, y las aristas se generan solas a partir de edificios y muros (`Building.edges`, `Wall.edges`). El informe de la simulación incluye `edges`, `max_reflections` y `candidate_rays`.
+  * **Interfaz:**
+    * La configuración tiene las opciones "Difracción (UTD)" y "Reflexiones".
+    * Los rayos difractados se marcan con un cuadrado en el punto de la arista, y las reflexiones dobles con sus dos puntos de rebote.
+    * Las etiquetas del receptor dicen qué esquina, borde o par de muros tocó cada rayo.
+* **Cambios que conviene conocer:**
+  * Con los valores por defecto de la librería (sin aristas, un rebote) los resultados son idénticos bit a bit a 1.4.0. Los **proyectos** sí cambian, porque la difracción viene activada: la sombra detrás de los obstáculos deja de estar vacía. Para recuperar los resultados de 1.4.0 pon `"diffraction": false` en `settings`.
+  * `MultipathRay` tiene un campo más, `interactions`, que tampoco forma parte de `==` ni del `repr`.
+  * `run_raytracing_simulation` reparte la grilla en bloques según el número de rayos candidatos (`simulation._MAX_RAY_POINTS`), sin cambiar ningún número.
 
 ### Versión 1.4.0
 

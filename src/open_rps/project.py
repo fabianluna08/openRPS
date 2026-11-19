@@ -37,7 +37,7 @@ import numpy as np
 
 from .models import Cost231Hata, FreeSpacePathLoss, LogDistancePathLoss, OkumuraHata, TwoRayGroundReflection
 from .multipath import ChannelImpulseResponse
-from .raytracer import PlanarReflector, Transmitter
+from .raytracer import DiffractionEdge, PlanarReflector, Transmitter, _in_polygon
 from .simulation import DEFAULT_MIN_DISTANCE_M, PropagationSimulator, SimulationResult
 
 PROJECT_FORMAT = "openrps-project"
@@ -147,6 +147,19 @@ class Material:
         if self.penetration == "fixed":
             return float(self.loss_db)
         return max(0.0, float(self.loss_a_db) + float(self.loss_b_db_per_ghz) * frequency_hz / 1e9)
+
+    def surface_kwargs(self, frequency_hz: float) -> Dict[str, Any]:
+        """Reflection parameters (reflectivity, or eps_r and sigma) for walls and edges of this material."""
+        if self.reflection == "constant":
+            return {"reflectivity": float(self.reflectivity)}
+        return {"eps_r": float(self.eps_r), "sigma": self.conductivity(frequency_hz)}
+
+    def shadow_loss_db(self, frequency_hz: float, crossings: int) -> float:
+        """Loss of a ray that crosses ``crossings`` walls of this material (DiffractionEdge.shadow_loss_db)."""
+        loss = self.penetration_loss_db(frequency_hz)
+        if loss is None:
+            return 0.0
+        return float("inf") if math.isinf(loss) else crossings * loss
 
     def reflector_kwargs(self, frequency_hz: float) -> Dict[str, Any]:
         """Keyword arguments of ``PlanarReflector`` for a wall of this material."""
@@ -293,9 +306,49 @@ class Building:
                                          name=f"{label} · techo", footprint=self.footprint, **kwargs))
         return walls
 
+    def edges(self, material: Material, frequency_hz: float) -> List[DiffractionEdge]:
+        """
+        Diffracting edges of the building (new in 1.5.0): one vertical edge per convex
+        corner of the footprint (reflex corners, the inside corner of an L, do not
+        diffract into the exterior) and, with a roof, one horizontal edge per side of
+        the roof (a right-angled wedge, n = 1.5).  A ray just behind an edge crosses
+        two walls of the building, so the shadow loss is twice the penetration loss.
+        """
+        label = self.name or self.id
+        poly = [list(map(float, q)) for q in self.footprint]
+        order = list(range(len(poly)))
+        if polygon_area(poly) < 0:                     # the geometry below assumes counter-clockwise
+            poly, order = poly[::-1], order[::-1]
+        common = dict(material.surface_kwargs(frequency_hz), shadow_loss_db=material.shadow_loss_db(frequency_hz, 2))
+        out: List[DiffractionEdge] = []
+        n = len(poly)
+        for i in range(n):
+            prev, here, nxt = np.array(poly[i - 1]), np.array(poly[i]), np.array(poly[(i + 1) % n])
+            t0 = (nxt - here) / np.linalg.norm(nxt - here)
+            tn = (prev - here) / np.linalg.norm(prev - here)
+            n0 = np.array([t0[1], -t0[0]])               # outward normal of the side here -> next
+            exterior = math.atan2(float(tn @ n0), float(tn @ t0)) % (2.0 * math.pi)
+            wedge_n = exterior / math.pi
+            if wedge_n <= 1.0 + 1e-9:
+                continue
+            out.append(DiffractionEdge(start=[here[0], here[1], 0.0], end=[here[0], here[1], self.height_m],
+                                       face_direction=[t0[0], t0[1], 0.0], face_normal=[n0[0], n0[1], 0.0],
+                                       wedge_n=min(wedge_n, 2.0), polarization="soft",
+                                       name=f"{label} · esquina {order[i] + 1}", **common))
+        if self.roof:
+            for i in range(n):
+                a, b = np.array(poly[i]), np.array(poly[(i + 1) % n])
+                t = (b - a) / np.linalg.norm(b - a)
+                inward = np.array([-t[1], t[0]])
+                side = min(order[i], order[(i + 1) % n]) + 1 if abs(order[i] - order[(i + 1) % n]) == 1 else n
+                out.append(DiffractionEdge(start=[a[0], a[1], self.height_m], end=[b[0], b[1], self.height_m],
+                                           face_direction=[inward[0], inward[1], 0.0], face_normal=[0.0, 0.0, 1.0],
+                                           wedge_n=1.5, polarization="hard",
+                                           name=f"{label} · borde del techo {side}", **common))
+        return out
+
     def contains_xy(self, x, y) -> np.ndarray:
         """True where the points (x, y) are inside the footprint (edges included)."""
-        from .raytracer import _in_polygon
         return _in_polygon(x, y, np.asarray(self.footprint, dtype=float))
 
 
@@ -329,6 +382,35 @@ class Wall:
     def reflector(self, material: Material, frequency_hz: float) -> PlanarReflector:
         return vertical_wall(self.start, self.end, self.z_min_m, self.z_max_m, self.name or self.id,
                              **material.reflector_kwargs(frequency_hz))
+
+    def edges(self, material: Material, frequency_hz: float, start_free: bool = True,
+              end_free: bool = True) -> List[DiffractionEdge]:
+        """
+        Diffracting edges of the wall, a thin screen (half planes, n = 2; new in 1.5.0):
+        the top edge, the bottom edge if the wall does not stand on the ground, and
+        the two vertical ends, except the ends that touch another wall or building
+        (``start_free`` / ``end_free`` False): there the edge is not free.
+        """
+        label = self.name or self.id
+        (x0, y0), (x1, y1) = self.start, self.end
+        length = math.hypot(x1 - x0, y1 - y0)
+        along = [(x1 - x0) / length, (y1 - y0) / length, 0.0]
+        normal = [along[1], -along[0], 0.0]
+        common = dict(material.surface_kwargs(frequency_hz), shadow_loss_db=material.shadow_loss_db(frequency_hz, 1))
+        out = [DiffractionEdge(start=[x0, y0, self.z_max_m], end=[x1, y1, self.z_max_m], face_direction=[0.0, 0.0, -1.0],
+                               face_normal=normal, wedge_n=2.0, polarization="hard", name=f"{label} · borde superior",
+                               **common)]
+        if self.z_min_m > 1e-9:
+            out.append(DiffractionEdge(start=[x0, y0, self.z_min_m], end=[x1, y1, self.z_min_m],
+                                       face_direction=[0.0, 0.0, 1.0], face_normal=normal, wedge_n=2.0,
+                                       polarization="hard", name=f"{label} · borde inferior", **common))
+        for free, point, direction, which in ((start_free, (x0, y0), along, "inicio"),
+                                              (end_free, (x1, y1), [-along[0], -along[1], 0.0], "final")):
+            if free:
+                out.append(DiffractionEdge(start=[point[0], point[1], self.z_min_m], end=[point[0], point[1], self.z_max_m],
+                                           face_direction=direction, face_normal=normal, wedge_n=2.0, polarization="soft",
+                                           name=f"{label} · extremo ({which})", **common))
+        return out
 
 
 # --------------------------------------------------------------------------- transmitters, area, settings
@@ -417,9 +499,14 @@ class Settings:
     ground_eps_r: float = 15.0
     ground_sigma: float = 0.005
     reference_frequency_hz: Optional[float] = None
+    diffraction: bool = True          # UTD diffraction at the edges of buildings and walls (new in 1.5.0)
+    max_reflections: int = 1          # 2: also double reflections wall-wall and wall-ground (new in 1.5.0)
 
     def validate(self):
         _choice(self.mode, SIMULATION_MODES, "settings.mode")
+        self.diffraction = bool(self.diffraction)
+        if isinstance(self.max_reflections, bool) or self.max_reflections not in (1, 2):
+            raise ProjectError(f"settings.max_reflections: debe ser 1 o 2, se recibió {self.max_reflections!r}")
         _choice(self.hata_environment, HATA_ENVIRONMENTS, "settings.hata_environment")
         self.coherent = bool(self.coherent)
         self.sinr = bool(self.sinr)
@@ -584,7 +671,35 @@ class Project:
                 sim.add_reflector(wall)
         for wall in self.walls:
             sim.add_reflector(wall.reflector(materials[wall.material], frequency))
+        tracer = sim.ray_tracer
+        tracer.max_reflections = self.settings.max_reflections
+        if self.settings.diffraction:
+            for building in self.buildings:
+                for edge in building.edges(materials[building.material], frequency):
+                    tracer.add_edge(edge)
+            for wall in self.walls:
+                start_free, end_free = (not self._end_touches(wall, point) for point in (wall.start, wall.end))
+                for edge in wall.edges(materials[wall.material], frequency, start_free, end_free):
+                    tracer.add_edge(edge)
         return sim
+
+    def _end_touches(self, wall: "Wall", point, tol: float = 1e-6) -> bool:
+        """True if an end of ``wall`` lies on another wall (overlapping heights) or on a building footprint edge."""
+        def near_segment(a, b):
+            (ax, ay), (bx, by), (px, py) = a, b, point
+            dx, dy = bx - ax, by - ay
+            length2 = dx * dx + dy * dy
+            t = 0.0 if length2 == 0 else min(1.0, max(0.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+            return math.hypot(px - (ax + t * dx), py - (ay + t * dy)) <= tol
+        for other in self.walls:
+            if other is not wall and other.z_min_m < wall.z_max_m and wall.z_min_m < other.z_max_m \
+                    and near_segment(other.start, other.end):
+                return True
+        for building in self.buildings:
+            fp = building.footprint
+            if wall.z_min_m < building.height_m and any(near_segment(fp[i], fp[(i + 1) % len(fp)]) for i in range(len(fp))):
+                return True
+        return False
 
     def empirical_model(self):
         """Propagation model of the empirical modes (None in ray-tracing mode)."""
@@ -633,6 +748,9 @@ class Project:
             "transmitters": len(sim.transmitters),
             "reflectors": len(sim.ray_tracer.reflectors),
             "obstructing_reflectors": sum(1 for r in sim.ray_tracer.reflectors if r.obstructs),
+            "edges": len(sim.ray_tracer.edges),
+            "max_reflections": sim.ray_tracer.max_reflections,
+            "candidate_rays": len(sim.ray_tracer.candidate_rays()),
             "reference_frequency_hz": self.reference_frequency_hz(),
             "mode": self.settings.mode,
         }
@@ -654,6 +772,7 @@ class Project:
         z = _number(point[2], "probe.z", 0.0) if len(point) == 3 else float(self.area.rx_height_m)
         sim = sim or self.build_simulator()
         names = [r.name for r in sim.ray_tracer.reflectors]
+        edge_names = [e.name for e in sim.ray_tracer.edges]
         model = self.empirical_model()
         entries = []
         for tx in sim.transmitters:
@@ -664,7 +783,7 @@ class Project:
             if model is None:
                 cir = sim.ray_tracer.trace_paths(tx, (x, y, z))
                 entry.update(_cir_metrics(cir, tx, self.settings.coherent))
-                entry["rays"] = [_ray_dict(ray, names) for ray in cir.rays]
+                entry["rays"] = [_ray_dict(ray, names, edge_names) for ray in cir.rays]
             else:
                 entry.update(_empirical_point(model, tx, x, y, z))
                 entry["rays"] = []
@@ -691,11 +810,22 @@ def _cir_metrics(cir: ChannelImpulseResponse, tx: Transmitter, coherent: bool) -
     }
 
 
-def _ray_dict(ray, names: List[str]) -> Dict[str, Any]:
+def _ray_dict(ray, names: List[str], edge_names: Sequence[str] = ()) -> Dict[str, Any]:
+    def plane(kind, index):
+        if kind == "ground":
+            return "suelo"
+        if kind == "edge":
+            return edge_names[index] if 0 <= index < len(edge_names) else f"arista {index}"
+        return names[index] if 0 <= index < len(names) else f"muro {index}"
+
     if ray.kind == "direct":
         label = "Directo (LoS)"
     elif ray.kind == "ground":
         label = "Reflexión en el suelo"
+    elif ray.kind == "diffraction":
+        label = f"Difracción: {plane(*ray.interactions[0])}"
+    elif ray.kind == "double":
+        label = "Doble reflexión: " + " → ".join(plane(*i) for i in ray.interactions)
     elif 0 <= ray.reflector_index < len(names):
         label = f"Reflexión: {names[ray.reflector_index]}"
     else:
@@ -703,6 +833,7 @@ def _ray_dict(ray, names: List[str]) -> Dict[str, Any]:
     power = ray.power_linear
     return {
         "kind": ray.kind, "label": label, "reflector_index": ray.reflector_index,
+        "interactions": [list(i) for i in ray.interactions],
         "path": [list(p) for p in ray.path] if ray.path else None,
         "power_dbm": 10.0 * math.log10(power) if power > 0 else float("-inf"),
         "phase_deg": math.degrees(math.atan2(ray.magnitude.imag, ray.magnitude.real)),

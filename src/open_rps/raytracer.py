@@ -7,8 +7,10 @@ Two equivalent entry points are provided:
   * ``RayTracer.trace_paths``  -- one receiver point, returns a ChannelImpulseResponse.
   * ``RayTracer.trace_points`` -- many receiver points at once (numpy), returns a RayField.
 
-Physical scope (see README, "Limitaciones fisicas"): single-bounce specular
-reflections only, no diffraction.  Walls do not block rays unless they are given a
+Physical scope (see README, "Limitaciones fisicas"): direct ray, ground reflection
+and one specular reflection per wall; optionally (new in 1.5.0) one diffraction per
+edge (``DiffractionEdge``, UTD) and every double reflection wall-wall / wall-ground
+(``RayTracer(max_reflections=2)``).  Walls do not block rays unless they are given a
 ``transmission_loss_db`` (see ``PlanarReflector``): then every ray leg that crosses
 the wall is attenuated by that loss (``inf`` = opaque wall, the ray carries no power).
 Antennas are isotropic unless ``Transmitter(pattern="sector")`` is used.  The tracer
@@ -23,6 +25,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .diffraction import utd_coefficient
 from .models import SPEED_OF_LIGHT, fresnel_reflection_coefficient
 from .multipath import MultipathRay, ChannelImpulseResponse
 
@@ -448,6 +451,139 @@ class Transmitter:
         return self.antenna_gain_dbi + self.pattern_gain_db(phi_deg, theta_deg)
 
 
+EDGE_POLARIZATIONS = ("soft", "hard")
+# Angular tolerance (rad) of the exterior region of a wedge
+_ANGLE_TOL = 1e-12
+
+
+@dataclass
+class DiffractionEdge:
+    """
+    A straight edge of a wedge that diffracts rays (new in 1.5.0), with the
+    coefficient of the Uniform Theory of Diffraction (``diffraction.utd_coefficient``).
+
+    Geometry: the edge is the segment ``start`` -> ``end``.  ``face_direction`` (t0)
+    points from the edge into face 0 of the wedge and ``face_normal`` (n0) is the
+    normal of face 0 on the side of the exterior (free space); both perpendicular
+    to the edge (components along it are removed on creation).  Angles around the
+    edge are measured from face 0 towards n0: the exterior of the wedge is
+    0 <= phi <= ``wedge_n`` * pi, and face n is face 0 rotated by that angle.
+    ``wedge_n`` = 2 is a half plane (a thin screen: the top or the end of a wall),
+    1.5 a right-angled corner (a building corner or a roof edge); it must lie in (1, 2].
+
+    polarization: "soft" (E parallel to the edge: vertical polarization on a vertical
+        edge) or "hard" (E perpendicular to the edge: vertical polarization on a
+        horizontal edge such as a roof edge).
+    reflectivity / eps_r / sigma: the faces, as in ``PlanarReflector``.  Constant
+        reflectivity rho gives the Luebbers face coefficients -rho (soft) or +rho
+        (hard): rho = 1 is a perfectly conducting wedge.  With ``eps_r`` the Fresnel
+        coefficients are used (TE for soft, TM for hard), at the grazing angles phi'
+        on face 0 and n*pi - phi on face n.
+    shadow_loss_db: penetration loss of the incident field just inside the shadow
+        of the edge (``inf``, default: an opaque wedge, the standard UTD).  A finite
+        value L scales the two incident-shadow-boundary terms by 1 - 10^(-L/20), so
+        that the total field (transmitted + diffracted) stays continuous at the
+        shadow boundary of a wedge that lets part of the field through; 0 removes
+        them (a wedge that does not obstruct only diffracts its reflections).
+
+    A diffracted ray exists where both Tx and Rx are in the exterior of the wedge
+    (and off the edge line) and the diffraction point given by Keller's law (equal
+    angles with the edge) falls on the segment, ends included.
+    """
+    start: np.ndarray
+    end: np.ndarray
+    face_direction: np.ndarray
+    face_normal: np.ndarray
+    wedge_n: float = 2.0
+    polarization: str = "soft"
+    reflectivity: float = 1.0
+    eps_r: Optional[float] = None
+    sigma: float = 0.0
+    shadow_loss_db: Optional[float] = float("inf")
+    name: str = "Edge"
+
+    def __post_init__(self):
+        self.start = np.array(self.start, dtype=float)
+        self.end = np.array(self.end, dtype=float)
+        if self.start.shape != (3,) or self.end.shape != (3,):
+            raise ValueError("start and end must be 3-element vectors [x, y, z]")
+        axis = self.end - self.start
+        length = float(np.linalg.norm(axis))
+        if not (np.isfinite(length) and length > 0.0):
+            raise ValueError("an edge needs two distinct, finite end points")
+        self.length = length
+        self.axis = axis / length
+        t0 = np.array(self.face_direction, dtype=float)
+        n0 = np.array(self.face_normal, dtype=float)
+        if t0.shape != (3,) or n0.shape != (3,):
+            raise ValueError("face_direction and face_normal must be 3-element vectors")
+        t0 = t0 - np.dot(t0, self.axis) * self.axis
+        if not np.linalg.norm(t0) > 1e-9:
+            raise ValueError("face_direction must not be parallel to the edge")
+        t0 = t0 / np.linalg.norm(t0)
+        n0 = n0 - np.dot(n0, self.axis) * self.axis - np.dot(n0, t0) * t0
+        if not np.linalg.norm(n0) > 1e-9:
+            raise ValueError("face_normal must not lie in the plane of face 0")
+        self.face_direction = t0
+        self.face_normal = n0 / np.linalg.norm(n0)
+        n = float(self.wedge_n)
+        if not (np.isfinite(n) and 1.0 < n <= 2.0):
+            raise ValueError(f"wedge_n (exterior angle / pi) must be in (1, 2], got {self.wedge_n!r}")
+        self.wedge_n = n
+        if self.polarization not in EDGE_POLARIZATIONS:
+            raise ValueError(f"polarization must be one of {EDGE_POLARIZATIONS}, got {self.polarization!r}")
+        if not (0.0 <= self.reflectivity <= 1.0):
+            raise ValueError(f"reflectivity must be within [0, 1], got {self.reflectivity!r}")
+        if self.eps_r is not None and not self.eps_r >= 1.0:
+            raise ValueError(f"eps_r must be >= 1, got {self.eps_r!r}")
+        loss = 0.0 if self.shadow_loss_db is None else float(self.shadow_loss_db)
+        if not loss >= 0.0:
+            raise ValueError(f"shadow_loss_db must be >= 0 dB or inf, got {self.shadow_loss_db!r}")
+        self.shadow_loss_db = loss
+
+    @property
+    def exterior_angle(self) -> float:
+        """Exterior angle of the wedge in radians (n * pi)."""
+        return self.wedge_n * math.pi
+
+    @property
+    def isb_scale(self) -> float:
+        """Factor of the incident-shadow-boundary terms: 1 - (amplitude let through the wedge)."""
+        return 1.0 - 10.0 ** (-self.shadow_loss_db / 20.0)
+
+    def cylindrical(self, points):
+        """
+        Coordinates of ``points`` ([..., 3]) around the edge: (s, r, phi) with s the
+        position along the edge measured from ``start``, r the distance to the edge
+        line and phi the angle from face 0 (0..2 pi; tiny negative angles, i.e. points
+        on face 0 up to rounding, give 0).
+        """
+        v = np.asarray(points, dtype=float) - self.start
+        s = v @ self.axis
+        perp = v - s[..., None] * self.axis if np.ndim(s) else v - s * self.axis
+        r = np.linalg.norm(perp, axis=-1)
+        phi = np.arctan2(perp @ self.face_normal, perp @ self.face_direction)
+        phi = np.where(phi < -_ANGLE_TOL, phi + 2.0 * math.pi, np.maximum(phi, 0.0))
+        return s, r, phi
+
+    def face_coefficients(self, phi_prime, phi, frequency_hz: float):
+        """Luebbers' reflection coefficients (r0, rn) of the faces: grazing angles phi' and n pi - phi."""
+        if self.eps_r is None:
+            rho = -self.reflectivity if self.polarization == "soft" else self.reflectivity
+            shape = np.broadcast(np.asarray(phi_prime), np.asarray(phi)).shape
+            return np.full(shape, rho, dtype=complex), np.full(shape, rho, dtype=complex)
+        pol = "horizontal" if self.polarization == "soft" else "vertical"
+
+        def grazing(angle):
+            a = np.clip(np.asarray(angle, dtype=float), 0.0, math.pi)
+            return np.minimum(a, math.pi - a)
+
+        psi0 = grazing(phi_prime) + np.zeros(np.shape(phi))
+        psin = grazing(self.exterior_angle - np.asarray(phi, dtype=float))
+        return (np.asarray(fresnel_reflection_coefficient(psi0, frequency_hz, self.eps_r, self.sigma, pol)),
+                np.asarray(fresnel_reflection_coefficient(psin, frequency_hz, self.eps_r, self.sigma, pol)))
+
+
 @dataclass
 class RayField:
     """
@@ -455,8 +591,10 @@ class RayField:
 
     Every array has shape [K, *points_shape], K being the number of candidate rays:
     index 0 = direct, 1 = ground reflection, 2.. = one per reflector (in the order
-    they were added).  Where a ray does not exist ``valid`` is False, its amplitude
-    is 0 and its delay/angles are NaN.
+    they were added), then one diffracted ray per edge and, with
+    ``max_reflections=2``, one per ordered pair of planes (see
+    ``RayTracer.candidate_rays``).  Where a ray does not exist ``valid`` is False,
+    its amplitude is 0 and its delay/angles are NaN.
 
     Obstruction (walls with ``transmission_loss_db``) never changes which rays exist:
     a ray attenuated or blocked by walls keeps ``valid`` = True, its delay and its
@@ -490,6 +628,33 @@ class RayField:
         return self.power_linear.sum(axis=0)
 
 
+def _plane_ref(index: int) -> Tuple[str, int]:
+    """Interaction of a reflection on plane ``index`` (-1 = ground)."""
+    return ("ground", -1) if index < 0 else ("wall", index)
+
+
+class _Rays:
+    """One candidate ray of ``RayTracer._extra_rays`` evaluated on a flat array of points."""
+    __slots__ = ("kind", "interactions", "idx", "amplitude", "tau_ns", "angles", "loss_db", "vertices")
+
+    def __init__(self, kind: str, interactions):
+        self.kind = kind
+        self.interactions = interactions
+        self.idx = np.zeros(0, dtype=np.intp)          # points where the ray exists
+        self.amplitude = self.tau_ns = self.loss_db = None
+        self.angles = None                              # (tx_phi, tx_theta, rx_phi, rx_theta)
+        self.vertices = None                            # interior vertices of the path, [m, 3] each
+
+    def fill(self, idx, amplitude, length_m, angles, loss_db, vertices):
+        self.idx = idx
+        self.amplitude = amplitude
+        self.tau_ns = length_m / SPEED_OF_LIGHT * 1e9
+        self.angles = angles
+        self.loss_db = loss_db
+        self.vertices = vertices
+        return self
+
+
 def _angles_deg(p_src: np.ndarray, p_dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Vectorized azimuth/elevation (degrees) of the direction src -> dst; inputs broadcast to [..., 3]."""
     v = p_dst - p_src
@@ -508,13 +673,49 @@ class RayTracer:
     the loss through the walls that the ray crosses, for the walls that have a
     ``transmission_loss_db`` (none by default; see ``PlanarReflector``).
     """
-    def __init__(self, ground_eps_r: float = 15.0, ground_sigma: float = 0.005):
+    def __init__(self, ground_eps_r: float = 15.0, ground_sigma: float = 0.005, max_reflections: int = 1):
         self.ground_eps_r = ground_eps_r
         self.ground_sigma = ground_sigma
         self.reflectors: List[PlanarReflector] = []
+        self.edges: List[DiffractionEdge] = []
+        self.max_reflections = max_reflections
+
+    @property
+    def max_reflections(self) -> int:
+        """1 (default): one specular reflection per ray.  2: also every double reflection (new in 1.5.0)."""
+        return self._max_reflections
+
+    @max_reflections.setter
+    def max_reflections(self, value: int):
+        if isinstance(value, bool) or value not in (1, 2):
+            raise ValueError(f"max_reflections must be 1 or 2, got {value!r}")
+        self._max_reflections = int(value)
 
     def add_reflector(self, reflector: PlanarReflector):
         self.reflectors.append(reflector)
+
+    def add_edge(self, edge: DiffractionEdge):
+        """Add an edge that diffracts rays (UTD; new in 1.5.0)."""
+        self.edges.append(edge)
+
+    def _plane_pairs(self) -> List[Tuple[int, int]]:
+        """Ordered pairs (a, b), a != b, of the planes of a double reflection: -1 = ground, 0.. = reflectors."""
+        if self.max_reflections < 2:
+            return []
+        planes = range(-1, len(self.reflectors))
+        return [(a, b) for a in planes for b in planes if a != b]
+
+    def candidate_rays(self) -> List[Tuple[str, Tuple[Tuple[str, int], ...]]]:
+        """
+        (kind, interactions) of every candidate ray, in the order of the axis K of
+        ``trace_points`` (and of the rays of ``trace_paths``).  Interactions are
+        ("ground", -1), ("wall", index of the reflector) or ("edge", index of the edge).
+        """
+        rays = [("direct", ()), ("ground", (("ground", -1),))]
+        rays += [("wall", (("wall", r),)) for r in range(len(self.reflectors))]
+        rays += [("diffraction", (("edge", e),)) for e in range(len(self.edges))]
+        rays += [("double", (_plane_ref(a), _plane_ref(b))) for a, b in self._plane_pairs()]
+        return rays
 
     def obstruction_loss_db(self, p_start, p_end) -> np.ndarray:
         """
@@ -619,6 +820,180 @@ class RayTracer:
         return fresnel_reflection_coefficient(theta_grazing_rad, freq_hz,
                                               self.ground_eps_r, self.ground_sigma, "vertical")
 
+    # ------------------------------------------------------------------ diffraction and double reflections
+    def _plane_distance(self, index: int, points) -> np.ndarray:
+        """Signed distance to plane ``index`` (-1 = ground z = 0)."""
+        points = np.asarray(points, dtype=float)
+        return points[..., 2] if index < 0 else self.reflectors[index].signed_distance(points)
+
+    def _mirror(self, index: int, point: np.ndarray, distance: float) -> np.ndarray:
+        """Image of ``point`` across plane ``index`` (its signed distance given)."""
+        if index < 0:
+            return point * np.array([1.0, 1.0, -1.0])
+        return point - 2.0 * distance * self.reflectors[index].normal
+
+    def _plane_contains(self, index: int, points: np.ndarray) -> np.ndarray:
+        if index < 0:
+            return np.ones(points.shape[:-1], dtype=bool)
+        return self.reflectors[index].contains(points)
+
+    def _plane_coefficient(self, index: int, sin_grazing: np.ndarray, frequency_hz: float) -> np.ndarray:
+        if index < 0:
+            psi = np.arcsin(np.clip(sin_grazing, 0.0, 1.0))
+            return np.asarray(self._fresnel_ground_reflection(psi, frequency_hz))
+        return np.asarray(self.reflectors[index].reflection_coefficient(sin_grazing, frequency_hz))
+
+    @staticmethod
+    def _polyline_obstruction(obstacles: list, idx: np.ndarray, vertices: list, bend_owns: list) -> np.ndarray:
+        """
+        Loss in dB ([m]) of the polylines vertices[0] (Tx, [3]) -> vertices[1] -> ... ->
+        vertices[-1] (Rx, [m, 3]) for the points ``idx`` through the obstructing walls
+        (``obstacles`` as built in ``_extra_rays``).  Every leg is tested as in
+        ``PlanarReflector.crosses``.  bend_owns gives, per interior vertex, None (no
+        test at that bend: a diffraction point, where the ray legitimately turns
+        around the edge) or the index of the plane the ray is reflected on there
+        (-1 = ground), which is the only wall not tested at that bend.
+        """
+        loss = np.zeros(len(idx))
+        for index, wall, s_tx, s_rx in obstacles:
+            dist = [s_tx] + [wall.signed_distance(v) for v in vertices[1:-1]] + [s_rx[idx]]
+            for leg in range(len(vertices) - 1):
+                crossed = wall._crosses(dist[leg], dist[leg + 1], vertices[leg], vertices[leg + 1])
+                np.add(loss, wall.transmission_loss_db, out=loss, where=crossed)
+            for b, own in enumerate(bend_owns, start=1):
+                if own is None or own == index:
+                    continue
+                crossed = wall._crosses_at_bend(dist[b - 1], dist[b], dist[b + 1],
+                                                vertices[b - 1], vertices[b], vertices[b + 1])
+                np.add(loss, wall.transmission_loss_db, out=loss, where=crossed)
+        return loss
+
+    def _extra_rays(self, tx: Transmitter, pts: np.ndarray, k: float, amp_1m: float, sector: bool,
+                    want_vertices: bool) -> List[_Rays]:
+        """
+        The rays added in 1.5.0 (one diffraction per edge, then every double
+        reflection), in the order of ``candidate_rays``, for the flat array of
+        receiver points ``pts`` ([M, 3]).  Shared by ``trace_paths`` (one point) and
+        ``trace_points``, so both give the same rays.
+        """
+        tx_p = np.array([tx.x, tx.y, tx.z], dtype=float)
+        obstacles = [(index, refl, float(refl.signed_distance(tx_p)), refl.signed_distance(pts))
+                     for index, refl in enumerate(self.reflectors) if refl.obstructs]
+        out = [self._diffracted_ray(tx, tx_p, pts, e, edge, k, amp_1m, sector, obstacles, want_vertices)
+               for e, edge in enumerate(self.edges)]
+        if self.max_reflections >= 2:
+            cache = {}
+
+            def rx_distance(index):
+                if index not in cache:
+                    cache[index] = self._plane_distance(index, pts)
+                return cache[index]
+
+            for a, b in self._plane_pairs():
+                out.append(self._double_ray(tx, tx_p, pts, a, b, k, amp_1m, sector, obstacles, rx_distance,
+                                            want_vertices))
+        return out
+
+    def _finish(self, ray: _Rays, tx: Transmitter, tx_p, idx, amp, length, first_point, last_point, rx,
+                obstacles, vertices, bend_owns, want_vertices) -> _Rays:
+        """Angles, antenna pattern and obstruction common to the extra rays."""
+        tx_phi, tx_theta = _angles_deg(tx_p, first_point)
+        rx_phi, rx_theta = _angles_deg(rx, last_point)
+        if not tx.is_isotropic:
+            amp = amp * self._pattern_factor(tx, tx_phi, tx_theta)
+        loss = np.zeros(len(idx))
+        if obstacles:
+            loss = self._polyline_obstruction(obstacles, idx, [tx_p] + vertices + [rx], bend_owns)
+            if loss.any():
+                amp = amp * 10.0 ** (-loss / 20.0)
+        return ray.fill(idx, amp, length, (tx_phi, tx_theta, rx_phi, rx_theta), loss,
+                        vertices if want_vertices else None)
+
+    def _diffracted_ray(self, tx, tx_p, pts, e, edge: DiffractionEdge, k, amp_1m, sector, obstacles,
+                        want_vertices) -> _Rays:
+        """Tx -> Q (on the edge, Keller's law) -> Rx, with the UTD coefficient of the wedge."""
+        ray = _Rays("diffraction", (("edge", e),))
+        s_t, r_t, phi_t = (float(v) for v in edge.cylindrical(tx_p))
+        ext = edge.exterior_angle
+        if not (r_t > OBSTRUCTION_TOL_M and phi_t <= ext + _ANGLE_TOL):
+            return ray
+        s_r, r_r, phi_r = edge.cylindrical(pts)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_q = s_t + (s_r - s_t) * (r_t / (r_t + r_r))
+        ok = ((r_r > OBSTRUCTION_TOL_M) & (phi_r <= ext + _ANGLE_TOL)
+              & (s_q >= -_BOUNDS_TOL_M) & (s_q <= edge.length + _BOUNDS_TOL_M))
+        idx = np.flatnonzero(ok)
+        if not idx.size:
+            return ray
+        s_q, s_r, r_r = s_q[idx], s_r[idx], r_r[idx]
+        phi_r = np.minimum(phi_r[idx], ext)
+        phi_t = min(phi_t, ext)
+        rx = pts[idx]
+        q = edge.start + s_q[:, None] * edge.axis
+        s1 = np.sqrt(r_t * r_t + (s_q - s_t) ** 2)          # Tx -> Q
+        s2 = np.sqrt(r_r * r_r + (s_r - s_q) ** 2)          # Q -> Rx
+        total = s1 + s2
+        sin_beta0 = r_t / s1
+        distance_parameter = s1 * s2 * sin_beta0 ** 2 / total
+        r0, rn = edge.face_coefficients(phi_t, phi_r, tx.frequency_hz)
+        d = np.asarray(utd_coefficient(phi_r, phi_t, edge.wedge_n, k, distance_parameter, sin_beta0, r0, rn,
+                                       edge.isb_scale))
+        # Field at Q (spherical wave from Tx) times D and the spreading factor of the diffracted wave
+        amp = (amp_1m / s1) * d * np.sqrt(s1 / (s2 * total)) * np.exp(-1j * k * total)
+        return self._finish(ray, tx, tx_p, idx, amp, total, q, q, rx, obstacles, [q], [None], want_vertices)
+
+    def _double_ray(self, tx, tx_p, pts, a, b, k, amp_1m, sector, obstacles, rx_distance, want_vertices) -> _Rays:
+        """Tx -> P1 (plane a) -> P2 (plane b) -> Rx by the image method (-1 = ground)."""
+        tol = OBSTRUCTION_TOL_M
+        ray = _Rays("double", (_plane_ref(a), _plane_ref(b)))
+        s_a_tx = float(self._plane_distance(a, tx_p))
+        if not abs(s_a_tx) > tol:
+            return ray
+        image_a = self._mirror(a, tx_p, s_a_tx)
+        s_b_image = float(self._plane_distance(b, image_a))
+        if not abs(s_b_image) > tol:
+            return ray
+        if b >= 0:
+            # P2 must be on the Tx side of plane a: impossible if the whole patch b is behind it
+            box = self.reflectors[b].bounds
+            if box is not None and all(np.isfinite(box)):
+                corners = np.array([[x, y, z] for x in box[0:2] for y in box[2:4] for z in box[4:6]])
+                if np.all(np.sign(s_a_tx) * self._plane_distance(a, corners) < -tol):
+                    return ray
+        image_ab = self._mirror(b, image_a, s_b_image)
+        s_b_rx = rx_distance(b)
+        idx = np.flatnonzero(_same_side(s_b_image, s_b_rx, tol))      # Rx on the side of plane b of image_a
+        if not idx.size:
+            return ray
+        rx = pts[idx]
+        s_b_ab = -s_b_image
+        t2 = s_b_ab / (s_b_ab - s_b_rx[idx])
+        p2 = image_ab + t2[:, None] * (rx - image_ab)
+        s_a_p2 = self._plane_distance(a, p2)
+        keep = self._plane_contains(b, p2) & _same_side(s_a_tx, s_a_p2, tol)
+        if not keep.any():
+            return ray
+        idx, rx, p2, s_a_p2 = idx[keep], rx[keep], p2[keep], s_a_p2[keep]
+        t1 = -s_a_tx / (-s_a_tx - s_a_p2)
+        p1 = image_a + t1[:, None] * (p2 - image_a)
+        seg = p2 - p1
+        seg_len = np.linalg.norm(seg, axis=-1)
+        keep = self._plane_contains(a, p1) & (seg_len > tol)
+        if not keep.any():
+            return ray
+        idx, rx, p1, p2, seg, seg_len = idx[keep], rx[keep], p1[keep], p2[keep], seg[keep], seg_len[keep]
+        leg1 = p1 - tx_p
+        normal_a = np.array([0.0, 0.0, 1.0]) if a < 0 else self.reflectors[a].normal
+        normal_b = np.array([0.0, 0.0, 1.0]) if b < 0 else self.reflectors[b].normal
+        sin_a = np.abs(leg1 @ normal_a) / np.linalg.norm(leg1, axis=-1)
+        sin_b = np.abs(seg @ normal_b) / seg_len
+        gamma = (self._plane_coefficient(a, sin_a, tx.frequency_hz)
+                 * self._plane_coefficient(b, sin_b, tx.frequency_hz))
+        length = np.linalg.norm(rx - image_ab, axis=-1)
+        amp = (amp_1m / length) * gamma * np.exp(-1j * k * length)
+        return self._finish(ray, tx, tx_p, idx, amp, length, p1, p2, rx, obstacles, [p1, p2], [a, b],
+                            want_vertices)
+
     def trace_paths(self, tx: Transmitter, rx_pos: Tuple[float, float, float]) -> ChannelImpulseResponse:
         """
         Traces multipath rays from transmitter to receiver position:
@@ -676,6 +1051,7 @@ class RayTracer:
                 obstruction_loss_db=loss_direct,
                 kind="direct",
                 path=(tuple(tx_p.tolist()), tuple(rx_p.tolist())),
+                interactions=(),
             ))
 
         # --- 2. Ground Reflected Ray ---
@@ -725,6 +1101,7 @@ class RayTracer:
                 obstruction_loss_db=loss_ground,
                 kind="ground",
                 path=(tuple(tx_p.tolist()), tuple(bounce_xyz), tuple(rx_p.tolist())),
+                interactions=(("ground", -1),),
             ))
 
         # --- 3. Wall Specular Reflections ---
@@ -778,7 +1155,29 @@ class RayTracer:
                 kind="wall",
                 path=(tuple(tx_p.tolist()), tuple(p_wall_hit.tolist()), tuple(rx_p.tolist())),
                 reflector_index=wall_index,
+                interactions=(("wall", wall_index),),
             ))
+
+        # --- 4. Diffraction by edges and 5. double reflections (new in 1.5.0) ---
+        if self.edges or self.max_reflections >= 2:
+            for extra in self._extra_rays(tx, rx_p[None, :], k, amp_1m, sector, want_vertices=True):
+                if not extra.idx.size:
+                    continue
+                tx_phi_e, tx_theta_e, rx_phi_e, rx_theta_e = (float(v[0]) for v in extra.angles)
+                cir.add_ray(MultipathRay(
+                    tx_id=tx.tx_id,
+                    magnitude=complex(extra.amplitude[0]),
+                    tau_ns=float(extra.tau_ns[0]),
+                    tx_phi_deg=tx_phi_e,
+                    tx_theta_deg=tx_theta_e,
+                    rx_phi_deg=rx_phi_e,
+                    rx_theta_deg=rx_theta_e,
+                    obstruction_loss_db=float(extra.loss_db[0]),
+                    kind=extra.kind,
+                    path=(tuple(tx_p.tolist()),) + tuple(tuple(v[0].tolist()) for v in extra.vertices)
+                         + (tuple(rx_p.tolist()),),
+                    interactions=extra.interactions,
+                ))
 
         return cir
 
@@ -795,7 +1194,8 @@ class RayTracer:
         if pts.shape[-1] != 3:
             raise ValueError("points must have shape [..., 3]")
         shape = pts.shape[:-1]
-        n_rays = 2 + len(self.reflectors)
+        n_first = 2 + len(self.reflectors)
+        n_rays = n_first + len(self.edges) + len(self._plane_pairs())
 
         amplitude = np.zeros((n_rays,) + shape, dtype=complex)
         tau_ns = np.full((n_rays,) + shape, np.nan)
@@ -895,6 +1295,20 @@ class RayTracer:
             gamma_wall = refl.reflection_coefficient(np.where(ok_wall, sin_grazing, 0.0), tx.frequency_hz)
             gamma_wall = np.asarray(gamma_wall)
             store(2 + r, ok_wall, d_wall, gamma_wall, p_wall_hit, p_wall_hit, via=p_wall_hit, own=r)
+
+        # --- 4. Diffraction by edges and 5. double reflections (new in 1.5.0) ---
+        if n_rays > n_first:
+            flat = pts.reshape(-1, 3)
+            for i, extra in enumerate(self._extra_rays(tx, flat, k, amp_1m, sector, want_vertices=False)):
+                if not extra.idx.size:
+                    continue
+                r = n_first + i
+                amplitude[r].reshape(-1)[extra.idx] = extra.amplitude
+                tau_ns[r].reshape(-1)[extra.idx] = extra.tau_ns
+                for a, values in enumerate(extra.angles):
+                    angles[a, r].reshape(-1)[extra.idx] = values
+                valid[r].reshape(-1)[extra.idx] = True
+                loss_db[r].reshape(-1)[extra.idx] = extra.loss_db
 
         return RayField(
             tx_id=tx.tx_id,

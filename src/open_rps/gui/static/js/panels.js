@@ -122,7 +122,7 @@ function fieldRow(obj, spec, onCommit) {
       if (String(v) === String(value)) option.selected = true;
       input.append(option);
     }
-    input.addEventListener("change", () => onCommit(spec.key, input.value));
+    input.addEventListener("change", () => onCommit(spec.key, spec.integer ? Number(input.value) : input.value));
   } else if (spec.type === "color") {
     input = el("input", { type: "color", value });
     input.addEventListener("change", () => onCommit(spec.key, input.value));
@@ -196,6 +196,11 @@ const AREA_FIELDS = [
 
 const SETTINGS_FIELDS = [
   { key: "mode", label: "Modelo", type: "select", options: Object.entries(MODE_LABELS) },
+  { key: "diffraction", label: "Difracción (UTD)", type: "checkbox", show: (s) => s.mode === "raytracing",
+    help: "Rayos difractados en las esquinas y bordes de techo de los edificios y en los bordes de los muros" },
+  { key: "max_reflections", label: "Reflexiones", type: "select", integer: true, show: (s) => s.mode === "raytracing",
+    options: [[1, "Un rebote"], [2, "Hasta dos rebotes (más lento)"]],
+    help: "Con dos rebotes se suman las reflexiones muro–muro y muro–suelo" },
   { key: "coherent", label: "Suma coherente", type: "checkbox", show: (s) => s.mode === "raytracing",
     help: "Suma las amplitudes complejas de los rayos: aparece el desvanecimiento rápido" },
   { key: "hata_environment", label: "Entorno", type: "select", options: Object.entries(HATA_LABELS), show: (s) => s.mode === "hata" },
@@ -316,7 +321,7 @@ export function renderProperties(container, titleEl, store, app) {
     if (obj.mode !== "raytracing") {
       container.append(el("p", { class: "note", text: "Los modelos empíricos ignoran los edificios y muros: ni reflejan ni obstruyen. Usa ray tracing para verlos en el mapa." }));
     } else {
-      container.append(el("p", { class: "note", text: "Ray tracing de OpenRPS: rayo directo, reflexión en el suelo y un rebote especular por muro, con obstrucción por los muros que tapan. Sin difracción." }));
+      container.append(el("p", { class: "note", text: "Ray tracing de OpenRPS: rayo directo, reflexión en el suelo y rebotes especulares en los muros (uno, o hasta dos), difracción UTD en las aristas (una por rayo) y obstrucción por los muros que tapan. No combina difracción con reflexiones ni difracciones sucesivas." }));
     }
   } else if (s.type === "project") {
     titleEl.textContent = "Proyecto";

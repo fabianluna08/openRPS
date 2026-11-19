@@ -76,12 +76,15 @@ class MultipathRay:
     obstruction_loss_db: float = 0.0
     # Geometry of the ray, for display (new in 1.4.0).  Filled by ``RayTracer.trace_paths``;
     # left out of ``==`` and ``repr`` so that rays compare and print as in 1.3.0.
-    #   kind: "direct", "ground" or "wall" ("" if unknown)
+    #   kind: "direct", "ground", "wall", "diffraction" or "double" ("" if unknown)
     #   path: vertices of the polyline Tx -> [bounce point] -> Rx, as (x, y, z) tuples
     #   reflector_index: position of the wall in ``RayTracer.reflectors`` (-1 if not a wall ray)
     kind: str = field(default="", compare=False, repr=False)
     path: Optional[Tuple[Tuple[float, float, float], ...]] = field(default=None, compare=False, repr=False)
     reflector_index: int = field(default=-1, compare=False, repr=False)
+    # New in 1.5.0: what the ray met, in order: ("ground", -1), ("wall", i) or ("edge", i).  kind is then
+    # also "diffraction" (one edge) or "double" (two reflections).  Not part of == nor repr either.
+    interactions: Tuple = field(default=(), compare=False, repr=False)
 
     @property
     def power_linear(self) -> float:

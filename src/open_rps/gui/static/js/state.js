@@ -16,7 +16,7 @@ export class Store {
     this.view = {
       mode: "2d", tool: "select", metric: "rx_power", txFilter: "best", opacity: 0.85,
       rangeAuto: true, rangeMin: null, rangeMax: null, grid: true, snap: true, smooth: false, labels: true,
-      relief: false, transparent: false, showBlocked: true, hoverRay: null,
+      relief: false, transparent: false, showBlocked: false, hoverRay: null,
       coverageThreshold: -85, sinrThreshold: 0,
     };
     this.undoStack = [];

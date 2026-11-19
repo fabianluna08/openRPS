@@ -17,6 +17,9 @@ from .raytracer import RayTracer, Transmitter, PlanarReflector
 
 # Upper bound of receiver points traced per numpy batch (keeps memory bounded on big grids)
 _MAX_CHUNK_POINTS = 200_000
+# Upper bound of (candidate ray x point) values per batch: with diffraction and double
+# reflections a tracer can have thousands of candidate rays (new in 1.5.0)
+_MAX_RAY_POINTS = 2_000_000
 
 BOLTZMANN_J_PER_K = 1.380649e-23
 # Pixels closer than this (3D) to a transmitter antenna are not evaluated by default.
@@ -332,6 +335,10 @@ class PropagationSimulator:
     def add_reflector(self, wall: PlanarReflector):
         self.ray_tracer.add_reflector(wall)
 
+    def add_edge(self, edge):
+        """Add a diffracting edge (``DiffractionEdge``, new in 1.5.0) to the ray tracer."""
+        self.ray_tracer.add_edge(edge)
+
     def _build_result(self, x_coords, y_coords, rx_power_dbm, path_loss_db,
                       best_index, max_rx_power_dbm, delay_spread, angular_spread) -> SimulationResult:
         tx_ids = [tx.tx_id for tx in self.transmitters]
@@ -426,7 +433,9 @@ class PropagationSimulator:
         delay_spread_tx = np.full((num_tx, ny, nx), float("nan"))
         angular_spread_tx = np.full((num_tx, ny, nx), float("nan"))
 
-        rows_per_chunk = max(1, _MAX_CHUNK_POINTS // max(1, nx))
+        n_candidates = len(self.ray_tracer.candidate_rays())
+        chunk_points = min(_MAX_CHUNK_POINTS, max(1, _MAX_RAY_POINTS // n_candidates))
+        rows_per_chunk = max(1, chunk_points // max(1, nx))
         for j0 in range(0, ny, rows_per_chunk):
             rows = slice(j0, min(ny, j0 + rows_per_chunk))
             points = np.empty((len(y_coords[rows]), nx, 3))
