@@ -83,7 +83,8 @@ class MultipathRay:
     path: Optional[Tuple[Tuple[float, float, float], ...]] = field(default=None, compare=False, repr=False)
     reflector_index: int = field(default=-1, compare=False, repr=False)
     # New in 1.5.0: what the ray met, in order: ("ground", -1), ("wall", i) or ("edge", i).  kind is then
-    # also "diffraction" (one edge) or "double" (two reflections).  Not part of == nor repr either.
+    # also "diffraction" (one edge) or "double" (two reflections), and since 1.6.0 "double-diffraction",
+    # "reflection-diffraction" or "diffraction-reflection" (in that order).  Not part of == nor repr either.
     interactions: Tuple = field(default=(), compare=False, repr=False)
 
     @property
