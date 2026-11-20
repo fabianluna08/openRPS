@@ -29,6 +29,9 @@ export const api = {
   validate: (project) => request("/api/validate", { project }),
   simulate: (project) => request("/api/simulate", { project }),
   probe: (project, point) => request("/api/probe", { project, point }),
+  parseMeasurements: (project, csv) => request("/api/measurements/parse", { project, csv }),
+  compare: (project) => request("/api/compare", { project }),
+  calibrate: (project, options) => request("/api/calibrate", { project, options }),
   exportUrl: (resultId, what) => `/api/export/${encodeURIComponent(resultId)}/${encodeURIComponent(what)}`,
 };
 

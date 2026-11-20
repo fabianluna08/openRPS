@@ -9,6 +9,12 @@ La versión 1.5.0 añade la **difracción en aristas con la Teoría Uniforme de 
 
 La versión 1.6.0 añade la **difracción doble**: el rayo puede pasar por dos aristas seguidas, como sobre un edificio alto y ancho o rodeando las esquinas de dos edificios. También añade los **rayos que combinan una reflexión con una difracción** (sección 1.G).
 
+La versión 1.7.0 conecta la simulación con la realidad:
+
+* **Plano de fondo:** se carga la imagen de un plano, se escala con dos puntos de distancia conocida y se dibujan los muros encima.
+* **Mediciones:** se importan desde un CSV o se anotan en el mapa con lo que marca el teléfono.
+* **Calibración:** se ve cuánto se aleja la predicción de lo medido, y OpenRPS ajusta las pérdidas de los materiales y la potencia de las antenas para que coincidan (sección 1.H).
+
 ---
 
 ## 1. Arquitectura y Modelos Físicos Implementados
@@ -283,6 +289,65 @@ Un test comprueba que estos filtros no cambian ningún rayo. En el ejemplo urban
 
 En `MultipathRay.kind` estos rayos valen `"double-diffraction"`, `"reflection-diffraction"` y `"diffraction-reflection"`. `MultipathRay.interactions` da el orden, por ejemplo `(("wall", 3), ("edge", 7))`. `trace_points(..., compact=True)` devuelve solo las filas de los rayos que pueden existir para ese transmisor, con sus etiquetas en `RayField.labels`. La simulación de grilla usa ese modo.
 
+### H. Plano de fondo, mediciones y calibración (nuevo en 1.7.0)
+
+Un modelo de propagación solo es tan bueno como sus parámetros. La pérdida real de una pared de tablaroca o la potencia que de verdad emite un punto de acceso casi nunca se conocen de antemano. Esta versión permite medir, comparar y ajustar.
+
+**Plano de fondo.** En la interfaz, *Archivo → Plano de fondo* carga una imagen en PNG, JPEG, WebP o GIF:
+
+* **Escala y posición.** Se marcan dos puntos de distancia conocida (una pared, una cota) y se escribe esa distancia. En el mismo diálogo se pueden dar las coordenadas del primer punto (por ejemplo, 0 y 0 en la esquina que se usa de origen), así que escalar y colocar es un solo paso.
+* **Dibujo.** El plano se dibuja en modo *multiply*: lo blanco deja ver el mapa de cobertura y las líneas quedan oscuras. Con el plano seleccionado se puede arrastrar, y en 3D aparece sobre el suelo.
+* **Archivo.** La imagen se guarda dentro del `.orps.json` como *data URL* (`Project.floor_plan`, clase `FloorPlan`), así que el archivo es autosuficiente. Las imágenes de más de 4096 px de lado se reducen al cargarlas.
+* **Simulación.** El plano solo se dibuja: la simulación no lo usa y moverlo no deja los resultados desactualizados.
+
+**Mediciones.** Cada medición (`open_rps.measurements.Measurement`) es un punto (x, y y, opcionalmente, z), la potencia medida en dBm y, opcionalmente, el transmisor al que corresponde. Sin transmisor se compara con el más fuerte. Hay dos formas de cargarlas:
+
+* **Desde un CSV**, con *Archivo → Importar mediciones* o `read_measurements_csv`:
+  * **Columnas** (en la primera fila): `x`, `y` y la potencia, que se reconoce como `rssi`, `dbm`, `potencia`, `señal` o `signal`.
+  * **Columnas opcionales:** `z` o `altura`, `tx` o `ap` (id o nombre del transmisor) y una etiqueta.
+  * **Formato.** Los nombres se reconocen sin acentos ni mayúsculas, y una unidad entre paréntesis se ignora ("Señal (dBm)"). Se aceptan coma, punto y coma o tabulador como separador, coma decimal con los dos últimos, y líneas de comentario con `#`.
+* **Con la herramienta Medición (N):** clic donde mediste y escribe lo que marcó el teléfono o el analizador.
+
+**Comparación.** La predicción se evalúa exactamente en cada punto, con la misma cuenta que los mapas, sin interpolar la grilla ni sumar sombra aleatoria:
+
+* **El error** es predicho − medido; si es positivo, el modelo es optimista.
+* **Estadísticas:** sesgo, desviación, RMSE, error máximo y correlación.
+* **Puntos que quedan fuera:** sin señal predicha, a menos de la distancia mínima de una antena, o con un transmisor desactivado. Se cuentan aparte.
+* **En la interfaz** se compara después de cada ejecución. Cada punto muestra su error en el mapa y la pestaña *Mediciones* tiene la gráfica de predicho contra medido y los puntos con más error.
+
+**Calibración** (`calibrate`, el botón *Calibrar* o el comando `open-rps-calibrate`). Ajusta por mínimos cuadrados sobre el error en dB, con el método de Levenberg–Marquardt y límites:
+
+* **Pérdida por cruce de cada material** (ray tracing). Es el valor a la frecuencia de referencia, entre 0 y 60 dB. Un material con ley lineal en la frecuencia conserva su pendiente.
+* **Potencia de los transmisores.** Puede ser un ajuste por transmisor, si las mediciones dicen de cuál son, o uno común: este absorbe, por ejemplo, la ganancia desconocida del equipo de medición.
+* **El exponente de pérdida**, en el modo log-distancia.
+
+Cada paso vuelve a trazar los rayos en los puntos medidos: las derivadas son numéricas y salen del mismo motor, sin aproximaciones. No se ajusta un parámetro del que dependan menos de 3 puntos medidos, porque esos puntos no lo distinguen del error de medición. Pasa, por ejemplo, con una pared que ningún rayo medido cruza; el resultado lo dice. Cada valor trae su incertidumbre (1σ), calculada con la dispersión que queda y la curvatura del ajuste. El proyecto original no cambia: `CalibrationResult.project` es una copia calibrada, y en la interfaz *Aplicar al proyecto* se puede deshacer con Ctrl+Z.
+
+**Validación** (`tests/test_v1_7.py`):
+
+* **Sin ruido** se recuperan los valores con los que se generaron las mediciones:
+  * tablaroca a menos de 0.05 dB, concreto a menos de 0.3 dB y potencia a menos de 0.05 dB;
+  * el exponente de log-distancia (3.4) a menos de 0.01.
+* **Con 3 dB de ruido**, en el escenario urbano con difracción, los cuatro valores ajustados quedan a menos de 1.4 σ de los verdaderos (el test acepta hasta 3.5 σ).
+* **Equivalencia con el mapa:** la predicción en los puntos coincide con el mapa en todos los modos.
+
+`examples/mediciones_oficina.csv` trae 56 mediciones **sintéticas** para practicar, con `examples/plano_oficina.png` (un plano generado). Las produjo OpenRPS con una oficina "real" que tiene la tablaroca a 5.5 dB, el concreto a 18 dB y el AP a 17 dBm, en vez de los 3 dB, 25.8 dB y 20 dBm del ejemplo, más 3 dB de ruido. La calibración las recupera en 1.1 s:
+
+| Parámetro | Ejemplo (antes) | Calibrado | Verdad |
+|---|---|---|---|
+| Tablaroca | 3.00 dB | 5.85 ± 0.56 dB | 5.5 dB |
+| Concreto | 25.8 dB | 17.9 ± 1.3 dB | 18 dB |
+| Potencia del AP | 20 dBm | 17.6 ± 0.7 dBm | 17 dBm |
+| RMSE | 6.3 dB | 3.0 dB | (ruido: 3 dB) |
+
+El vidrio queda igual: ningún punto medido depende de él.
+
+**Lo que conviene saber al medir:**
+
+* **Promedia.** El RSSI de un teléfono oscila varios dB de una lectura a otra (desvanecimiento rápido, el cuerpo de quien mide). La predicción, en cambio, es la potencia media local: promedia varias lecturas en cada punto.
+* **Los valores calibrados son los que mejor explican tus mediciones con este modelo, no la verdad física.** Si el escenario no tiene muebles, gente o pisos, sus pérdidas acaban dentro de las paredes. Si faltan muros en el dibujo, otros los compensan.
+* **Con pocos puntos el ajuste se acomoda al ruido.** Mide en zonas donde cada material importe: detrás de las paredes, no solo en la sala del AP. Revisa las incertidumbres y comprueba el resultado con mediciones que no usaste para calibrar.
+
 ---
 
 ## 2. Estructura del Proyecto
@@ -302,6 +367,8 @@ open_rps/
 │   ├── visualizer.py     # Mapas ASCII para terminal y SVG vectoriales
 │   ├── cli.py            # Interfaz de línea de comandos
 │   ├── project.py        # Proyectos .orps.json: escenario, edificios 2.5D, materiales (nuevo en 1.4.0)
+│   ├── measurements.py   # Mediciones (CSV), comparación con la predicción y calibración (nuevo en 1.7.0)
+│   ├── calibrate_cli.py  # Comando open-rps-calibrate (nuevo en 1.7.0)
 │   └── gui/              # Interfaz gráfica (nuevo en 1.4.0)
 │       ├── server.py     # Servidor local (http.server) y API JSON
 │       └── static/       # Página: HTML, CSS, JavaScript y three.js (vendor/)
@@ -309,7 +376,9 @@ open_rps/
 │   ├── example_sim.py           # Demostración con 2 transmisores y reflector
 │   ├── practicas_openrps.ipynb  # Cuaderno con 5 prácticas para alumnos
 │   ├── proyecto_urbano.orps.json   # Microcelda urbana (ábrelo en la interfaz gráfica)
-│   └── proyecto_oficina.orps.json  # Planta de oficinas con Wi-Fi a 5.2 GHz
+│   ├── proyecto_oficina.orps.json  # Planta de oficinas con Wi-Fi a 5.2 GHz
+│   ├── plano_oficina.png           # Plano de esa oficina, para practicar el plano de fondo (1.7.0)
+│   └── mediciones_oficina.csv      # 56 mediciones sintéticas de esa oficina, para practicar la calibración
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -333,13 +402,13 @@ pip install git+https://github.com/fabianluna08/openRPS.git
 pip install "open-rps[notebook] @ git+https://github.com/fabianluna08/openRPS.git"
 ```
 
-Cualquiera de las opciones instala la librería (`import open_rps`) y los comandos `open-rps` y `open-rps-gui`. Probado con Python 3.14 y numpy 2.4; no se ha verificado con versiones anteriores.
+Cualquiera de las opciones instala la librería (`import open_rps`) y los comandos `open-rps`, `open-rps-gui` y `open-rps-calibrate`. Probado con Python 3.14 y numpy 2.4; no se ha verificado con versiones anteriores.
 
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.6.0-py3-none-any.whl
-pip install dist/open_rps-1.6.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.7.0-py3-none-any.whl
+pip install dist/open_rps-1.7.0-py3-none-any.whl
 ```
 
 ---
@@ -474,13 +543,14 @@ python3 -m open_rps.gui --port 0 --no-browser  # puerto libre, sin abrir el nave
 
 El comando levanta un servidor local en `http://127.0.0.1:8765/`, que solo es accesible desde tu equipo, y abre la interfaz en el navegador. Para cerrarla, pulsa Ctrl+C en la consola. La página la sirve el propio paquete, three.js va incluido y funciona sin internet. Necesita un navegador moderno con WebGL para la vista 3D. Su distribución sigue la de una herramienta de planificación:
 
-* **Árbol del proyecto** (izquierda): área de predicción, configuración, transmisores, edificios, muros y materiales.
+* **Árbol del proyecto** (izquierda): área de predicción, configuración, transmisores, edificios, muros, plano de fondo, mediciones y materiales.
 * **Propiedades** (derecha): el formulario del elemento seleccionado. Incluye la posición, potencia, frecuencia y diagrama de cada antena, la altura y el material de cada edificio, los vértices de su planta, y los parámetros ITU-R/3GPP de cada material.
 * **Vista 2D:** editor a escala con cuadrícula en metros. Puedes colocar transmisores (T), dibujar edificios rectangulares (R) o poligonales (P), muros (W), mover objetos y vértices (V), medir (M) y desplazar la vista con la rueda o el botón derecho. Se puede deshacer y rehacer (Ctrl+Z / Ctrl+Y).
 * **Vista 3D** (2, o 3 para verla junto a la 2D): edificios extruidos, muros, antenas con el cono del sector y el mapa de cobertura en el plano del receptor, opcionalmente en relieve. Se gira con el ratón.
 * **Mapas:** potencia recibida, pérdida de trayecto, mejor servidor, SINR, interferencia + ruido, dispersión de retardo y dispersión angular. La potencia y la pérdida se pueden ver por transmisor. La escala es automática o manual, con la misma rampa de color y la misma paleta Okabe-Ito que los SVG. Al pasar el cursor se ve el valor de cada transmisor.
 * **Receptor de prueba** (S): haz clic o arrastra en 2D o 3D. Se dibujan todos los rayos, incluidos los bloqueados, en discontinua. El panel inferior muestra la potencia y las dispersiones por transmisor, el perfil potencia–retardo (respuesta al impulso) y la tabla de rayos con sus ángulos y pérdidas por muros. Se recalcula al mover cualquier objeto.
 * **Estadísticas:** porcentaje del área cubierta sobre un umbral de potencia, área con SINR ≥ 0 dB, percentiles e histograma de la métrica, y reparto del área entre servidores.
+* **Plano de fondo y mediciones** (1.7.0, sección 1.H): *Archivo → Plano de fondo* y *Archivo → Importar mediciones*. La herramienta Medición (N) sirve para anotar puntos. La pestaña *Mediciones* compara la predicción con lo medido y calibra el modelo.
 * **Archivo:** abrir y guardar proyectos `.orps.json`; el último proyecto se guarda además en el navegador. Hay ejemplos incluidos y se puede exportar el resultado como CSV, JSON o SVG (los mismos archivos que el CLI) o la vista como PNG.
 
 Cada edificio se convierte en el motor en un muro vertical por arista y un techo poligonal (sección 1.E). Con el material por defecto (concreto) las fachadas atenúan 14.6 dB a 2.4 GHz. Con "Metal" son opacas y con "Muro ideal" solo reflejan. Los modelos empíricos ignoran edificios y muros, como en la librería.
@@ -500,6 +570,29 @@ probe = project.probe((300.0, 190.0))       # rayos y métricas en un punto (sin
 sim = project.build_simulator()             # PropagationSimulator con todos los muros
 project.save("copia.orps.json")
 ```
+
+### G. Mediciones y calibración (nuevo en 1.7.0)
+
+```bash
+open-rps-calibrate examples/proyecto_oficina.orps.json examples/mediciones_oficina.csv -o oficina_calibrada.orps.json
+open-rps-calibrate oficina_calibrada.orps.json --compare-only --errors errores.csv   # solo comparar
+open-rps-calibrate proyecto.orps.json medidas.csv --materials concreto,tablaroca --tx-power common
+```
+
+```python
+from open_rps.project import Project
+from open_rps.measurements import read_csv, compare, calibrate
+
+project = Project.load("examples/proyecto_oficina.orps.json")
+project.measurements = read_csv("examples/mediciones_oficina.csv", project.transmitters)
+print(compare(project).stats)                 # sesgo, desviación, RMSE, error máximo, r
+result = calibrate(project)                   # o materials=["tablaroca"], tx_power="common"
+for p in result.parameters:
+    print(p.name, p.before, "->", p.after, "±", p.uncertainty)
+result.project.save("oficina_calibrada.orps.json")
+```
+
+Un proyecto con plano de fondo o con mediciones se guarda como versión 2 del formato. Sin ellos sigue siendo la versión 1, y lo abren OpenRPS 1.4 a 1.6.
 
 `Project.from_dict` valida todo el documento. Rechaza campos desconocidos, polígonos que se cruzan, materiales inexistentes, `tx_id` repetidos y grillas de más de 4 millones de píxeles, y en cada caso lanza un `ProjectError` (subclase de `ValueError`) que dice qué elemento y qué campo fallan.
 
@@ -534,6 +627,17 @@ Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del mo
 * **Reciprocidad** de los rayos reflexión → difracción, difracción → reflexión y de la difracción doble.
 * **Motor:** la zona de transición (y su simetría), el rango angular de un segmento o de un parche visto desde una arista, que los filtros no cambien ningún rayo, el modo compacto de `trace_points`, la igualdad entre el trazado vectorizado y el punto a punto con todas las opciones, la configuración y el informe de los proyectos, y las etiquetas del receptor de prueba.
 
+`tests/test_v1_7.py` cubre lo añadido en 1.7.0:
+
+* **CSV:** coma, punto y coma y tabulador, coma decimal, encabezados con acentos y unidades, transmisor por nombre o id, BOM, y errores que dicen la fila y la columna.
+* **Predicción en los puntos:** igual al mapa en ray tracing y en los cuatro modos empíricos, con antena sectorial.
+* **Comparación:** signo del error, estadísticas, mejor servidor, y puntos sin señal, demasiado cerca o con un transmisor ausente.
+* **Calibración:**
+  * recupera las pérdidas, la potencia y el exponente sin ruido, y con ruido los encuentra a pocas σ de los verdaderos;
+  * la ley lineal conserva su pendiente y no cambia el proyecto original;
+  * un parámetro con pocos puntos se deja igual.
+* **Formato, comando y API:** el formato de archivo (versión 1 sin plano ni mediciones, validación del plano y de las mediciones), el comando `open-rps-calibrate` y la API de la interfaz (leer CSV, comparar y calibrar).
+
 `tests/test_gui_server.py` arranca el servidor de la interfaz en un puerto libre y prueba la API: archivos estáticos, protección frente a rutas `../`, simulación y decodificación de las grillas, exportaciones, receptor de prueba, errores y rechazo de peticiones de otros orígenes.
 
 Para repetir la comparación bit a bit contra una copia real de la versión 1.2.0 (el test se omite si la variable no está definida):
@@ -549,7 +653,9 @@ OPEN_RPS_REFERENCE_SRC=/tmp/openrps-1.2.0/src python3 -m unittest tests.test_v1_
 
 OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados conviene tener presente lo que **no** modela:
 
-* **Sin validación experimental.** Los modelos están comprobados contra sus fórmulas, casos calculados a mano y entre sí (p. ej. ray tracing coherente frente a Two-Ray), no contra mediciones ni contra el RPS original u otra herramienta de referencia.
+* **Sin validación experimental propia.** Los modelos están comprobados contra sus fórmulas, casos calculados a mano y entre sí (p. ej. ray tracing coherente frente a Two-Ray), no contra campañas de medición ni contra el RPS original u otra herramienta de referencia. Desde 1.7.0 puedes comparar con tus propias mediciones y calibrar el escenario (sección 1.H). Ten en cuenta dos cosas:
+  * La calibración ajusta los parámetros del modelo, no corrige lo que el modelo no tiene. Las pérdidas calibradas absorben los muebles, la gente o los muros que falten en el dibujo, así que solo valen para ese escenario.
+  * Las mediciones de ejemplo son sintéticas.
 * **Suma incoherente por defecto; la coherente es idealizada.** Por defecto el trazador suma $|a_k|^2$ rayo a rayo: da la potencia media local, sin interferencia ni desvanecimiento rápido, y por eso difiere de `TwoRayGroundReflection`. Con `coherent=True` aparecen los desvanecimientos (y la igualdad con Two-Ray), pero la posición exacta de cada nulo depende de fases calculadas sobre una geometría perfecta (suelo y muros lisos, posiciones exactas al milímetro, una sola frecuencia): sirve para ver el fenómeno y su estadística, no para predecir dónde habrá un nulo en un entorno real. Además el patrón varía en distancias del orden de λ, así que una grilla de metros solo lo muestrea (los mapas coherentes parecen "ruidosos" por ese motivo).
 * **A lo más dos interacciones por rayo.** Rayo directo, un rebote en el suelo, un rebote por muro, una difracción por arista y, opcionalmente, dos rebotes, dos difracciones o un rebote y una difracción (secciones 1.F y 1.G). Las limitaciones de la difracción son estas:
   * No hay rayos de tres o más interacciones. Detrás de dos edificios altos seguidos, o donde hay que rodear dos esquinas y además pasar sobre un techo, la sombra sigue siendo pesimista. Tampoco hay dispersión difusa.
@@ -579,6 +685,21 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 ---
 
 ## 7. Historial de cambios
+
+### Versión 1.7.0
+
+* **Novedades** (sección 1.H):
+  * **Plano de fondo** en la interfaz: imagen en PNG, JPEG, WebP o GIF que se escala y se coloca con dos puntos, se dibuja en modo *multiply* en 2D y sobre el suelo en 3D, y se guarda dentro del proyecto (`Project.floor_plan`, `FloorPlan`).
+  * **Mediciones:** se leen de CSV (`read_measurements_csv`), con coma, punto y coma o tabulador, coma decimal y transmisor por nombre o id, o se anotan con la herramienta Medición (N). Se guardan en el proyecto (`Project.measurements`).
+  * **Comparación** con la predicción exacta en cada punto (`compare_measurements`, `predict_points`): error por punto, estadísticas y, en la interfaz, el error sobre el mapa, la gráfica de predicho contra medido y los puntos con más error.
+  * **Calibración** (`calibrate`): pérdida de los materiales, potencia de los transmisores (por transmisor o común) y exponente de log-distancia, por Levenberg–Marquardt con incertidumbre 1σ. Está en la interfaz (*Calibrar*, *Aplicar al proyecto*, que se deshace con Ctrl+Z) y en el comando nuevo `open-rps-calibrate`.
+  * **Ejemplos:** `examples/plano_oficina.png` y `examples/mediciones_oficina.csv`, sintéticas.
+  * **API de la interfaz:** `/api/measurements/parse`, `/api/compare` y `/api/calibrate`.
+* **Cambios que conviene conocer:**
+  * El formato de proyecto pasa a la versión 2 solo cuando hay plano o mediciones. Sin ellos se guarda como versión 1 y lo siguen abriendo las versiones anteriores.
+  * En la interfaz, cambiar el plano, las mediciones, el nombre o la descripción ya no deja los resultados desactualizados.
+  * El servidor acepta peticiones de hasta 64 MB (antes 32), por la imagen del plano.
+* **Simulación:** sin cambios. Con el mismo proyecto da exactamente lo mismo que 1.6.0.
 
 ### Versión 1.6.0
 

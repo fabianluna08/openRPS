@@ -350,3 +350,220 @@ function histogram(sorted, layer) {
   box.append(chart, tooltip);
   return box;
 }
+
+// ------------------------------------------------------------------ mediciones: comparación y calibración
+const signed = (v, d = 1) => (v === null || v === undefined || Number.isNaN(v) ? "—" : `${v >= 0 ? "+" : "−"}${fmt(Math.abs(v), d)}`);
+
+function statsRows(st, counts) {
+  const rows = [["Puntos comparados", String(st.n)]];
+  const skipped = Object.entries(counts || {}).filter(([k, v]) => k !== "ok" && v);
+  if (skipped.length) rows.push(["Sin comparar", skipped.map(([k, v]) => `${v} ${k}`).join(", ")]);
+  if (st.n) {
+    rows.push(["Sesgo (predicho − medido)", `${signed(st.bias_db)} dB`], ["Desviación estándar", `${fmt(st.std_db, 1)} dB`],
+      ["RMSE", `${fmt(st.rmse_db, 1)} dB`], ["Error máximo", `${fmt(st.max_abs_db, 1)} dB`],
+      ["Correlación r", st.r === null ? "—" : fmt(st.r, 3)]);
+  }
+  return rows;
+}
+
+export function renderMeasurements(container, store, app) {
+  container.replaceChildren();
+  const p = store.project;
+  if (!p) return;
+  const ms = p.measurements || [];
+  if (!ms.length) {
+    container.append(el("div", { class: "empty-state" },
+      el("p", { text: "No hay mediciones. Con ellas puedes ver cuánto se aleja la predicción de la realidad y ajustar el modelo." }),
+      el("p", { text: "Importa un CSV (Archivo → Importar mediciones) con columnas x, y y la potencia en dBm (rssi, dbm, potencia o señal); opcionales: z, tx (id o nombre del transmisor) y una etiqueta. O usa la herramienta Medición (N): clic donde mediste y escribe la potencia que leíste." }),
+      el("div", { class: "props-actions" },
+        el("button", { class: "btn", text: "Importar CSV…", onclick: () => app.pickMeasurementsCsv() }),
+        el("button", { class: "btn", text: "Anotar en el mapa (N)", onclick: () => app.setTool("sample") }))));
+    return;
+  }
+  const grid = el("div", { class: "stats-grid" });
+  container.append(grid);
+  const rev = store.measurementRevision();
+  const cmp = store.comparison && store.comparison.revision === rev ? store.comparison.data : null;
+
+  // 1. Comparación
+  const box = el("div");
+  box.append(el("h3", { text: "Predicción frente a mediciones" }));
+  if (!cmp) {
+    box.append(el("p", { class: "note", text: store.comparison ? "El proyecto cambió desde la última comparación." : "Aún no se compara." }),
+      el("div", { class: "props-actions" }, el("button", { class: "btn primary", text: "Comparar", onclick: () => app.compareMeasurements() })));
+  } else {
+    box.append(simpleTable(statsRows(cmp.stats, cmp.counts)));
+    box.append(el("p", { class: "note", text: "Error = predicho − medido: positivo si el modelo es optimista. Sin sombra aleatoria: se compara la parte determinista de la predicción." }));
+  }
+  grid.append(box);
+
+  // 2. Dispersión predicho vs. medido
+  if (cmp && cmp.stats.n) {
+    const sc = el("div");
+    sc.append(el("h3", { text: "Predicho vs. medido (dBm)" }));
+    sc.append(scatter(store, app, cmp.points));
+    grid.append(sc);
+  }
+
+  // 3. Calibración
+  grid.append(calibrationBox(store, app, rev));
+
+  // 4. Puntos con más error
+  if (cmp && cmp.stats.n) {
+    const worst = cmp.points.filter((q) => q.status === "ok").sort((a, b) => Math.abs(b.error_db) - Math.abs(a.error_db)).slice(0, 8);
+    const w = el("div");
+    w.append(el("h3", { text: "Puntos con más error" }));
+    const table = el("table", { class: "data clickable" },
+      el("tr", {}, el("th", { text: "#" }), el("th", { text: "Medido" }), el("th", { text: "Predicho" }), el("th", { text: "Error" }), el("th", { text: "Tx" })));
+    for (const q of worst) {
+      const row = el("tr", { title: "Clic para seleccionarla en el mapa", onclick: () => { app.setTool("select"); app.zoomTo({ type: "measurement", id: q.index }); } },
+        el("td", { text: `${q.index + 1}${q.label ? ` · ${q.label}` : ""}` }), el("td", { class: "num", text: fmt(q.measured_dbm, 1) }),
+        el("td", { class: "num", text: fmt(q.predicted_dbm, 1) }), el("td", { class: "num", text: signed(q.error_db) }),
+        el("td", { text: q.tx_id === null ? "—" : store.txName(q.tx_id) }));
+      table.append(row);
+    }
+    w.append(table);
+    grid.append(w);
+  }
+}
+
+function scatter(store, app, points) {
+  const W = 320;
+  const H = 230;
+  const m = { l: 40, r: 10, t: 10, b: 30 };
+  const ok = points.filter((q) => q.status === "ok");
+  const values = ok.flatMap((q) => [q.measured_dbm, q.predicted_dbm]);
+  const ticks0 = niceTicks(Math.min(...values), Math.max(...values), 5);
+  const lo = Math.min(ticks0[0], Math.min(...values));
+  const hi = Math.max(ticks0[ticks0.length - 1], Math.max(...values));
+  const span = hi - lo || 1;
+  const X = (v) => m.l + ((v - lo) / span) * (W - m.l - m.r);
+  const Y = (v) => H - m.b - ((v - lo) / span) * (H - m.t - m.b);
+  const box = el("div", { class: "chart-box" });
+  const chart = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Potencia predicha frente a la medida en cada punto" });
+  for (const t of niceTicks(lo, hi, 5)) {
+    chart.append(svg("line", { x1: X(t), x2: X(t), y1: m.t, y2: H - m.b, stroke: AXIS, "stroke-opacity": 0.45 }),
+      svg("line", { x1: m.l, x2: W - m.r, y1: Y(t), y2: Y(t), stroke: AXIS, "stroke-opacity": 0.45 }));
+    const lx = svg("text", { x: X(t), y: H - m.b + 13, "text-anchor": "middle", "font-size": 10.5, fill: MUTED });
+    lx.textContent = fmt(t, 0);
+    const ly = svg("text", { x: m.l - 5, y: Y(t) + 3.5, "text-anchor": "end", "font-size": 10.5, fill: MUTED });
+    ly.textContent = fmt(t, 0);
+    chart.append(lx, ly);
+  }
+  // Línea 1:1 (predicción perfecta)
+  chart.append(svg("line", { x1: X(lo), y1: Y(lo), x2: X(hi), y2: Y(hi), stroke: INK2, "stroke-width": 1.2, "stroke-dasharray": "4 3" }));
+  const xl = svg("text", { x: (m.l + W - m.r) / 2, y: H - 4, "text-anchor": "middle", "font-size": 11, fill: INK2 });
+  xl.textContent = "Medido";
+  const yl = svg("text", { x: 11, y: (m.t + H - m.b) / 2, "text-anchor": "middle", "font-size": 11, fill: INK2, transform: `rotate(-90 11 ${(m.t + H - m.b) / 2})` });
+  yl.textContent = "Predicho";
+  chart.append(xl, yl);
+  const tooltip = el("div", { class: "tooltip", hidden: true });
+  for (const q of ok) {
+    const color = q.tx_id === null ? INK2 : txColor(store.txSlot(q.tx_id));
+    const dot = svg("circle", { cx: X(q.measured_dbm), cy: Y(q.predicted_dbm), r: 4, fill: color, "fill-opacity": 0.85, stroke: SURFACE, "stroke-width": 1.5 });
+    dot.style.cursor = "pointer";
+    dot.addEventListener("pointerenter", () => {
+      tooltip.replaceChildren(el("div", { class: "tt-value", text: `${signed(q.error_db)} dB` }),
+        el("div", { class: "tt-label", text: `Medición ${q.index + 1}${q.label ? ` · ${q.label}` : ""}: medido ${fmt(q.measured_dbm, 1)}, predicho ${fmt(q.predicted_dbm, 1)} dBm` }),
+        el("div", { class: "tt-label", text: q.tx_id === null ? "" : store.txName(q.tx_id) }));
+      tooltip.hidden = false;
+      const scale = box.clientWidth / W;
+      tooltip.style.left = `${Math.min(X(q.measured_dbm) * scale + 10, box.clientWidth - 190)}px`;
+      tooltip.style.top = `${Math.max(0, Y(q.predicted_dbm) * scale - 50)}px`;
+      dot.setAttribute("stroke", INK2);
+    });
+    dot.addEventListener("pointerleave", () => { tooltip.hidden = true; dot.setAttribute("stroke", SURFACE); });
+    dot.addEventListener("click", () => { app.setTool("select"); app.zoomTo({ type: "measurement", id: q.index }); });
+    chart.append(dot);
+  }
+  box.append(chart, tooltip);
+  const txs = [...new Set(ok.map((q) => q.tx_id))].filter((id) => id !== null);
+  if (txs.length > 1) {
+    box.append(el("div", { class: "legend-inline" }, ...txs.map((id) => el("span", { class: "legend-item" },
+      el("span", { class: "dot", style: `background:${txColor(store.txSlot(id))}` }), el("span", { text: store.txName(id) })))));
+  }
+  box.append(el("p", { class: "note", text: "Sobre la diagonal, la predicción coincide con la medición; por encima, el modelo es optimista." }));
+  return box;
+}
+
+function calibrationBox(store, app, rev) {
+  const p = store.project;
+  const box = el("div");
+  box.append(el("h3", { text: "Calibración" }));
+  const opts = app.calibOptions ||= { excluded: new Set(), tx_power: "auto", exponent: true };
+  const f = (() => {
+    if (p.settings.reference_frequency_hz) return p.settings.reference_frequency_hz;
+    const tx = p.transmitters.find((t) => t.enabled);
+    return tx ? tx.frequency_hz : 2.4e9;
+  })();
+  const used = new Set([...p.buildings.map((b) => b.material), ...p.walls.map((w) => w.material)]);
+  const candidates = p.settings.mode === "raytracing"
+    ? p.materials.filter((m) => used.has(m.id) && (m.penetration === "fixed" || m.penetration === "frequency")) : [];
+  const form = el("div", { class: "calib-form" });
+  if (candidates.length) {
+    form.append(el("div", { class: "note", text: "Pérdida por cruce de los materiales:" }));
+    for (const m of candidates) {
+      const loss = m.penetration === "fixed" ? m.loss_db : Math.max(0, m.loss_a_db + m.loss_b_db_per_ghz * f / 1e9);
+      const check = el("input", { type: "checkbox" });
+      check.checked = !opts.excluded.has(m.id);
+      check.addEventListener("change", () => { if (check.checked) opts.excluded.delete(m.id); else opts.excluded.add(m.id); });
+      form.append(el("label", { class: "inline-check" }, check, el("span", { class: "swatch", style: `background:${m.color}` }),
+        el("span", { text: `${m.name || m.id} (${fmt(loss, 1)} dB)` })));
+    }
+  } else if (p.settings.mode === "raytracing") {
+    form.append(el("p", { class: "note", text: "Ningún material usado tiene una pérdida finita que ajustar." }));
+  } else {
+    form.append(el("p", { class: "note", text: "Los modelos empíricos no usan los materiales: se ajustan la potencia y, en log-distancia, el exponente." }));
+  }
+  const power = el("select", {}, ...[["auto", "Automático"], ["per_tx", "Una por transmisor"], ["common", "Una común a todos"], ["none", "No ajustar"]]
+    .map(([v, t]) => el("option", { value: v, text: t })));
+  power.value = opts.tx_power;
+  power.addEventListener("change", () => { opts.tx_power = power.value; });
+  form.append(el("label", { class: "field", title: "Automático: una por transmisor si todas las mediciones dicen de qué transmisor son; si no, una común (por ejemplo, la ganancia del equipo de medición)" },
+    el("span", { text: "Potencia de los Tx" }), power));
+  if (p.settings.mode === "logdistance") {
+    const exp = el("input", { type: "checkbox" });
+    exp.checked = opts.exponent;
+    exp.addEventListener("change", () => { opts.exponent = exp.checked; });
+    form.append(el("label", { class: "inline-check" }, exp, el("span", { text: `Exponente n (ahora ${fmt(p.settings.log_distance_exponent, 2)})` })));
+  }
+  form.append(el("div", { class: "props-actions" }, el("button", { class: "btn primary", text: "Calibrar", onclick: () => {
+    const materials = candidates.filter((m) => !opts.excluded.has(m.id)).map((m) => m.id);
+    app.calibrate({ materials: p.settings.mode === "raytracing" ? materials : false, tx_power: opts.tx_power, exponent: opts.exponent });
+  } })));
+  box.append(form);
+
+  const c = store.calibration;
+  if (c && c.revision === rev) {
+    const d = c.data;
+    const table = el("table", { class: "data calib-table" },
+      el("tr", {}, el("th", { text: "Parámetro" }), el("th", { text: "Antes" }), el("th", { text: "Después" }), el("th", { text: "± 1σ" }), el("th", { text: "Puntos" })));
+    for (const q of d.parameters) {
+      const unit = q.unit ? ` ${q.unit}` : "";
+      const isOffset = q.kind === "tx_power";
+      table.append(el("tr", {},
+        el("td", { text: q.name }),
+        el("td", { class: "num", text: isOffset ? "—" : `${fmt(q.before, 2)}${unit}` }),
+        el("td", { class: "num", text: isOffset ? `${signed(q.after, 2)} dB` : `${fmt(q.after, 2)}${unit}` }),
+        el("td", { class: "num", text: q.uncertainty === null ? "—" : fmt(q.uncertainty, 2) }),
+        el("td", { class: "num", text: String(q.points) })));
+    }
+    const heading = el("div", { class: "props-section", text: "Resultado" });
+    box.append(heading, table);
+    if (app.scrollToCalibration) {
+      app.scrollToCalibration = false;
+      requestAnimationFrame(() => heading.scrollIntoView({ block: "start", behavior: "smooth" }));
+    }
+    box.append(simpleTable([["RMSE", `${fmt(d.before.stats.rmse_db, 2)} → ${fmt(d.after.stats.rmse_db, 2)} dB`],
+      ["Sesgo", `${signed(d.before.stats.bias_db, 2)} → ${signed(d.after.stats.bias_db, 2)} dB`],
+      ["Desviación", `${fmt(d.before.stats.std_db, 2)} → ${fmt(d.after.stats.std_db, 2)} dB`]]));
+    for (const note of d.notes) box.append(el("p", { class: "note warn-note", text: note }));
+    box.append(el("p", { class: "note", text: "± 1σ: incertidumbre de cada valor según la dispersión que queda y cuántos puntos dependen de él. Con pocos puntos, o si una pared casi no se cruza, el valor es poco fiable." }));
+    box.append(el("div", { class: "props-actions" },
+      el("button", { class: "btn primary", text: "Aplicar al proyecto", onclick: () => app.applyCalibration() }),
+      el("button", { class: "btn", text: "Descartar", onclick: () => { store.calibration = null; store.emit("comparison"); } })));
+  } else if (c) {
+    box.append(el("p", { class: "note", text: "El proyecto cambió después de calibrar: vuelve a calibrar." }));
+  }
+  return box;
+}

@@ -35,13 +35,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .measurements import Measurement, MeasurementError
 from .models import Cost231Hata, FreeSpacePathLoss, LogDistancePathLoss, OkumuraHata, TwoRayGroundReflection
 from .multipath import ChannelImpulseResponse
 from .raytracer import DiffractionEdge, PlanarReflector, Transmitter, _in_polygon
 from .simulation import DEFAULT_MIN_DISTANCE_M, PropagationSimulator, SimulationResult
 
 PROJECT_FORMAT = "openrps-project"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2              # 2: floor plan and measurements (1.7.0); without them a file is still version 1
+FLOOR_PLAN_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+MAX_FLOOR_PLAN_CHARS = 30_000_000   # the image as a data URL (about 22 MB of image)
+MAX_MEASUREMENTS = 100_000
 SIMULATION_MODES = ("raytracing", "fspl", "tworay", "logdistance", "hata")
 REFLECTION_MODELS = ("fresnel", "constant")
 PENETRATION_MODELS = ("none", "fixed", "frequency", "opaque")
@@ -530,6 +534,57 @@ class Settings:
                                                   "settings.reference_frequency_hz", 0.0, True)
 
 
+@dataclass
+class FloorPlan:
+    """
+    Image under the map (a scanned floor plan, an aerial photo), new in 1.7.0.  It is
+    only drawn: the simulation does not use it.  ``image`` is a data URL
+    ("data:image/png;base64,...") so that the project file carries it.  The image
+    is placed with its lower-left corner at (x_m, y_m) and is ``width_m`` meters
+    wide; its height follows from its size in pixels.
+    """
+    image: str
+    pixel_width: int
+    pixel_height: int
+    x_m: float = 0.0
+    y_m: float = 0.0
+    width_m: float = 10.0
+    opacity: float = 0.7
+    visible: bool = True
+    name: str = ""
+
+    def validate(self):
+        if not isinstance(self.image, str) or not self.image.startswith("data:"):
+            raise ProjectError("plano: la imagen debe ser un data URL (data:image/png;base64,...)")
+        head = self.image[5:self.image.find(",")] if "," in self.image else ""
+        mime = head.split(";")[0]
+        if mime not in FLOOR_PLAN_TYPES or not head.endswith(";base64"):
+            raise ProjectError(f"plano: formato de imagen {mime or '?'!r} no soportado (PNG, JPEG, WebP o GIF)")
+        if len(self.image) > MAX_FLOOR_PLAN_CHARS:
+            raise ProjectError(f"plano: la imagen ocupa {len(self.image) / 1e6:.1f} MB como texto "
+                               f"(máximo {MAX_FLOOR_PLAN_CHARS / 1e6:.0f} MB); redúcela o comprímela")
+        for name in ("pixel_width", "pixel_height"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ProjectError(f"plano.{name}: debe ser un entero > 0, se recibió {value!r}")
+        self.x_m = _number(self.x_m, "plano.x_m")
+        self.y_m = _number(self.y_m, "plano.y_m")
+        self.width_m = _number(self.width_m, "plano.width_m", 0.0, strict=True)
+        self.opacity = _number(self.opacity, "plano.opacity", 0.0)
+        if self.opacity > 1.0:
+            raise ProjectError(f"plano.opacity: debe estar entre 0 y 1, se recibió {self.opacity:g}")
+        self.visible = bool(self.visible)
+        self.name = str(self.name or "")
+
+    @property
+    def height_m(self) -> float:
+        return self.width_m * self.pixel_height / self.pixel_width
+
+    @property
+    def meters_per_pixel(self) -> float:
+        return self.width_m / self.pixel_width
+
+
 # --------------------------------------------------------------------------- project
 
 @dataclass
@@ -574,6 +629,8 @@ class Project:
     transmitters: List[TransmitterSpec] = field(default_factory=list)
     buildings: List[Building] = field(default_factory=list)
     walls: List[Wall] = field(default_factory=list)
+    floor_plan: Optional[FloorPlan] = None                            # new in 1.7.0
+    measurements: List[Measurement] = field(default_factory=list)     # new in 1.7.0
 
     # ----- (de)serialization
     @classmethod
@@ -587,7 +644,7 @@ class Project:
         if not isinstance(version, int) or version > PROJECT_VERSION:
             raise ProjectError(f"proyecto: versión {version!r} no soportada (esta versión lee hasta la {PROJECT_VERSION})")
         known = {"format", "version", "name", "description", "area", "settings", "materials",
-                 "transmitters", "buildings", "walls"}
+                 "transmitters", "buildings", "walls", "floor_plan", "measurements"}
         unknown = sorted(set(data) - known)
         if unknown:
             raise ProjectError(f"proyecto: campos desconocidos {', '.join(unknown)}")
@@ -602,6 +659,9 @@ class Project:
             transmitters=[_from_dict(TransmitterSpec, t, "transmisor") for t in data.get("transmitters", [])],
             buildings=[_from_dict(Building, b, "edificio") for b in data.get("buildings", [])],
             walls=[_from_dict(Wall, w, "muro") for w in data.get("walls", [])],
+            floor_plan=None if data.get("floor_plan") is None else _from_dict(FloorPlan, data["floor_plan"], "plano"),
+            measurements=[_from_dict(Measurement, m, f"medición {i + 1}")
+                          for i, m in enumerate(data.get("measurements") or [])],
         )
         project.validate()
         return project
@@ -613,6 +673,15 @@ class Project:
                 "transmitters": [asdict(t) for t in self.transmitters],
                 "buildings": [asdict(b) for b in self.buildings],
                 "walls": [asdict(w) for w in self.walls]}
+        # Written only when present, so that a project without them stays readable by 1.4.0 - 1.6.0
+        if self.floor_plan is not None or self.measurements:
+            data["version"] = PROJECT_VERSION
+            if self.floor_plan is not None:
+                data["floor_plan"] = asdict(self.floor_plan)
+            if self.measurements:
+                data["measurements"] = [asdict(m) for m in self.measurements]
+        else:
+            data["version"] = 1
         return copy.deepcopy(data)
 
     @classmethod
@@ -645,6 +714,15 @@ class Project:
             building.validate(materials)
         for wall in self.walls:
             wall.validate(materials)
+        if self.floor_plan is not None:
+            self.floor_plan.validate()
+        if len(self.measurements) > MAX_MEASUREMENTS:
+            raise ProjectError(f"mediciones: hay {len(self.measurements)} (máximo {MAX_MEASUREMENTS})")
+        for i, m in enumerate(self.measurements):
+            try:
+                m.validate(f"medición {i + 1}")
+            except MeasurementError as error:
+                raise ProjectError(str(error)) from None
         return self
 
     def material_map(self) -> Dict[str, Material]:

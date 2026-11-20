@@ -13,6 +13,9 @@ API (every body is JSON):
     POST /api/validate  {project}     normalized project, or 400 with the error
     POST /api/simulate  {project}     grids of the result (float32, base64) + summary + report
     POST /api/probe     {project, point: [x, y] | [x, y, z]}   rays and CIR at one point
+    POST /api/measurements/parse {project, csv}   measurements read from CSV text (1.7.0)
+    POST /api/compare   {project}     prediction vs the measurements of the project (1.7.0)
+    POST /api/calibrate {project, options}   fitted parameters, before/after and the changes (1.7.0)
     GET  /api/export/<result_id>/<what>   csv | json | svg-<metric> of a cached result
 """
 
@@ -37,10 +40,11 @@ import numpy as np
 from .. import __version__
 from ..project import (EXAMPLES, HATA_ENVIRONMENTS, PENETRATION_MODELS, REFLECTION_MODELS, SIMULATION_MODES,
                        Project, ProjectError, default_materials)
+from ..measurements import calibrate, compare, read_csv
 from ..visualizer import MapVisualizer
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-MAX_BODY_BYTES = 32 * 1024 * 1024
+MAX_BODY_BYTES = 64 * 1024 * 1024     # a project can carry its floor plan image (up to ~30 MB as text)
 MAX_CACHED_RESULTS = 4
 # Per-transmitter power grids are sent only while their total size stays reasonable
 MAX_PER_TX_VALUES = 4_000_000
@@ -88,6 +92,27 @@ def result_payload(result, report: Dict[str, Any], result_id: str) -> Dict[str, 
         "summary": result.summary(),
         "report": {k: (_finite_or_none(v) if isinstance(v, float) else v) for k, v in report.items()},
     }
+
+
+def calibration_payload(project: Project, options: Dict[str, Any]) -> Dict[str, Any]:
+    """Calibration result plus ``changes``: the materials, transmitter powers and settings that it modifies."""
+    if not isinstance(options, dict):
+        raise ProjectError("calibración: las opciones deben ser un objeto")
+    materials = options.get("materials", "auto")
+    result = calibrate(project, materials=None if materials is False else materials,
+                       tx_power=options.get("tx_power", "auto"), exponent=bool(options.get("exponent", True)))
+    data = result.to_dict()
+    del data["project"]                  # the page keeps its own project (with its floor plan)
+    new = result.project
+    changed = {p.key for p in result.parameters if p.kind == "material" and p.after != p.before}
+    data["changes"] = {
+        "materials": [m for m in new.to_dict()["materials"] if m["id"] in changed],
+        "transmitters": [{"tx_id": t.tx_id, "tx_power_dbm": t.tx_power_dbm} for t in new.transmitters
+                         if any(o.tx_id == t.tx_id and o.tx_power_dbm != t.tx_power_dbm for o in project.transmitters)],
+        "settings": ({"log_distance_exponent": new.settings.log_distance_exponent}
+                     if new.settings.log_distance_exponent != project.settings.log_distance_exponent else {}),
+    }
+    return data
 
 
 class ResultCache:
@@ -192,6 +217,17 @@ class OpenRPSRequestHandler(BaseHTTPRequestHandler):
                 if not isinstance(point, (list, tuple)):
                     raise ProjectError("probe: falta el punto [x, y]")
                 self._json(HTTPStatus.OK, project.probe(point).to_dict())
+            elif path == "/api/measurements/parse":
+                project = self._project(body)
+                text = body.get("csv")
+                if not isinstance(text, str):
+                    raise ProjectError("falta el texto del CSV")
+                measurements = read_csv(text, project.transmitters)
+                self._json(HTTPStatus.OK, {"measurements": [m.__dict__ for m in measurements]})
+            elif path == "/api/compare":
+                self._json(HTTPStatus.OK, compare(self._project(body)).to_dict())
+            elif path == "/api/calibrate":
+                self._json(HTTPStatus.OK, calibration_payload(self._project(body), body.get("options") or {}))
             else:
                 self._error(HTTPStatus.NOT_FOUND, f"ruta desconocida {path}")
         except ProjectError as error:

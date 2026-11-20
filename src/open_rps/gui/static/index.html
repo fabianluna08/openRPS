@@ -19,6 +19,9 @@
           <button data-action="open" role="menuitem">Abrir… <kbd>Ctrl+O</kbd></button>
           <button data-action="save" role="menuitem">Guardar <kbd>Ctrl+S</kbd></button>
           <hr>
+          <button data-action="floorplan" role="menuitem">Plano de fondo (imagen)…</button>
+          <button data-action="import-measurements" role="menuitem">Importar mediciones (CSV)…</button>
+          <hr>
           <div class="menu-label">Ejemplos</div>
           <div id="examples-menu"></div>
         </div>
@@ -59,6 +62,9 @@
           <button data-action="select-area" role="menuitem">Área de predicción…</button>
           <button data-action="select-settings" role="menuitem">Configuración…</button>
           <hr>
+          <button data-action="compare" role="menuitem">Comparar con las mediciones</button>
+          <button data-action="show-measurements" role="menuitem">Calibrar con las mediciones…</button>
+          <hr>
           <div class="menu-label">Exportar resultado</div>
           <button data-action="export-csv" role="menuitem">Tabla CSV</button>
           <button data-action="export-json" role="menuitem">Resumen JSON</button>
@@ -87,6 +93,7 @@
       <button class="tool" data-tool="wall" title="Muro: clic en el inicio y en el final (W)">Muro</button>
       <button class="tool" data-tool="probe" title="Receptor de prueba: rayos y respuesta al impulso (S)">Receptor</button>
       <button class="tool" data-tool="measure" title="Medir distancia (M)">Medir</button>
+      <button class="tool" data-tool="sample" title="Anotar una medición: clic donde mediste y escribe la potencia (N)">Medición</button>
     </div>
     <div class="tool-group">
       <button id="run-button" class="primary" data-action="run" title="Ejecutar la predicción (F5)">▶ Ejecutar</button>
@@ -152,11 +159,13 @@
     <div class="tabs" role="tablist">
       <button class="tab active" data-tab="probe" role="tab">Receptor · respuesta al impulso</button>
       <button class="tab" data-tab="stats" role="tab">Estadísticas</button>
+      <button class="tab" data-tab="measurements" role="tab">Mediciones <span id="meas-count" class="count muted-count" hidden></span></button>
       <button class="tab" data-tab="log" role="tab">Mensajes <span id="log-count" class="count" hidden></span></button>
       <button class="tab-toggle" id="bottom-toggle" title="Mostrar u ocultar el panel">▾</button>
     </div>
     <div class="tab-body" data-body="probe" id="probe-body"></div>
     <div class="tab-body" data-body="stats" id="stats-body" hidden></div>
+    <div class="tab-body" data-body="measurements" id="measurements-body" hidden></div>
     <div class="tab-body" data-body="log" id="log-body" hidden></div>
   </section>
 
@@ -177,6 +186,8 @@
   </div>
 </div>
 <input type="file" id="file-input" accept=".json,application/json" hidden>
+<input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+<input type="file" id="csv-input" accept=".csv,.txt,.tsv,text/csv,text/plain" hidden>
 <script type="module" src="js/main.js"></script>
 </body>
 </html>

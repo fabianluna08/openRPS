@@ -1,0 +1,59 @@
+# Mediciones SINTÉTICAS para practicar la calibración: las generó OpenRPS con una oficina 'real'
+# distinta del ejemplo (otras pérdidas de tablaroca y concreto y otra potencia del AP) más ruido de 3 dB.
+etiqueta,x,y,ap,rssi_dbm
+Oficina 4,33.4,3.6,AP pasillo,-62
+Oficina 3,22.2,7.5,AP pasillo,-50
+Oficina 3,29.2,0.9,AP pasillo,-60
+Sala de juntas,3.8,19.4,AP pasillo,-55
+Oficina 4,32.9,1.3,AP pasillo,-70
+Oficina 1,0.9,4.0,AP pasillo,-54
+Pasillo,7.0,9.3,AP pasillo,-36
+Pasillo,22.6,9.1,AP pasillo,-47
+Servicio,36.3,15.9,AP pasillo,-88
+Oficina 2,16.2,4.4,AP pasillo,-47
+Oficina 5,14.5,16.8,AP pasillo,-55
+Oficina 5,14.1,19.2,AP pasillo,-64
+Oficina 3,22.6,5.1,AP pasillo,-57
+Oficina 3,20.6,5.8,AP pasillo,-57
+Pasillo,25.0,9.6,AP pasillo,-51
+Pasillo,25.9,10.8,AP pasillo,-46
+Sala de juntas,5.3,17.7,AP pasillo,-52
+Oficina 1,1.3,6.4,AP pasillo,-51
+Oficina 1,7.2,7.0,AP pasillo,-49
+Pasillo,24.6,11.0,AP pasillo,-46
+Pasillo,28.4,9.8,AP pasillo,-49
+Oficina 4,33.3,7.1,AP pasillo,-57
+Pasillo,21.9,10.1,AP pasillo,-44
+Oficina 1,1.5,4.9,AP pasillo,-57
+Oficina 1,3.8,5.3,AP pasillo,-51
+Oficina 1,0.9,6.1,AP pasillo,-52
+Oficina 5,15.1,12.8,AP pasillo,-45
+Pasillo,33.3,8.4,AP pasillo,-54
+Pasillo,25.1,10.4,AP pasillo,-44
+Oficina 1,9.6,4.3,AP pasillo,-55
+Oficina 5,18.1,15.5,AP pasillo,-45
+Oficina 5,23.6,13.7,AP pasillo,-55
+Pasillo,10.1,8.9,AP pasillo,-35
+Oficina 3,20.5,0.8,AP pasillo,-59
+Oficina 2,12.1,7.4,AP pasillo,-41
+Pasillo,1.0,11.2,AP pasillo,-37
+Oficina 3,21.9,2.3,AP pasillo,-60
+Sala de juntas,10.3,17.6,AP pasillo,-43
+Oficina 2,17.6,5.5,AP pasillo,-47
+Pasillo,34.1,9.2,AP pasillo,-52
+Oficina 5,24.9,17.6,AP pasillo,-51
+Oficina 3,21.7,3.6,AP pasillo,-55
+Oficina 6,28.3,18.2,AP pasillo,-57
+Oficina 5,16.8,13.0,AP pasillo,-51
+Oficina 4,34.5,3.5,AP pasillo,-62
+Pasillo,31.0,9.5,AP pasillo,-50
+Oficina 5,22.0,18.0,AP pasillo,-54
+Oficina 4,32.2,3.1,AP pasillo,-63
+Exterior,5.0,-1.2,AP pasillo,-76
+Exterior,15.0,-1.3,AP pasillo,-66
+Exterior,25.0,-1.2,AP pasillo,-78
+Exterior,35.0,-1.4,AP pasillo,-92
+Exterior,41.2,4.0,AP pasillo,-79
+Exterior,41.3,15.0,AP pasillo,-105
+Exterior,-1.2,4.0,AP pasillo,-72
+Exterior,-1.3,15.0,AP pasillo,-78
