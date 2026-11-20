@@ -1,8 +1,8 @@
 // Capa de cobertura actual (métrica + transmisor + escala) y su imagen, compartida por las vistas 2D y 3D.
-import { METRICS, NODATA, autoRange, hexToRgb, rampLUT, txColor } from "./colors.js";
+import { METRICS, NODATA, autoRange, hexToRgb, paletteLUT, paletteRamp, txColor } from "./colors.js";
 
-const LUT = rampLUT();
 let cache = { key: null, layer: null };
+let maskCache = { key: null, mask: null };
 
 export function metricOptions(store) {
   const r = store.result;
@@ -23,7 +23,8 @@ export function currentLayer(store) {
   const def = METRICS[metric];
   const perTxAllowed = (metric === "rx_power" || metric === "path_loss") && r.perTx && v.txFilter !== "best";
   const txPos = perTxAllowed ? r.tx_ids.indexOf(Number(v.txFilter)) : -1;
-  const key = [r.result_id, metric, txPos, v.rangeAuto, v.rangeMin, v.rangeMax].join("|");
+  const key = [r.result_id, metric, txPos, v.rangeAuto, v.rangeMin, v.rangeMax, v.palette, v.banded,
+    v.hideBelowOn, v.hideBelow, v.insideWalls].join("|");
   if (cache.key === key) return cache.layer;
 
   let values = r.metrics[metric];
@@ -45,6 +46,13 @@ export function currentLayer(store) {
     range = v.rangeAuto || !(v.rangeMax > v.rangeMin) ? autoRange(values, def.zeroBased) : [v.rangeMin, v.rangeMax];
   }
   const layer = { metric, def, label, values, range, grid: r.grid, txPos };
+  layer.hideBelow = def.kind === "seq" && v.hideBelowOn && isFinite(v.hideBelow) ? Number(v.hideBelow) : null;
+  layer.mask = null;
+  layer.maskNote = null;
+  if (v.insideWalls) {
+    layer.mask = insideMask(r);
+    if (!layer.mask) layer.maskNote = "Los muros y edificios no cierran ningún recinto: se pinta todo el área.";
+  }
   layer.image = buildImage(store, layer);
   cache = { key, layer };
   return layer;
@@ -52,6 +60,57 @@ export function currentLayer(store) {
 
 export function invalidateLayer() {
   cache = { key: null, layer: null };
+}
+
+// Píxeles "dentro de los muros" (1.9.0): se rasterizan los muros y los contornos de los edificios del
+// proyecto simulado, y se inunda desde el borde del área (vecinos en cruz).  Lo que la inundación no alcanza
+// está encerrado.  Devuelve un Uint8Array (1 = dentro, incluidos los propios muros) o null si nada queda
+// encerrado.  Un hueco en el contorno (una puerta sin muro) deja salir la inundación.
+export function insideMask(result) {
+  if (maskCache.key === result.result_id) return maskCache.mask;
+  const { nx, ny, x0, y0 } = result.grid;
+  const dx = result.grid.dx || 1;
+  const dy = result.grid.dy || 1;
+  const p = result.projectSnapshot || {};
+  const n = nx * ny;
+  const blocked = new Uint8Array(n);
+  const step = Math.min(dx, dy) / 3;
+  const mark = (a, b) => {
+    const steps = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step));
+    for (let k = 0; k <= steps; k++) {
+      const t = k / steps;
+      const i = Math.round((a[0] + (b[0] - a[0]) * t - x0) / dx);
+      const j = Math.round((a[1] + (b[1] - a[1]) * t - y0) / dy);
+      if (i >= 0 && j >= 0 && i < nx && j < ny) blocked[j * nx + i] = 1;
+    }
+  };
+  for (const w of p.walls || []) mark(w.start, w.end);
+  for (const b of p.buildings || []) b.footprint.forEach((v, k) => mark(v, b.footprint[(k + 1) % b.footprint.length]));
+  const outside = new Uint8Array(n);
+  const queue = new Int32Array(n);
+  let head = 0;
+  let tail = 0;
+  const seed = (k) => { if (!blocked[k] && !outside[k]) { outside[k] = 1; queue[tail++] = k; } };
+  for (let i = 0; i < nx; i++) { seed(i); seed((ny - 1) * nx + i); }
+  for (let j = 0; j < ny; j++) { seed(j * nx); seed(j * nx + nx - 1); }
+  while (head < tail) {
+    const k = queue[head++];
+    const i = k % nx;
+    if (i > 0) seed(k - 1);
+    if (i < nx - 1) seed(k + 1);
+    if (k >= nx) seed(k - nx);
+    if (k < n - nx) seed(k + nx);
+  }
+  const mask = new Uint8Array(n);
+  let enclosed = 0;
+  for (let k = 0; k < n; k++) {
+    if (!outside[k]) {
+      mask[k] = 1;
+      if (!blocked[k]) enclosed++;
+    }
+  }
+  maskCache = { key: result.result_id, mask: enclosed > 0 ? mask : null };
+  return maskCache.mask;
 }
 
 function buildImage(store, layer) {
@@ -71,16 +130,29 @@ function buildImage(store, layer) {
   }
   const [lo, hi] = layer.range || [0, 1];
   const span = hi - lo || 1;
+  const v = store.view;
+  const banded = !!v.banded;
+  const LUT = paletteLUT(paletteRamp(v), banded);
+  const mask = layer.mask;
+  const hideBelow = layer.hideBelow;
+  const hideNoData = hideBelow !== null;      // con umbral, lo que no tiene señal tampoco se pinta
   for (let j = 0; j < ny; j++) {
     const row = ny - 1 - j;                    // la fila 0 de la imagen es la y máxima
     for (let i = 0; i < nx; i++) {
       const value = values[j * nx + i];
       const o = 4 * (row * nx + i);
+      if ((mask && !mask[j * nx + i]) || (hideBelow !== null && !(value >= hideBelow))
+          || (hideNoData && !categorical && !isFinite(value))) {
+        data[o + 3] = 0;                       // transparente: se ve el plano debajo
+        continue;
+      }
       let rgb = nodata;
       if (categorical) {
         if (value >= 0 && slotColors.has(value)) rgb = slotColors.get(value);
       } else if (isFinite(value)) {
-        const k = Math.max(0, Math.min(255, Math.round(((value - lo) / span) * 255)));
+        const norm = (value - lo) / span;
+        const k = banded ? Math.max(0, Math.min(255, Math.floor(norm * 256)))
+          : Math.max(0, Math.min(255, Math.round(norm * 255)));
         data[o] = LUT[3 * k];
         data[o + 1] = LUT[3 * k + 1];
         data[o + 2] = LUT[3 * k + 2];

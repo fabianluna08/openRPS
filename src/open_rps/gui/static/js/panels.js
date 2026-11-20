@@ -3,6 +3,7 @@ import { fmt, fmtFreq, txColor } from "./colors.js";
 import { GUARD_INTERVALS, WIFI_BANDS, WIFI_STANDARDS, centreMHz, channelOptions, normalizeWifi, widthsFor } from "./wifi.js";
 import { centroid, isSimplePolygon, round } from "./geometry.js";
 import { nextId, nextTxId } from "./state.js";
+import { ANTENNA_PRESETS, antennaPresetOf, applyAntennaPreset, dbmToMw, mwToDbm, referenceFrequency, wallLossDb } from "./physics.js";
 
 const MODE_LABELS = {
   raytracing: "Ray tracing (multitrayecto)",
@@ -10,6 +11,7 @@ const MODE_LABELS = {
   tworay: "Two-Ray (reflexión en el suelo)",
   logdistance: "Log-distancia",
   hata: "Okumura-Hata / COST-231",
+  multiwall: "Interiores: log-distancia + muros (multimuro)",
 };
 const HATA_LABELS = { urban_large: "Urbano (ciudad grande)", urban_medium: "Urbano (ciudad mediana)", suburban: "Suburbano", open: "Rural abierto" };
 const PENETRATION_LABELS = { none: "No obstruye (solo refleja)", fixed: "Pérdida fija", frequency: "Pérdida lineal con f (3GPP)", opaque: "Opaco" };
@@ -53,7 +55,7 @@ export function renderTree(container, store, app) {
   container.append(section(
     head(p.name || "Proyecto", { type: "project" }, null),
     item({ type: "area" }, "Área de predicción", `${fmt(p.area.resolution_m, 2).replace(/\.?0+$/, "")} m`, el("span", { class: "swatch", style: "background:#f4f3ef" })),
-    item({ type: "settings" }, "Configuración", MODE_LABELS[p.settings.mode].split(" (")[0], el("span", { class: "swatch", style: "background:#1c5cab" })),
+    item({ type: "settings" }, "Configuración", p.settings.mode === "multiwall" ? "Multimuro" : MODE_LABELS[p.settings.mode].split(" (")[0], el("span", { class: "swatch", style: "background:#1c5cab" })),
   ));
   container.append(section(
     head("Transmisores", null, p.transmitters.length, () => app.addTransmitterCentered(), "Añadir transmisor (o usa la herramienta Transmisor)"),
@@ -120,7 +122,7 @@ function penetrationSummary(m, f) {
 // ------------------------------------------------------------------ propiedades
 // Campo: {key, label, type, unit, scale, min, step, options, show, nullable, help}
 function fieldRow(obj, spec, onCommit) {
-  const value = obj[spec.key];
+  const value = spec.get ? spec.get(obj) : obj[spec.key];
   let input;
   if (spec.type === "checkbox") {
     input = el("input", { type: "checkbox" });
@@ -149,8 +151,9 @@ function fieldRow(obj, spec, onCommit) {
     input.addEventListener("change", () => onCommit(spec.key, input.value));
   } else {
     const scale = spec.scale || 1;
+    const shown = (x) => (x === null || x === undefined ? "" : +(x / scale).toPrecision(spec.precision || 10));
     input = el("input", { type: "number", step: spec.step ?? "any", min: spec.min, max: spec.max });
-    input.value = value === null || value === undefined ? "" : +(value / scale).toPrecision(10);
+    input.value = shown(value);
     if (spec.nullable) input.placeholder = spec.placeholder || "auto";
     input.addEventListener("change", () => {
       const text = input.value.trim();
@@ -158,13 +161,13 @@ function fieldRow(obj, spec, onCommit) {
       const number = Number(text);
       if (text === "" || !isFinite(number) || (spec.min !== undefined && number < spec.min)
           || (spec.max !== undefined && number > spec.max)) {
-        input.value = value === null || value === undefined ? "" : +(value / scale).toPrecision(10);
+        input.value = shown(value);
         input.setCustomValidity("Valor no válido");
         input.reportValidity();
         setTimeout(() => input.setCustomValidity(""), 1500);
         return;
       }
-      onCommit(spec.key, spec.integer ? Math.round(number) : number * scale);
+      onCommit(spec.key, spec.integer ? Math.round(number) : spec.fromView ? spec.fromView(number) : number * scale);
     });
   }
   const control = spec.unit ? el("span", { class: "with-unit" }, input, el("span", { class: "unit", text: spec.unit })) : input;
@@ -191,7 +194,9 @@ const TX_FIELDS = (standard) => [
   { key: "y", label: "Y", unit: "m" },
   { key: "z", label: "Altura", unit: "m", min: 0 },
   { section: "Radio" },
-  { key: "tx_power_dbm", label: "Potencia", unit: "dBm" },
+  { key: "tx_power_dbm", label: "Potencia", unit: "dBm", precision: 6 },
+  { key: "tx_power_dbm", label: "Potencia", unit: "mW", get: (t) => dbmToMw(t.tx_power_dbm), fromView: mwToDbm,
+    min: 1e-9, precision: 4, help: "La misma potencia en milivatios (9 mW = 9.5 dBm, 100 mW = 20 dBm)" },
   { key: "frequency_hz", label: "Frecuencia", unit: "MHz", scale: 1e6, min: 0, show: (t) => !t.wifi_band },
   { key: "antenna_gain_dbi", label: "Ganancia", unit: "dBi" },
   { section: "Wi-Fi" },
@@ -205,6 +210,9 @@ const TX_FIELDS = (standard) => [
   { key: "wifi_streams", label: "Flujos espaciales", type: "select", integer: true, show: (t) => !!t.wifi_band,
     options: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} (${n}×${n} MIMO)`]), help: "Se usa el menor entre el AP y el cliente" },
   { section: "Antena" },
+  { key: "_antenna", label: "Modelo", type: "select", get: antennaPresetOf,
+    options: [...Object.entries(ANTENNA_PRESETS).map(([id, a]) => [id, a.label]), ["custom", "Personalizada"]],
+    help: "Pone el diagrama, la ganancia y los haces de un modelo genérico; luego puedes ajustar cada valor" },
   { key: "pattern", label: "Diagrama", type: "select", options: [["isotropic", "Isotrópica"], ["sector", "Sector 3GPP"]] },
   { key: "azimuth_deg", label: "Azimut", unit: "°", show: (t) => t.pattern === "sector", help: "0° = eje +x, 90° = eje +y" },
   { key: "downtilt_deg", label: "Inclinación", unit: "°", show: (t) => t.pattern === "sector", help: "Positiva hacia el suelo" },
@@ -238,8 +246,9 @@ const SETTINGS_FIELDS = [
   { key: "coherent", label: "Suma coherente", type: "checkbox", show: (s) => s.mode === "raytracing",
     help: "Suma las amplitudes complejas de los rayos: aparece el desvanecimiento rápido" },
   { key: "hata_environment", label: "Entorno", type: "select", options: Object.entries(HATA_LABELS), show: (s) => s.mode === "hata" },
-  { key: "log_distance_exponent", label: "Exponente n", min: 0.01, show: (s) => s.mode === "logdistance" },
-  { key: "log_distance_d0_m", label: "Distancia d0", unit: "m", min: 0.01, show: (s) => s.mode === "logdistance" },
+  { key: "log_distance_exponent", label: "Exponente n", min: 0.01, show: (s) => s.mode === "logdistance" || s.mode === "multiwall",
+    help: "2 = espacio libre; en interiores, típicamente 2.5 a 3.5 (muebles, gente)" },
+  { key: "log_distance_d0_m", label: "Distancia d0", unit: "m", min: 0.01, show: (s) => s.mode === "logdistance" || s.mode === "multiwall" },
   { key: "min_distance_m", label: "Distancia mínima", unit: "m", min: 0, help: "Píxeles más cerca de una antena quedan sin dato" },
   { section: "Sombra log-normal" },
   { key: "shadow_sigma_db", label: "σ", unit: "dB", min: 0 },
@@ -275,6 +284,9 @@ const BUILDING_FIELDS = (materials) => [
 const WALL_FIELDS = (materials) => [
   { key: "name", label: "Nombre", type: "text" },
   { key: "material", label: "Material", type: "select", options: materials.map((m) => [m.id, m.name || m.id]) },
+  { key: "thickness_m", label: "Espesor", unit: "cm", scale: 0.01, min: 0.001, max: 500, nullable: true,
+    placeholder: "del material",
+    help: "Vacío: la pérdida fija del material. Con espesor: la de una losa de ese grosor con la εr y la σ del material (ITU-R P.2040)" },
   { key: "z_min_m", label: "Base", unit: "m" },
   { key: "z_max_m", label: "Altura superior", unit: "m" },
 ];
@@ -345,6 +357,8 @@ export function renderProperties(container, titleEl, store, app) {
       if (k === "wifi_band" || k === "wifi_width_mhz" || k === "wifi_channel") {
         t[k] = k === "wifi_band" ? (v || null) : v;
         normalizeWifi(t, standard);
+      } else if (k === "_antenna") {
+        applyAntennaPreset(t, v);
       } else t[k] = v;
     }));
     const slot = store.txSlot(obj.tx_id);
@@ -368,7 +382,14 @@ export function renderProperties(container, titleEl, store, app) {
     buildForm(container, obj.start, pointSpecs, commit((k, v) => { store.wall(s.id).start[k] = v; }));
     buildForm(container, obj.end, [{ key: 0, label: "Fin X", unit: "m" }, { key: 1, label: "Fin Y", unit: "m" }],
       commit((k, v) => { store.wall(s.id).end[k] = v; }));
-    container.append(el("div", { class: "readout", text: `Longitud ${fmt(Math.hypot(obj.end[0] - obj.start[0], obj.end[1] - obj.start[1]), 2)} m` }));
+    const material = p.materials.find((m) => m.id === obj.material);
+    const f = referenceFrequency(p);
+    const loss = material ? wallLossDb(obj, material, f) : null;
+    const lossText = loss === null ? "no atenúa" : loss === Infinity ? "opaco" : `${fmt(loss, 1)} dB`;
+    const how = obj.thickness_m && material && ["fixed", "frequency"].includes(material.penetration)
+      ? `losa de ${fmt(obj.thickness_m * 100, obj.thickness_m < 0.01 ? 2 : 1)} cm` : "ley del material";
+    container.append(el("div", { class: "readout",
+      text: `Longitud ${fmt(Math.hypot(obj.end[0] - obj.start[0], obj.end[1] - obj.start[1]), 2)} m · pérdida por cruce a ${fmt(f / 1e6, 0)} MHz: ${lossText} (${how})` }));
     container.append(actions(store, app, s));
   } else if (s.type === "material") {
     titleEl.textContent = "Material";
@@ -405,8 +426,10 @@ export function renderProperties(container, titleEl, store, app) {
       }
     }));
     if (!anyWifi) container.append(el("p", { class: "note", text: "Para los mapas de Wi-Fi (tasa de datos, MCS y contención), asigna una banda y un canal Wi-Fi a los transmisores." }));
-    if (obj.mode !== "raytracing") {
-      container.append(el("p", { class: "note", text: "Los modelos empíricos ignoran los edificios y muros: ni reflejan ni obstruyen. Usa ray tracing para verlos en el mapa." }));
+    if (obj.mode === "multiwall") {
+      container.append(el("p", { class: "note", text: "Multimuro: pérdida log-distancia (FSPL hasta d0 y 10·n·log10(d/d0) después) más la pérdida de cada muro que cruza la línea directa del AP al punto, como en las herramientas de planeación Wi-Fi. Los muros no reflejan ni difractan aquí: para eso, ray tracing." }));
+    } else if (obj.mode !== "raytracing") {
+      container.append(el("p", { class: "note", text: "Los modelos empíricos ignoran los edificios y muros: ni reflejan ni obstruyen. Usa ray tracing o el modelo multimuro para verlos en el mapa." }));
     } else {
       container.append(el("p", { class: "note", text: "Ray tracing de OpenRPS: rayo directo, reflexión en el suelo y rebotes especulares en los muros (uno, o hasta dos), difracción UTD en las aristas (una, o hasta dos por rayo), rayos que combinan un rebote con una difracción y obstrucción por los muros que tapan. Cada rayo tiene a lo más dos interacciones." }));
     }

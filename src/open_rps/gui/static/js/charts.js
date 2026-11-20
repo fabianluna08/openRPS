@@ -1,5 +1,5 @@
 // Leyenda del mapa, panel del receptor (perfil potencia-retardo y tabla de rayos) y estadísticas.
-import { AXIS, BLUE_RAMP, INK2, MUTED, SURFACE, fmt, niceTicks, num, txColor } from "./colors.js";
+import { AXIS, INK2, MUTED, SURFACE, fmt, niceTicks, num, paletteRamp, txColor } from "./colors.js";
 import { currentLayer } from "./coverage.js";
 import { el } from "./panels.js";
 
@@ -34,7 +34,15 @@ export function renderLegend(container, store) {
     const defs = svg("defs");
     const gradId = `grad-${container.id || "legend"}`;
     const grad = svg("linearGradient", { id: gradId, x1: "0", x2: "1", y1: "0", y2: "0" });
-    BLUE_RAMP.forEach((c, k) => grad.append(svg("stop", { offset: `${(k / (BLUE_RAMP.length - 1)) * 100}%`, "stop-color": c })));
+    const ramp = paletteRamp(store.view);
+    if (store.view.banded) {
+      ramp.forEach((c, k) => {
+        grad.append(svg("stop", { offset: `${(k / ramp.length) * 100}%`, "stop-color": c }),
+          svg("stop", { offset: `${((k + 1) / ramp.length) * 100}%`, "stop-color": c }));
+      });
+    } else {
+      ramp.forEach((c, k) => grad.append(svg("stop", { offset: `${(k / (ramp.length - 1)) * 100}%`, "stop-color": c })));
+    }
     defs.append(grad);
     bar.append(defs, svg("rect", { x: pad, y: 4, width: width - 2 * pad, height: 12, rx: 2, fill: `url(#${gradId})` }));
     const integer = Boolean(layer.def.integer);
@@ -51,9 +59,17 @@ export function renderLegend(container, store) {
       bar.append(label);
     }
     container.append(bar);
-    container.append(el("div", { class: "legend-row" }, el("span", { class: "legend-swatch", style: "background:#e1e0d9" }),
-      el("span", { class: "muted", text: layer.def.noDataLegend || "Sin datos (sin señal o interior bloqueado)" })));
+    if (layer.hideBelow !== null) {
+      const unit = layer.def.unit ? ` ${layer.def.unit}` : "";
+      container.append(el("div", { class: "legend-row" }, el("span", { class: "legend-swatch hollow" }),
+        el("span", { class: "muted", text: `Sin pintar: por debajo de ${fmt(layer.hideBelow, layer.def.digits)}${unit} o sin señal` })));
+    } else {
+      container.append(el("div", { class: "legend-row" }, el("span", { class: "legend-swatch", style: "background:#e1e0d9" }),
+        el("span", { class: "muted", text: layer.def.noDataLegend || "Sin datos (sin señal o interior bloqueado)" })));
+    }
   }
+  if (layer.mask) container.append(el("div", { class: "legend-row muted", text: "Solo dentro de los muros" }));
+  if (layer.maskNote) container.append(el("div", { class: "legend-row warn-note", text: layer.maskNote }));
   if (store.outdated) container.append(el("div", { class: "muted", text: "El proyecto cambió: vuelve a ejecutar (F5)." }));
 }
 
@@ -106,6 +122,15 @@ export function renderProbe(container, store, app) {
   if (best) left.append(el("div", { class: "note", text: `★ Mejor servidor: ${store.txName(best.id)}. τ̄ exceso: retardo medio respecto al primer rayo. Las métricas de retardo y ángulo ponderan cada rayo por su potencia.` }));
   if (data.wifi && data.wifi.serving_tx_id !== null && data.wifi.serving_tx_id !== undefined) left.append(probeWifi(store, data.wifi));
   if (data.mode !== "raytracing") {
+    if (data.mode === "multiwall") {
+      const rows = data.transmitters.filter((t) => t.walls).map((t) => el("tr", {},
+        el("td", { text: store.txName(t.tx_id) }),
+        el("td", { class: "num", text: String(t.walls.length) }),
+        el("td", { class: "num", text: fmt(t.wall_loss_db, 1) }),
+        el("td", { text: t.walls.map((w) => `${w.name} (${fmt(w.loss_db, 1)} dB)`).join(" · ") || "línea de vista" })));
+      left.append(el("table", { class: "data" },
+        el("tr", {}, ...["Transmisor", "Muros", "Pérdida (dB)", "Muros que cruza la línea directa"].map((h) => el("th", { text: h }))), ...rows));
+    }
     left.append(el("p", { class: "note", text: "En los modelos empíricos no hay rayos ni respuesta al impulso: solo la potencia que predice el modelo. Cambia a ray tracing en la Configuración para verlos." }));
     return;
   }
@@ -504,7 +529,8 @@ function calibrationBox(store, app, rev) {
     return tx ? tx.frequency_hz : 2.4e9;
   })();
   const used = new Set([...p.buildings.map((b) => b.material), ...p.walls.map((w) => w.material)]);
-  const candidates = p.settings.mode === "raytracing"
+  const usesWalls = p.settings.mode === "raytracing" || p.settings.mode === "multiwall";
+  const candidates = usesWalls
     ? p.materials.filter((m) => used.has(m.id) && (m.penetration === "fixed" || m.penetration === "frequency")) : [];
   const form = el("div", { class: "calib-form" });
   if (candidates.length) {
@@ -517,7 +543,7 @@ function calibrationBox(store, app, rev) {
       form.append(el("label", { class: "inline-check" }, check, el("span", { class: "swatch", style: `background:${m.color}` }),
         el("span", { text: `${m.name || m.id} (${fmt(loss, 1)} dB)` })));
     }
-  } else if (p.settings.mode === "raytracing") {
+  } else if (usesWalls) {
     form.append(el("p", { class: "note", text: "Ningún material usado tiene una pérdida finita que ajustar." }));
   } else {
     form.append(el("p", { class: "note", text: "Los modelos empíricos no usan los materiales: se ajustan la potencia y, en log-distancia, el exponente." }));
@@ -528,7 +554,7 @@ function calibrationBox(store, app, rev) {
   power.addEventListener("change", () => { opts.tx_power = power.value; });
   form.append(el("label", { class: "field", title: "Automático: una por transmisor si todas las mediciones dicen de qué transmisor son; si no, una común (por ejemplo, la ganancia del equipo de medición)" },
     el("span", { text: "Potencia de los Tx" }), power));
-  if (p.settings.mode === "logdistance") {
+  if (p.settings.mode === "logdistance" || p.settings.mode === "multiwall") {
     const exp = el("input", { type: "checkbox" });
     exp.checked = opts.exponent;
     exp.addEventListener("change", () => { opts.exponent = exp.checked; });
@@ -536,7 +562,7 @@ function calibrationBox(store, app, rev) {
   }
   form.append(el("div", { class: "props-actions" }, el("button", { class: "btn primary", text: "Calibrar", onclick: () => {
     const materials = candidates.filter((m) => !opts.excluded.has(m.id)).map((m) => m.id);
-    app.calibrate({ materials: p.settings.mode === "raytracing" ? materials : false, tx_power: opts.tx_power, exponent: opts.exponent });
+    app.calibrate({ materials: usesWalls ? materials : false, tx_power: opts.tx_power, exponent: opts.exponent });
   } })));
   box.append(form);
 

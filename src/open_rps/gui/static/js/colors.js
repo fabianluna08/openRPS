@@ -37,6 +37,33 @@ export function rampLUT(ramp = BLUE_RAMP, n = 256) {
   return lut;
 }
 
+// Paleta de los mapas de calor Wi-Fi (1.9.0), de débil a fuerte: azul marino, azul, cian, verde, amarillo,
+// naranja y rojo oscuro.  Es la convención de las herramientas de site survey (rojo = señal fuerte), útil para
+// comparar con ellas; no es perceptualmente uniforme, así que la rampa azul sigue siendo la de por defecto.
+export const WIFI_HEAT_RAMP = ["#10163f", "#1b2c8f", "#1f4fd1", "#2a8be6", "#3cc6e8", "#2fb59a", "#1f8f4a", "#3fae3a",
+  "#8cc63f", "#e3e12c", "#f7b52a", "#f07d22", "#e2453a", "#c8102e", "#8b0a1a"];
+
+export const PALETTES = {
+  blue: { label: "Azul (OpenRPS)", ramp: BLUE_RAMP },
+  heat: { label: "Mapa de calor Wi-Fi (rojo = fuerte)", ramp: WIFI_HEAT_RAMP },
+};
+
+export function paletteRamp(view) {
+  return (PALETTES[view && view.palette] || PALETTES.blue).ramp;
+}
+
+// 256 colores de la paleta: interpolados, o en bandas sólidas (un color por paso de la rampa)
+export function paletteLUT(ramp, banded) {
+  if (!banded) return rampLUT(ramp);
+  const stops = ramp.map(hexToRgb);
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let k = 0; k < 256; k++) {
+    const band = Math.min(stops.length - 1, Math.floor((k / 256) * stops.length));
+    for (let c = 0; c < 3; c++) lut[3 * k + c] = stops[band][c];
+  }
+  return lut;
+}
+
 export function rampColor(norm, ramp = BLUE_RAMP) {
   const stops = ramp.map(hexToRgb);
   const pos = Math.min(1, Math.max(0, norm)) * (stops.length - 1);

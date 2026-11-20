@@ -235,6 +235,8 @@ def predict_points(project, points, sim=None) -> np.ndarray:
                 phi = np.degrees(np.arctan2(pts[:, 1] - tx.y, pts[:, 0] - tx.x))
                 theta = np.degrees(np.arctan2(pts[:, 2] - tx.z, np.maximum(1e-6, ground)))
                 pl = pl - tx.pattern_gain_db(phi, theta)
+            if project.wall_losses:
+                pl = pl + sim.wall_loss_db(tx, pts)
             out[t] = tx.tx_power_dbm - pl
         if s.min_distance_m > 0:
             near = np.linalg.norm(pts - np.array([tx.x, tx.y, tx.z]), axis=1) < s.min_distance_m
@@ -417,7 +419,7 @@ def calibrate(project, measurements: Optional[Sequence[Measurement]] = None, mat
     carries a calibrated copy (``CalibrationResult.project``).
 
     materials: "auto" (default) every material with a finite penetration loss used by
-        some building or wall (ray tracing only); a list of material ids; or None.
+        some building or wall (ray tracing and multiwall); a list of material ids; or None.
         The parameter is the loss per crossing at the reference frequency of the
         project; a material with a linear law keeps its slope.  Materials that no
         measured ray crosses are left as they are.
@@ -425,7 +427,7 @@ def calibrate(project, measurements: Optional[Sequence[Measurement]] = None, mat
         offset for every enabled transmitter: e.g. the gain of the measuring device),
         "none", or "auto" (default): "per_tx" if every measurement names its
         transmitter, "common" otherwise.  The offset is added to ``tx_power_dbm``.
-    exponent: in log-distance mode, also fit the path-loss exponent.
+    exponent: in log-distance and multiwall modes, also fit the path-loss exponent.
     progress: optional callable(evaluations) called after each evaluation of the model.
 
     A parameter that fewer than 3 measured points depend on (a material that almost
@@ -443,7 +445,7 @@ def calibrate(project, measurements: Optional[Sequence[Measurement]] = None, mat
 
     # --- parameters
     params: List[CalibrationParameter] = []
-    if materials is not None and mode == "raytracing":
+    if materials is not None and mode in ("raytracing", "multiwall"):
         material_map = base.material_map()
         ids = _used_materials(base) if materials == "auto" else list(materials)
         for mid in ids:
@@ -456,7 +458,7 @@ def calibrate(project, measurements: Optional[Sequence[Measurement]] = None, mat
                                            "que ajustar (no tapa o es opaco)")
                 continue
             params.append(CalibrationParameter("material", mid, material_map[mid].name or mid, loss))
-    if exponent and mode == "logdistance":
+    if exponent and mode in ("logdistance", "multiwall"):
         params.append(CalibrationParameter("exponent", "exponent", "Exponente de pérdida",
                                            float(base.settings.log_distance_exponent), unit=""))
     if tx_power == "auto":

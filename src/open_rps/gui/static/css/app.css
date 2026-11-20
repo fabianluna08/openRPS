@@ -222,3 +222,9 @@ table.data.clickable tr:not(:first-child):hover td { background: var(--accent-so
 .modal-body .inline-check { display: flex; align-items: flex-start; gap: 6px; margin: 6px 0; font-size: 13px; }
 .probe-wifi { margin-top: 10px; }
 .plan-result table.data { margin-top: 8px; }
+.legend .legend-swatch.hollow { border: 1px dashed #898781; background: transparent; }
+.legend .warn-note { color: #9a5b00; }
+.style-form { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; align-items: center; margin: 4px 0 12px; }
+.style-form .full { grid-column: 1 / -1; }
+.style-form input[type="number"] { width: 90px; }
+.style-presets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }

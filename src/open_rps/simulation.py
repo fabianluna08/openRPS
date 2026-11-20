@@ -635,6 +635,21 @@ class PropagationSimulator:
         return self._build_result(x_coords, y_coords, rx_power_dbm, path_loss_db,
                                   best_index, max_rx_power_dbm, rms_delay_spread_ns, angular_spread_phi)
 
+    def wall_loss_db(self, tx: Transmitter, points: np.ndarray) -> np.ndarray:
+        """
+        Penetration loss in dB of the walls crossed by the straight segments from ``tx``
+        to ``points`` ([..., 3]): 0 with line of sight, inf through an opaque wall (the
+        multi-wall model of ``run_empirical_simulation(wall_losses=True)``).  Done in
+        blocks so that large grids do not need huge temporary arrays.
+        """
+        pts = np.asarray(points, dtype=float)
+        flat = pts.reshape(-1, 3)
+        out = np.zeros(len(flat))
+        origin = np.array([tx.x, tx.y, tx.z], dtype=float)
+        for i0 in range(0, len(flat), _MAX_CHUNK_POINTS):
+            out[i0:i0 + _MAX_CHUNK_POINTS] = self.ray_tracer.obstruction_loss_db(origin, flat[i0:i0 + _MAX_CHUNK_POINTS])
+        return out.reshape(pts.shape[:-1])
+
     def run_empirical_simulation(
         self,
         model: PropagationModel,
@@ -644,7 +659,8 @@ class PropagationSimulator:
         rx_height_m: float = 1.5,
         min_distance_m: Optional[float] = DEFAULT_MIN_DISTANCE_M,
         shadow_fading_sigma_db: float = 0.0,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        wall_losses: bool = False,
     ) -> SimulationResult:
         """
         Executes a 2D grid simulation using an empirical model (e.g. Okumura-Hata, TwoRay, FSPL).
@@ -665,9 +681,14 @@ class PropagationSimulator:
         ``run_raytracing_simulation`` (the distance checked is always the 3D one).
 
         Empirical models carry no multipath information: the delay-spread and
-        angular-spread grids of the result are NaN.  They also ignore the walls
-        completely: reflectors neither reflect nor obstruct here (their
-        ``transmission_loss_db`` only acts in ``run_raytracing_simulation``).
+        angular-spread grids of the result are NaN.  By default they also ignore the
+        walls completely: reflectors neither reflect nor obstruct.
+
+        wall_losses: multi-wall model (new in 1.9.0): the penetration losses of the
+        walls that the straight segment Tx -> Rx crosses are added to the path loss
+        (``RayTracer.obstruction_loss_db``, the same crossing rule as the ray tracer;
+        an opaque wall leaves -inf).  With ``LogDistancePathLoss`` this is the classic
+        indoor model of the Wi-Fi planning tools.  Walls still do not reflect.
         """
         x_coords, y_coords = _make_grid(x_range, y_range, resolution_m)
         nx, ny, num_tx = len(x_coords), len(y_coords), len(self.transmitters)
@@ -697,6 +718,8 @@ class PropagationSimulator:
                 phi = np.degrees(np.arctan2(grid_y - tx.y, grid_x - tx.x))
                 theta = np.degrees(np.arctan2(rx_height_m - tx.z, np.maximum(1e-6, ground_distance)))
                 pl = pl - tx.pattern_gain_db(phi, theta)
+            if wall_losses:
+                pl = pl + self.wall_loss_db(tx, np.stack([grid_x, grid_y, np.full_like(grid_x, rx_height_m)], axis=-1))
             if shadow is not None:
                 pl = pl + shadow[tx_idx]
             if too_close is not None:

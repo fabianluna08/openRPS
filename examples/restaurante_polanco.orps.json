@@ -1,0 +1,753 @@
+{
+  "format": "openrps-project",
+  "version": 4,
+  "name": "Restaurante Polanco (práctica Acrylic Wi-Fi)",
+  "description": "Práctica de planeación Wi-Fi: tres salones y una terraza de vidrio, muros de concreto de 15 cm y vidrio de 0.3 cm, y tres AP en 2.4 GHz (canales 1, 6 y 11). Escala de la práctica: 100 m entre las esquinas superiores del salón mediano. Modelo de interiores multimuro (log-distancia n = 2.5 + muros). Carga el plano con Archivo → Plano de fondo (sección «Práctica» del README) y aplica Ver → Estilo del mapa → Estilo Acrylic.",
+  "area": {
+    "x_min": 0.0,
+    "x_max": 233.0,
+    "y_min": -2.0,
+    "y_max": 170.0,
+    "resolution_m": 1.0,
+    "rx_height_m": 1.0
+  },
+  "settings": {
+    "mode": "multiwall",
+    "coherent": false,
+    "min_distance_m": 1.0,
+    "shadow_sigma_db": 0.0,
+    "seed": null,
+    "hata_environment": "urban_medium",
+    "log_distance_exponent": 2.5,
+    "log_distance_d0_m": 1.0,
+    "sinr": true,
+    "noise_figure_db": 7.0,
+    "bandwidth_hz": 20000000.0,
+    "wifi_standard": "n",
+    "wifi_guard_interval_us": 0.8,
+    "wifi_client_streams": 2,
+    "wifi_cca_dbm": -82.0,
+    "ground_eps_r": 15.0,
+    "ground_sigma": 0.005,
+    "reference_frequency_hz": null,
+    "diffraction": true,
+    "max_reflections": 1,
+    "max_diffractions": 1,
+    "mixed_interactions": false
+  },
+  "materials": [
+    {
+      "id": "concreto",
+      "name": "Concreto",
+      "color": "#8d8a83",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 5.24,
+      "sigma_c": 0.0462,
+      "sigma_d": 0.7822,
+      "penetration": "frequency",
+      "loss_db": 15.0,
+      "loss_a_db": 5.0,
+      "loss_b_db_per_ghz": 4.0,
+      "note": "P.2040; penetración 3GPP: 5 + 4·f dB"
+    },
+    {
+      "id": "ladrillo",
+      "name": "Ladrillo",
+      "color": "#b0603c",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 3.91,
+      "sigma_c": 0.0238,
+      "sigma_d": 0.16,
+      "penetration": "fixed",
+      "loss_db": 10.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "P.2040 (1–10 GHz); penetración típica 10 dB"
+    },
+    {
+      "id": "vidrio",
+      "name": "Vidrio",
+      "color": "#7fb7d9",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 6.31,
+      "sigma_c": 0.0036,
+      "sigma_d": 1.3394,
+      "penetration": "frequency",
+      "loss_db": 2.5,
+      "loss_a_db": 2.0,
+      "loss_b_db_per_ghz": 0.2,
+      "note": "P.2040; penetración 3GPP: 2 + 0.2·f dB"
+    },
+    {
+      "id": "vidrio_irr",
+      "name": "Vidrio IRR (bajo emisivo)",
+      "color": "#4f8fb3",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 6.31,
+      "sigma_c": 0.0036,
+      "sigma_d": 1.3394,
+      "penetration": "frequency",
+      "loss_db": 23.7,
+      "loss_a_db": 23.0,
+      "loss_b_db_per_ghz": 0.3,
+      "note": "Penetración 3GPP: 23 + 0.3·f dB"
+    },
+    {
+      "id": "madera",
+      "name": "Madera",
+      "color": "#a47844",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 1.99,
+      "sigma_c": 0.0047,
+      "sigma_d": 1.0718,
+      "penetration": "frequency",
+      "loss_db": 5.1,
+      "loss_a_db": 4.85,
+      "loss_b_db_per_ghz": 0.12,
+      "note": "P.2040; penetración 3GPP: 4.85 + 0.12·f dB"
+    },
+    {
+      "id": "tablaroca",
+      "name": "Tablaroca",
+      "color": "#d8d3c6",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 2.73,
+      "sigma_c": 0.0085,
+      "sigma_d": 0.9395,
+      "penetration": "fixed",
+      "loss_db": 3.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "P.2040; penetración típica 3 dB"
+    },
+    {
+      "id": "metal",
+      "name": "Metal",
+      "color": "#5c6670",
+      "reflection": "constant",
+      "reflectivity": 1.0,
+      "eps_r": 1.0,
+      "sigma_c": 10000000.0,
+      "sigma_d": 0.0,
+      "penetration": "opaque",
+      "loss_db": 0.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "Reflector perfecto y opaco"
+    },
+    {
+      "id": "ideal",
+      "name": "Muro ideal (solo refleja)",
+      "color": "#b9b4a8",
+      "reflection": "constant",
+      "reflectivity": 0.5,
+      "eps_r": 5.0,
+      "sigma_c": 0.0,
+      "sigma_d": 0.0,
+      "penetration": "none",
+      "loss_db": 0.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "Comportamiento de OpenRPS 1.2: refleja y no tapa"
+    }
+  ],
+  "transmitters": [
+    {
+      "tx_id": 0,
+      "name": "AP 1 · Resta_Polanco",
+      "x": 76.23,
+      "y": 132.59,
+      "z": 2.5,
+      "tx_power_dbm": 9.542425094393248,
+      "frequency_hz": 2412000000.0,
+      "antenna_gain_dbi": 2.2,
+      "pattern": "isotropic",
+      "azimuth_deg": 0.0,
+      "beamwidth_az_deg": 65.0,
+      "beamwidth_el_deg": 65.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 1,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    },
+    {
+      "tx_id": 1,
+      "name": "AP 2 · Resta_Polanco",
+      "x": 3.86,
+      "y": 72.54,
+      "z": 2.5,
+      "tx_power_dbm": 14.771212547196624,
+      "frequency_hz": 2437000000.0,
+      "antenna_gain_dbi": 13.0,
+      "pattern": "sector",
+      "azimuth_deg": 0.0,
+      "beamwidth_az_deg": 40.0,
+      "beamwidth_el_deg": 36.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 6,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    },
+    {
+      "tx_id": 2,
+      "name": "AP 3 · Resta_Polanco",
+      "x": 229.0,
+      "y": 81.08,
+      "z": 2.5,
+      "tx_power_dbm": 16.020599913279625,
+      "frequency_hz": 2462000000.0,
+      "antenna_gain_dbi": 6.0,
+      "pattern": "sector",
+      "azimuth_deg": 180.0,
+      "beamwidth_az_deg": 120.0,
+      "beamwidth_el_deg": 60.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 11,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    }
+  ],
+  "buildings": [],
+  "walls": [
+    {
+      "id": "w1",
+      "name": "Salón grande norte · muro",
+      "start": [
+        32.5126,
+        167.2613
+      ],
+      "end": [
+        48.0905,
+        167.2613
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w2",
+      "name": "Salón grande norte · ventana 1",
+      "start": [
+        48.0905,
+        167.2613
+      ],
+      "end": [
+        67.6884,
+        167.2613
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    },
+    {
+      "id": "w3",
+      "name": "Salón grande norte · muro",
+      "start": [
+        67.6884,
+        167.2613
+      ],
+      "end": [
+        98.3417,
+        167.2613
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w4",
+      "name": "Salón grande norte · ventana 2",
+      "start": [
+        98.3417,
+        167.2613
+      ],
+      "end": [
+        117.4372,
+        167.2613
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    },
+    {
+      "id": "w5",
+      "name": "Salón grande norte · muro",
+      "start": [
+        117.4372,
+        167.2613
+      ],
+      "end": [
+        130.0,
+        167.2613
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w6",
+      "name": "Salón grande oeste",
+      "start": [
+        32.5126,
+        167.2613
+      ],
+      "end": [
+        32.5126,
+        97.9146
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w7",
+      "name": "Salón grande este",
+      "start": [
+        130.0,
+        167.2613
+      ],
+      "end": [
+        130.0,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w8",
+      "name": "Salón grande / salón pequeño",
+      "start": [
+        32.5126,
+        97.9146
+      ],
+      "end": [
+        130.0,
+        97.9146
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w9",
+      "name": "Salón pequeño norte",
+      "start": [
+        2.8643,
+        97.9146
+      ],
+      "end": [
+        32.5126,
+        97.9146
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w10",
+      "name": "Salón pequeño oeste",
+      "start": [
+        2.8643,
+        97.9146
+      ],
+      "end": [
+        2.8643,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w11",
+      "name": "Salón pequeño sur",
+      "start": [
+        2.8643,
+        47.1608
+      ],
+      "end": [
+        130.0,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w12",
+      "name": "Salón pequeño / salón mediano",
+      "start": [
+        130.0,
+        97.9146
+      ],
+      "end": [
+        130.0,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w13",
+      "name": "Salón grande / salón mediano",
+      "start": [
+        130.0,
+        115.0
+      ],
+      "end": [
+        130.0,
+        97.9146
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w14",
+      "name": "Salón mediano este",
+      "start": [
+        230.0,
+        115.0
+      ],
+      "end": [
+        230.0,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w15",
+      "name": "Salón mediano norte · muro",
+      "start": [
+        130.0,
+        115.0
+      ],
+      "end": [
+        140.5528,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w16",
+      "name": "Salón mediano norte · ventana 1",
+      "start": [
+        140.5528,
+        115.0
+      ],
+      "end": [
+        159.6482,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w17",
+      "name": "Salón mediano norte · muro",
+      "start": [
+        159.6482,
+        115.0
+      ],
+      "end": [
+        175.2261,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w18",
+      "name": "Salón mediano norte · ventana 2",
+      "start": [
+        175.2261,
+        115.0
+      ],
+      "end": [
+        194.3216,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w19",
+      "name": "Salón mediano norte · muro",
+      "start": [
+        194.3216,
+        115.0
+      ],
+      "end": [
+        204.8744,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w20",
+      "name": "Salón mediano norte · ventana 3",
+      "start": [
+        204.8744,
+        115.0
+      ],
+      "end": [
+        223.9698,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w21",
+      "name": "Salón mediano norte · muro",
+      "start": [
+        223.9698,
+        115.0
+      ],
+      "end": [
+        230.0,
+        115.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w22",
+      "name": "Salón mediano sur · muro",
+      "start": [
+        130.0,
+        47.1608
+      ],
+      "end": [
+        140.5528,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w23",
+      "name": "Salón mediano sur · ventana 1",
+      "start": [
+        140.5528,
+        47.1608
+      ],
+      "end": [
+        159.6482,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w24",
+      "name": "Salón mediano sur · muro",
+      "start": [
+        159.6482,
+        47.1608
+      ],
+      "end": [
+        175.2261,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w25",
+      "name": "Salón mediano sur · ventana 2",
+      "start": [
+        175.2261,
+        47.1608
+      ],
+      "end": [
+        194.3216,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w26",
+      "name": "Salón mediano sur · muro",
+      "start": [
+        194.3216,
+        47.1608
+      ],
+      "end": [
+        204.8744,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w27",
+      "name": "Salón mediano sur · ventana 3",
+      "start": [
+        204.8744,
+        47.1608
+      ],
+      "end": [
+        223.9698,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w28",
+      "name": "Salón mediano sur · muro",
+      "start": [
+        223.9698,
+        47.1608
+      ],
+      "end": [
+        230.0,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto",
+      "thickness_m": 0.15
+    },
+    {
+      "id": "w29",
+      "name": "Terraza · vidrio 1",
+      "start": [
+        22.9648,
+        47.1608
+      ],
+      "end": [
+        22.9648,
+        28.5678
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    },
+    {
+      "id": "w30",
+      "name": "Terraza · vidrio 2",
+      "start": [
+        22.9648,
+        28.5678
+      ],
+      "end": [
+        48.0905,
+        3.4422
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    },
+    {
+      "id": "w31",
+      "name": "Terraza · vidrio 3",
+      "start": [
+        48.0905,
+        3.4422
+      ],
+      "end": [
+        84.2714,
+        3.4422
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    },
+    {
+      "id": "w32",
+      "name": "Terraza · vidrio 4",
+      "start": [
+        84.2714,
+        3.4422
+      ],
+      "end": [
+        109.8995,
+        29.0704
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    },
+    {
+      "id": "w33",
+      "name": "Terraza · vidrio 5",
+      "start": [
+        109.8995,
+        29.0704
+      ],
+      "end": [
+        109.8995,
+        47.1608
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio",
+      "thickness_m": 0.003
+    }
+  ]
+}

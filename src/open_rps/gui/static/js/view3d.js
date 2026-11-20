@@ -173,6 +173,7 @@ export class View3D {
     }
     const r = size / 160;
     p.transmitters.forEach((tx, slot) => {
+      if (v.hideTx && !this.store.isSelected("tx", tx.tx_id)) return;
       const color = new THREE.Color(txColor(slot));
       const mast = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(tx.x, tx.y, 0), new THREE.Vector3(tx.x, tx.y, tx.z)]),
