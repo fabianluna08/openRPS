@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from open_rps.measurements import Measurement, calibrate, predict_points
 from open_rps.project import (ANTENNA_PRESETS, Area, Project, ProjectError, Settings, TransmitterSpec, Wall,
-                              default_materials, example_restaurant, mw_to_dbm, restaurant_floor_plan,
+                              default_materials, example_antennas, example_restaurant, mw_to_dbm, restaurant_floor_plan,
                               restaurant_px_to_m, slab_loss_db)
 
 STATIC = os.path.join(os.path.dirname(__file__), "..", "src", "open_rps", "gui", "static", "js")
@@ -274,6 +274,29 @@ class RestaurantTests(unittest.TestCase):
         self.assertGreater(np.mean(best[large] >= -75), 0.95)
         self.assertEqual(np.bincount(r.best_server_indices()[large].ravel()).argmax(), 0)
         self.assertAlmostEqual(r.summary()["wifi"]["mean_contention"], 0.0)      # channels 1, 6 and 11
+
+
+class AntennaPracticeTests(unittest.TestCase):
+    def test_example(self):
+        p = example_antennas()
+        self.assertEqual([t.tx_power_dbm for t in p.transmitters], [-16.0] * 4)
+        self.assertEqual([t.antenna_gain_dbi for t in p.transmitters], [0.0, 8.0, 20.0, 16.0])
+        self.assertTrue(all(t.azimuth_deg == 90.0 for t in p.transmitters))
+        path = os.path.join(os.path.dirname(__file__), "..", "examples", "tipos_de_antenas.orps.json")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), p.to_dict())
+
+    def test_patterns_point_to_plus_y(self):
+        p = example_antennas()
+        r = p.run()
+        for k, tx in enumerate(p.transmitters[1:], start=1):
+            ahead = p.probe((tx.x, tx.y + 20.0)).to_dict()["transmitters"][k]["rx_power_dbm"]
+            behind = p.probe((tx.x, tx.y - 15.0)).to_dict()["transmitters"][k]["rx_power_dbm"]
+            self.assertGreater(ahead, behind + 10.0, tx.name)
+        # the cell of the patch at -76 dBm reaches roughly 25-30 m in front of it
+        col = int(np.argmin(abs(r.x_coords - p.transmitters[1].x)))
+        front = r.y_coords[(r.rx_power_dbm[1][:, col] >= -76.0) & (r.y_coords > p.transmitters[1].y)]
+        self.assertTrue(20.0 < front.max() - p.transmitters[1].y < 35.0, front.max())
 
 
 if __name__ == "__main__":

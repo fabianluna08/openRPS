@@ -74,7 +74,7 @@ class ServerTests(unittest.TestCase):
         info = json.loads(self.get("/api/info")[2])
         self.assertIn("raytracing", info["modes"])
         self.assertTrue(any(m["id"] == "concreto" for m in info["materials"]))
-        self.assertEqual({e["id"] for e in info["examples"]}, {"urbano", "oficina", "wifi", "restaurante"})
+        self.assertEqual({e["id"] for e in info["examples"]}, {"urbano", "oficina", "wifi", "restaurante", "antenas"})
         project = json.loads(self.get("/api/project")[2])
         self.assertEqual(project["project"]["format"], "openrps-project")
         self.assertIsNone(project["path"])

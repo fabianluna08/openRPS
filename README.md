@@ -498,6 +498,10 @@ La suma incluye la pérdida de cada muro que cruza la línea recta del AP al pun
 | Yagi 13 dBi | sector 3GPP | 40° × 36° |
 | Sector 6 dBi | sector 3GPP | 120° × 60° |
 | Panel 8 dBi | sector 3GPP | 65° × 65° |
+| Parche 8 dBi | sector 3GPP | 70° × 65° |
+| Bocina (horn) 20 dBi | sector 3GPP | 17° × 17° |
+| Sector 16 dBi | sector 3GPP | 65° × 11° |
+| Isotrópica 0 dBi | isotrópico | — |
 
 Los haces dan esa ganancia con un ~70 % de eficiencia (G ≈ 0.7 · 41253 / (haz_h · haz_v)). Son modelos genéricos, no el diagrama medido de un producto. La orientación es el azimut: 0° apunta a la derecha (+x), 90° hacia arriba (+y) y 180° a la izquierda.
 
@@ -552,7 +556,8 @@ open_rps/
 │   ├── plano_oficina.png           # Plano de esa oficina, para practicar el plano de fondo (1.7.0)
 │   ├── mediciones_oficina.csv      # 56 mediciones sintéticas de esa oficina, para practicar la calibración
 │   ├── proyecto_wifi.orps.json     # Esa oficina con cuatro AP en canales que se enciman (1.8.0)
-│   └── restaurante_polanco.orps.json  # El restaurante de la práctica de Acrylic Wi-Fi (1.9.0, sin el plano)
+│   ├── restaurante_polanco.orps.json  # El restaurante de la práctica de Acrylic Wi-Fi (1.9.0, sin el plano)
+│   └── tipos_de_antenas.orps.json     # La práctica de tipos de antenas de RPS (1.9.0)
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -840,6 +845,25 @@ Detalles que conviene conocer:
 * **Ventanas del salón mediano:** la práctica deja de concreto sus seis ventanas. En el ejemplo son muros aparte, para cambiarlos a vidrio con un clic.
 * **802.11 b/g/n:** OpenRPS modela 802.11n, ac y ax. Un AP b/g/n conecta a los clientes actuales en 802.11n, así que se elige ese estándar. El mapa de potencia no depende del estándar.
 
+### J. Práctica: tipos de antenas como en RPS (nuevo en 1.9.0)
+
+La práctica «Tipos de antenas» de RPS compara cuatro antenas: isotrópica, parche, bocina (*horn*) de 20 dB y sector de 16 dB. Las cuatro van a −16 dBm y 2.4 GHz, sobre un campo de receptores a 0.5 m de altura cada 1 m, con un muro de 0.2 m de alto de (−50, −50) a (50, 50). *Archivo → Ejemplos → Tipos de antenas (práctica RPS)* la abre lista (`examples/tipos_de_antenas.orps.json`).
+
+| Paso de la práctica (RPS) | En OpenRPS |
+|---|---|
+| 1–7. *Import Antenna*: Horn 20 dB, Patch, Sector 16 dB | *Antena → Modelo*: Bocina (horn) 20 dBi, Parche 8 dBi, Sector 16 dBi, Isotrópica 0 dBi |
+| 8–10. Muro 3D de 0.2 m de (−50, −50) a (50, 50) | Herramienta *Muro* (W) y, en su panel, inicio (−50, −50), fin (50, 50) y altura superior 0.2 m |
+| 14–19. Campo de receptores de (−57, −51) a (66, 53), 1 m, a 0.5 m | *Área de predicción*: X de −57 a 66, Y de −51 a 53, resolución 1 m y altura del Rx 0.5 m |
+| 20–28. Transmisores a −16 dBm, 2.4 GHz, Phi = 0 | Herramienta *Transmisor* (T): isotrópico en (−34, 27), parche en (−36, −28), horn en (−1, −28) y sectorial en (32, −28). Potencia −16 dBm, altura 2 m, azimut 90° (apuntan hacia +y, como en el resultado de la práctica) |
+| 28. Resultado: los cuatro patrones | Ejecuta (F5). *Ver → Estilo del mapa*: paleta de mapa de calor, sin bandas |
+| 29. Video: potencia en el borde de la célula del parche a −76 dB, con el mouse | En *Tx* elige «Parche» para ver solo su cobertura y activa *No pintar por debajo de −76 dBm*. El borde de lo pintado es la célula; al pasar el mouse, la barra de abajo dice la potencia (≈ −76 dBm). Graba con Win+Alt+R |
+
+Detalles que conviene conocer:
+
+* **Los diagramas son genéricos.** Las antenas son los modelos de *Antena → Modelo*: el diagrama parabólico de 3GPP con la ganancia y los haces de la tabla de la sección 1.J (parche 70° × 65°, bocina 17° × 17°, sector 65° × 11°). No son los archivos .cfg de RPS, así que los patrones se parecen pero no son iguales. No tienen lóbulos laterales: los anillos que RPS dibuja junto al sector no aparecen.
+* **Altura de los transmisores.** RPS pide *Antenna Height* 1 m y *Altitude* 2 m. En OpenRPS la altura es una sola, y se usó 2 m.
+* **Archivo de entrega.** El archivo `Tipos_antenas.RPS` solo lo genera RPS. OpenRPS guarda `.orps.json`.
+
 ---
 
 ## 5. Tests
@@ -954,9 +978,9 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 * **Novedades** (secciones 1.J y 4.I):
   * **Espesor de los muros** (`Wall.thickness_m`): pérdida de una losa del material con ese grosor (`slab_loss_db`, ITU-R P.2040), en el motor, la interfaz y el receptor de prueba.
   * **Modelo de interiores multimuro** (`Settings.mode = "multiwall"`): log-distancia más los muros que cruza la línea directa (`run_empirical_simulation(wall_losses=True)`), con la lista de muros cruzados en el receptor de prueba y calibración de materiales y exponente.
-  * **Modelos de antena** (`ANTENNA_PRESETS`: omnidireccional 2.2 y 5 dBi, Yagi 13 dBi, sector 6 dBi, panel 8 dBi) y **potencia en mW** (`mw_to_dbm`).
+  * **Modelos de antena** (`ANTENNA_PRESETS`: isotrópica, omnidireccional 2.2 y 5 dBi, Yagi 13 dBi, sector 6 y 16 dBi, panel y parche 8 dBi, bocina 20 dBi) y **potencia en mW** (`mw_to_dbm`).
   * **Estilo del mapa:** paleta de mapa de calor Wi-Fi, bandas sólidas, valor bajo el que no se pinta, «solo dentro de los muros», ocultar los AP y el botón *Estilo Acrylic*.
-  * **Ejemplo** `examples/restaurante_polanco.orps.json` de la práctica de Acrylic Wi-Fi, y guía de la práctica (sección 4.I).
+  * **Ejemplos** `examples/restaurante_polanco.orps.json` (práctica de Acrylic Wi-Fi) y `examples/tipos_de_antenas.orps.json` (práctica de tipos de antenas de RPS), con sus guías (secciones 4.I y 4.J).
 * **Cambios que conviene conocer:**
   * El formato de proyecto pasa a la versión 4 solo cuando algún muro tiene espesor. Sin espesor, el archivo es igual al de 1.8.0.
   * Los muros nuevos heredan también el espesor del último muro.
