@@ -1264,6 +1264,7 @@ def example_wifi() -> Project:
 # gain with ~70 % efficiency (G ~ 0.7 * 41253 / (az * el)); they are generic models,
 # not the measured pattern of a product.
 ANTENNA_PRESETS = {
+    "iso_0": {"label": "Isotrópica 0 dBi", "pattern": "isotropic", "antenna_gain_dbi": 0.0},
     "omni_2_2": {"label": "Omnidireccional 2.2 dBi", "pattern": "isotropic", "antenna_gain_dbi": 2.2},
     "omni_5": {"label": "Omnidireccional 5 dBi", "pattern": "isotropic", "antenna_gain_dbi": 5.0},
     "yagi_13": {"label": "Yagi 13 dBi (40° × 36°)", "pattern": "sector", "antenna_gain_dbi": 13.0,
@@ -1272,6 +1273,12 @@ ANTENNA_PRESETS = {
                  "beamwidth_az_deg": 120.0, "beamwidth_el_deg": 60.0},
     "panel_8": {"label": "Panel 8 dBi (65° × 65°)", "pattern": "sector", "antenna_gain_dbi": 8.0,
                 "beamwidth_az_deg": 65.0, "beamwidth_el_deg": 65.0},
+    "patch_8": {"label": "Parche 8 dBi (70° × 65°)", "pattern": "sector", "antenna_gain_dbi": 8.0,
+                "beamwidth_az_deg": 70.0, "beamwidth_el_deg": 65.0},
+    "horn_20": {"label": "Bocina (horn) 20 dBi (17° × 17°)", "pattern": "sector", "antenna_gain_dbi": 20.0,
+                "beamwidth_az_deg": 17.0, "beamwidth_el_deg": 17.0},
+    "sector_16": {"label": "Sector 16 dBi (65° × 11°)", "pattern": "sector", "antenna_gain_dbi": 16.0,
+                  "beamwidth_az_deg": 65.0, "beamwidth_el_deg": 11.0},
 }
 
 
@@ -1392,4 +1399,30 @@ def example_restaurant() -> Project:
     return project.validate()
 
 
-EXAMPLES = {"urbano": example_urban, "oficina": example_office, "wifi": example_wifi, "restaurante": example_restaurant}
+def example_antennas() -> Project:
+    """
+    The RPS practice "Tipos de antenas": four transmitters at -16 dBm and 2.4 GHz with an
+    isotropic source, a patch, a 20 dB horn and a 16 dB sector, all pointing to +y, over
+    a field of receivers 0.5 m high with a 1 m grid and a low diagonal wall (new in 1.9.0).
+    The antennas are the generic presets of ANTENNA_PRESETS, not the .cfg files of RPS.
+    """
+    def tx(tx_id, name, x, y, preset):
+        fields_ = {k: v for k, v in ANTENNA_PRESETS[preset].items() if k != "label"}
+        return TransmitterSpec(tx_id, name, x, y, 2.0, -16.0, 2.4e9, azimuth_deg=90.0, **fields_)
+
+    project = Project(
+        name="Tipos de antenas (práctica RPS)",
+        description=("Cuatro transmisores a −16 dBm y 2.4 GHz (isotrópica, parche, bocina de 20 dBi y sector de "
+                     "16 dBi) apuntando hacia +y, receptores a 0.5 m cada 1 m y un muro de 0.2 m de alto de "
+                     "(−50, −50) a (50, 50). Pasa el mouse por el borde de la cobertura del parche (−76 dBm)."),
+        area=Area(-57.0, 66.0, -51.0, 53.0, 1.0, 0.5),
+        settings=Settings(mode="raytracing", sinr=False),
+        transmitters=[tx(0, "Isotrópico", -34.0, 27.0, "iso_0"), tx(1, "Parche", -36.0, -28.0, "patch_8"),
+                      tx(2, "Horn", -1.0, -28.0, "horn_20"), tx(3, "Sectorial", 32.0, -28.0, "sector_16")],
+        walls=[Wall("w1", "Muro 3D (0.2 m)", [-50.0, -50.0], [50.0, 50.0], 0.0, 0.2, "concreto")],
+    )
+    return project.validate()
+
+
+EXAMPLES = {"urbano": example_urban, "oficina": example_office, "wifi": example_wifi, "restaurante": example_restaurant,
+            "antenas": example_antennas}

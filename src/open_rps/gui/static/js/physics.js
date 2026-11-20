@@ -7,11 +7,15 @@ const C0 = 299792458;
 
 // Modelos de antena: diagrama, ganancia y haces a −3 dB (igual que open_rps.project.ANTENNA_PRESETS)
 export const ANTENNA_PRESETS = {
+  iso_0: { label: "Isotrópica 0 dBi", pattern: "isotropic", antenna_gain_dbi: 0.0 },
   omni_2_2: { label: "Omnidireccional 2.2 dBi", pattern: "isotropic", antenna_gain_dbi: 2.2 },
   omni_5: { label: "Omnidireccional 5 dBi", pattern: "isotropic", antenna_gain_dbi: 5.0 },
   yagi_13: { label: "Yagi 13 dBi (40° × 36°)", pattern: "sector", antenna_gain_dbi: 13.0, beamwidth_az_deg: 40.0, beamwidth_el_deg: 36.0 },
   sector_6: { label: "Sector 6 dBi (120° × 60°)", pattern: "sector", antenna_gain_dbi: 6.0, beamwidth_az_deg: 120.0, beamwidth_el_deg: 60.0 },
   panel_8: { label: "Panel 8 dBi (65° × 65°)", pattern: "sector", antenna_gain_dbi: 8.0, beamwidth_az_deg: 65.0, beamwidth_el_deg: 65.0 },
+  patch_8: { label: "Parche 8 dBi (70° × 65°)", pattern: "sector", antenna_gain_dbi: 8.0, beamwidth_az_deg: 70.0, beamwidth_el_deg: 65.0 },
+  horn_20: { label: "Bocina (horn) 20 dBi (17° × 17°)", pattern: "sector", antenna_gain_dbi: 20.0, beamwidth_az_deg: 17.0, beamwidth_el_deg: 17.0 },
+  sector_16: { label: "Sector 16 dBi (65° × 11°)", pattern: "sector", antenna_gain_dbi: 16.0, beamwidth_az_deg: 65.0, beamwidth_el_deg: 11.0 },
 };
 
 // Modelo de antena de un transmisor, o "custom" si sus valores no son los de ninguno
