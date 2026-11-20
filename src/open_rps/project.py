@@ -36,13 +36,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .measurements import Measurement, MeasurementError
+from .simulation import thermal_noise_dbm
+from .wifi import (STANDARDS as WIFI_STANDARDS, ChannelSpec, WifiError, bands_overlap, best_mcs,
+                   channel_center_hz, effective_standard, max_streams, overlap_factor)
 from .models import Cost231Hata, FreeSpacePathLoss, LogDistancePathLoss, OkumuraHata, TwoRayGroundReflection
 from .multipath import ChannelImpulseResponse
 from .raytracer import DiffractionEdge, PlanarReflector, Transmitter, _in_polygon
 from .simulation import DEFAULT_MIN_DISTANCE_M, PropagationSimulator, SimulationResult
 
 PROJECT_FORMAT = "openrps-project"
-PROJECT_VERSION = 2              # 2: floor plan and measurements (1.7.0); without them a file is still version 1
+PROJECT_VERSION = 3              # 2: floor plan and measurements (1.7.0); 3: Wi-Fi channels (1.8.0)
+WIFI_TX_KEYS = ("wifi_band", "wifi_channel", "wifi_width_mhz", "wifi_streams")
+WIFI_SETTINGS_DEFAULTS = {"wifi_standard": "ax", "wifi_guard_interval_us": 0.8, "wifi_client_streams": 2,
+                          "wifi_cca_dbm": -82.0}
 FLOOR_PLAN_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 MAX_FLOOR_PLAN_CHARS = 30_000_000   # the image as a data URL (about 22 MB of image)
 MAX_MEASUREMENTS = 100_000
@@ -436,6 +442,11 @@ class TransmitterSpec:
     beamwidth_el_deg: float = 65.0
     downtilt_deg: float = 0.0
     enabled: bool = True
+    # 1.8.0: Wi-Fi channel.  With wifi_channel the frequency is the centre of the channel
+    wifi_band: Optional[str] = None       # "2.4", "5" or "6" (GHz)
+    wifi_channel: Optional[int] = None    # primary 20 MHz channel
+    wifi_width_mhz: int = 20              # 20, 40, 80 or 160 (2.4 GHz: 20)
+    wifi_streams: int = 2                 # spatial streams of the AP
 
     def validate(self, what: str = "transmisor"):
         what = f"{what} {self.name or self.tx_id!r}"
@@ -449,6 +460,22 @@ class TransmitterSpec:
             setattr(self, name, _number(getattr(self, name), f"{what}.{name}", 0.0, strict=True))
         _choice(self.pattern, ("isotropic", "sector"), f"{what}.pattern")
         self.enabled = bool(self.enabled)
+        if isinstance(self.wifi_streams, bool) or not isinstance(self.wifi_streams, int) \
+                or not 1 <= self.wifi_streams <= 8:
+            raise ProjectError(f"{what}.wifi_streams: debe ser un entero de 1 a 8")
+        if self.wifi_channel is None:
+            self.wifi_band = None
+            return
+        band = {2.4: "2.4", 5: "5", 6: "6"}.get(self.wifi_band, self.wifi_band) \
+            if isinstance(self.wifi_band, (int, float)) and not isinstance(self.wifi_band, bool) else self.wifi_band
+        if isinstance(self.wifi_channel, bool) or not isinstance(self.wifi_channel, int):
+            raise ProjectError(f"{what}.wifi_channel: debe ser un entero o null")
+        try:
+            self.frequency_hz = channel_center_hz(str(band), self.wifi_channel, self.wifi_width_mhz)
+        except WifiError as error:
+            raise ProjectError(f"{what}: {error}") from None
+        self.wifi_band = str(band)
+        self.wifi_width_mhz = int(self.wifi_width_mhz)
 
     def to_transmitter(self) -> Transmitter:
         return Transmitter(tx_id=self.tx_id, x=self.x, y=self.y, z=self.z, tx_power_dbm=self.tx_power_dbm,
@@ -500,6 +527,11 @@ class Settings:
     sinr: bool = True
     noise_figure_db: float = 7.0
     bandwidth_hz: float = 20e6
+    # 1.8.0: Wi-Fi (only used by transmitters with a Wi-Fi channel)
+    wifi_standard: str = "ax"             # "n", "ac" or "ax": generation of the APs and clients
+    wifi_guard_interval_us: float = 0.8
+    wifi_client_streams: int = 2          # spatial streams of the client device
+    wifi_cca_dbm: float = -82.0           # level above which another AP on the channel takes air time
     ground_eps_r: float = 15.0
     ground_sigma: float = 0.005
     reference_frequency_hz: Optional[float] = None
@@ -527,6 +559,16 @@ class Settings:
         self.log_distance_d0_m = _number(self.log_distance_d0_m, "settings.log_distance_d0_m", 0.0, True)
         self.noise_figure_db = _number(self.noise_figure_db, "settings.noise_figure_db")
         self.bandwidth_hz = _number(self.bandwidth_hz, "settings.bandwidth_hz", 0.0, True)
+        _choice(self.wifi_standard, tuple(WIFI_STANDARDS), "settings.wifi_standard")
+        self.wifi_guard_interval_us = _number(self.wifi_guard_interval_us, "settings.wifi_guard_interval_us", 0.0, True)
+        allowed = WIFI_STANDARDS[self.wifi_standard][4]
+        if not any(abs(self.wifi_guard_interval_us - g) < 1e-9 for g in allowed):
+            raise ProjectError(f"settings.wifi_guard_interval_us: con {WIFI_STANDARDS[self.wifi_standard][0]} "
+                               f"debe ser {' o '.join(f'{g:g}' for g in allowed)} µs")
+        if isinstance(self.wifi_client_streams, bool) or not isinstance(self.wifi_client_streams, int) \
+                or not 1 <= self.wifi_client_streams <= 8:
+            raise ProjectError("settings.wifi_client_streams: debe ser un entero de 1 a 8")
+        self.wifi_cca_dbm = _number(self.wifi_cca_dbm, "settings.wifi_cca_dbm")
         self.ground_eps_r = _number(self.ground_eps_r, "settings.ground_eps_r", 1.0)
         self.ground_sigma = _number(self.ground_sigma, "settings.ground_sigma", 0.0)
         if self.reference_frequency_hz is not None:
@@ -594,10 +636,13 @@ class ProbeResult:
     mode: str
     per_transmitter: List[Dict[str, Any]]
     reflector_names: List[str]
+    wifi: Optional[Dict[str, Any]] = None      # 1.8.0: serving AP, SINR, MCS, rate and interferers
 
     def to_dict(self) -> Dict[str, Any]:
-        return _json_safe({"point": list(self.point), "mode": self.mode,
-                           "transmitters": self.per_transmitter})
+        data = {"point": list(self.point), "mode": self.mode, "transmitters": self.per_transmitter}
+        if self.wifi is not None:
+            data["wifi"] = self.wifi
+        return _json_safe(data)
 
 
 def _json_safe(value):
@@ -673,15 +718,25 @@ class Project:
                 "transmitters": [asdict(t) for t in self.transmitters],
                 "buildings": [asdict(b) for b in self.buildings],
                 "walls": [asdict(w) for w in self.walls]}
-        # Written only when present, so that a project without them stays readable by 1.4.0 - 1.6.0
+        # Written only when present, so that a project without them stays readable by older versions:
+        # without Wi-Fi by 1.7.0, and without floor plan nor measurements by 1.4.0 - 1.6.0
+        wifi = any(t.wifi_channel is not None for t in self.transmitters)
+        for t in data["transmitters"]:
+            if t["wifi_channel"] is None:
+                for key in WIFI_TX_KEYS:
+                    t.pop(key)
+        if not wifi and all(data["settings"][k] == v for k, v in WIFI_SETTINGS_DEFAULTS.items()):
+            for key in WIFI_SETTINGS_DEFAULTS:
+                data["settings"].pop(key)
+        data["version"] = 1
         if self.floor_plan is not None or self.measurements:
-            data["version"] = PROJECT_VERSION
+            data["version"] = 2
             if self.floor_plan is not None:
                 data["floor_plan"] = asdict(self.floor_plan)
             if self.measurements:
                 data["measurements"] = [asdict(m) for m in self.measurements]
-        else:
-            data["version"] = 1
+        if wifi or "wifi_standard" in data["settings"]:
+            data["version"] = 3
         return copy.deepcopy(data)
 
     @classmethod
@@ -714,6 +769,16 @@ class Project:
             building.validate(materials)
         for wall in self.walls:
             wall.validate(materials)
+        for tx in self.transmitters:
+            if tx.wifi_channel is None:
+                continue
+            name = f"transmisor {tx.name or tx.tx_id!r}"
+            if tx.wifi_band == "6" and self.settings.wifi_standard != "ax":
+                raise ProjectError(f"{name}: la banda de 6 GHz requiere Wi-Fi 6E (estándar ax)")
+            standard = effective_standard(self.settings.wifi_standard, tx.wifi_band)
+            if tx.wifi_width_mhz not in WIFI_STANDARDS[standard][2]:
+                raise ProjectError(f"{name}: {WIFI_STANDARDS[standard][0]} no admite canales de "
+                                   f"{tx.wifi_width_mhz} MHz")
         if self.floor_plan is not None:
             self.floor_plan.validate()
         if len(self.measurements) > MAX_MEASUREMENTS:
@@ -818,8 +883,40 @@ class Project:
         else:
             result = sim.run_empirical_simulation(model, *area, **common)
         if s.sinr and sim.transmitters:
+            wifi = self.wifi_setup(sim)
+            if wifi is not None:
+                result.tx_channels = wifi["channels"]
             result.compute_sinr(noise_figure_db=s.noise_figure_db, bandwidth_hz=s.bandwidth_hz)
+            if wifi is not None:
+                result.compute_wifi(wifi["standards"], wifi["streams"], s.wifi_guard_interval_us, s.wifi_cca_dbm)
         return result
+
+    def wifi_setup(self, sim: Optional[PropagationSimulator] = None) -> Optional[Dict[str, Any]]:
+        """
+        Channel, standard and spatial streams of each transmitter of the simulator
+        (order of ``sim.transmitters``), or None when none has a Wi-Fi channel.  A
+        transmitter without Wi-Fi channel occupies ``settings.bandwidth_hz`` around its
+        frequency with a flat spectrum.
+        """
+        transmitters = sim.transmitters if sim is not None else [t for t in self.transmitters if t.enabled]
+        by_id = {t.tx_id: t for t in self.transmitters}
+        s = self.settings
+        channels, standards, streams = [], [], []
+        for tx in transmitters:
+            spec = by_id[tx.tx_id]
+            if spec.wifi_channel is None:
+                channels.append(ChannelSpec(spec.frequency_hz, s.bandwidth_hz, wifi=False))
+                standards.append(None)
+                streams.append(0)
+            else:
+                standard = effective_standard(s.wifi_standard, spec.wifi_band)
+                channels.append(ChannelSpec(channel_center_hz(spec.wifi_band, spec.wifi_channel, spec.wifi_width_mhz),
+                                            spec.wifi_width_mhz * 1e6))
+                standards.append(standard)
+                streams.append(min(spec.wifi_streams, s.wifi_client_streams, max_streams(standard)))
+        if not any(standards):
+            return None
+        return {"channels": channels, "standards": standards, "streams": streams}
 
     def run_with_report(self) -> Tuple[SimulationResult, Dict[str, Any]]:
         """``run()`` plus a report: elapsed time, warnings of the models, counts of the scene."""
@@ -878,7 +975,53 @@ class Project:
                 entry.update(_empirical_point(model, tx, x, y, z))
                 entry["rays"] = []
             entries.append(entry)
-        return ProbeResult(point=(x, y, z), mode=self.settings.mode, per_transmitter=entries, reflector_names=names)
+        wifi = self.wifi_setup(sim)
+        return ProbeResult(point=(x, y, z), mode=self.settings.mode, per_transmitter=entries, reflector_names=names,
+                           wifi=None if wifi is None or not self.settings.sinr else _probe_wifi(self, sim, entries, wifi))
+
+
+def _probe_wifi(project, sim, entries, wifi) -> Dict[str, Any]:
+    """
+    Wi-Fi at the probe point: the best server, the contribution of every other
+    transmitter (its power times the fraction that enters the serving channel), the
+    noise of that channel, and the SINR, MCS and rate that result (the same
+    computation as the maps, without shadow fading).
+    """
+    s = project.settings
+    power = np.array([float("nan") if e["too_close"] else e["rx_power_dbm"] for e in entries], dtype=float)
+    channels, standards, streams = wifi["channels"], wifi["standards"], wifi["streams"]
+    finite = np.where(np.isnan(power), -np.inf, power)
+    if not len(power) or not np.isfinite(finite).any():
+        return {"serving_tx_id": None}
+    k = int(np.argmax(finite))
+    serving = channels[k]
+    noise_dbm = thermal_noise_dbm(serving.width_hz, s.noise_figure_db)
+    interferers, total_mw, unknown = [], 10.0 ** (noise_dbm / 10.0), False
+    for j, tx in enumerate(sim.transmitters):
+        if j == k:
+            continue
+        factor = overlap_factor(channels[j], serving)
+        if factor <= 0:
+            continue
+        if math.isnan(power[j]):
+            unknown = True
+            continue
+        contribution = power[j] + 10.0 * math.log10(factor)
+        total_mw += 10.0 ** (contribution / 10.0)
+        interferers.append({"tx_id": tx.tx_id, "rx_power_dbm": power[j], "overlap_db": 10.0 * math.log10(factor),
+                            "interference_dbm": contribution, "same_channel": bands_overlap(channels[j], serving)})
+    interferers.sort(key=lambda d: -d["interference_dbm"])
+    i_plus_n = 10.0 * math.log10(total_mw)
+    sinr = float("nan") if unknown else power[k] - i_plus_n
+    out = {"serving_tx_id": sim.transmitters[k].tx_id, "rx_power_dbm": power[k], "noise_dbm": noise_dbm,
+           "interference_plus_noise_dbm": i_plus_n, "sinr_db": sinr, "interferers": interferers,
+           "contention": sum(1 for j, e in enumerate(entries) if j != k and bands_overlap(channels[j], serving)
+                             and power[j] >= s.wifi_cca_dbm)}
+    if standards[k] is not None:
+        mcs, rate = best_mcs(sinr, standards[k], int(round(serving.width_hz / 1e6)), streams[k], s.wifi_guard_interval_us)
+        out.update({"standard": standards[k], "width_mhz": int(round(serving.width_hz / 1e6)), "streams": streams[k],
+                    "mcs": float(mcs), "rate_mbps": float(rate)})
+    return out
 
 
 def _cir_metrics(cir: ChannelImpulseResponse, tx: Transmitter, coherent: bool) -> Dict[str, Any]:
@@ -1020,4 +1163,21 @@ def example_office() -> Project:
     )
 
 
-EXAMPLES = {"urbano": example_urban, "oficina": example_office}
+def example_wifi() -> Project:
+    """
+    The office of ``example_office`` with four 2.4 GHz access points on channels 1, 3, 6
+    and 9: a common mistake (channels that overlap) to try the Wi-Fi maps and the
+    channel suggestion (new in 1.8.0).
+    """
+    project = example_office()
+    project.name = "Oficina Wi-Fi (2.4 GHz)"
+    project.description = ("Cuatro AP en 2.4 GHz en los canales 1, 3, 6 y 9, que se enciman. "
+                           "Mira los mapas de Wi-Fi y prueba Simulación → Sugerir canales Wi-Fi.")
+    project.transmitters = [
+        TransmitterSpec(k, name, x, y, 2.8, 17.0, 2.412e9, 3.0, wifi_band="2.4", wifi_channel=channel, wifi_streams=2)
+        for k, (name, x, y, channel) in enumerate([("AP sala de juntas", 6.5, 16.0, 1), ("AP oficina 2", 15.0, 4.0, 3),
+                                                   ("AP oficina 6", 29.5, 16.0, 6), ("AP oficina 4", 35.0, 4.0, 9)])]
+    return project.validate()
+
+
+EXAMPLES = {"urbano": example_urban, "oficina": example_office, "wifi": example_wifi}

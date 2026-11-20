@@ -15,6 +15,13 @@ La versión 1.7.0 conecta la simulación con la realidad:
 * **Mediciones:** se importan desde un CSV o se anotan en el mapa con lo que marca el teléfono.
 * **Calibración:** se ve cuánto se aleja la predicción de lo medido, y OpenRPS ajusta las pérdidas de los materiales y la potencia de las antenas para que coincidan (sección 1.H).
 
+La versión 1.8.0 añade la **capa Wi-Fi** (sección 1.I):
+
+* **Canales:** cada AP tiene banda (2.4, 5 o 6 GHz), ancho y canal, como en un analizador Wi-Fi.
+* **Interferencia entre canales vecinos:** se calcula con la máscara espectral del estándar, así que el canal 3 sí molesta al 1 y al 6.
+* **Mapas de Wi-Fi:** MCS y tasa de datos PHY (802.11n, ac y ax) en cada punto, y cuántos AP comparten el canal.
+* **Sugerencia de canales:** OpenRPS propone el plan de canales que da más tasa en el área.
+
 ---
 
 ## 1. Arquitectura y Modelos Físicos Implementados
@@ -348,6 +355,97 @@ El vidrio queda igual: ningún punto medido depende de él.
 * **Los valores calibrados son los que mejor explican tus mediciones con este modelo, no la verdad física.** Si el escenario no tiene muebles, gente o pisos, sus pérdidas acaban dentro de las paredes. Si faltan muros en el dibujo, otros los compensan.
 * **Con pocos puntos el ajuste se acomoda al ruido.** Mide en zonas donde cada material importe: detrás de las paredes, no solo en la sala del AP. Revisa las incertidumbres y comprueba el resultado con mediciones que no usaste para calibrar.
 
+### I. Capa Wi-Fi: canales, interferencia entre canales vecinos y tasa de datos (nuevo en 1.8.0)
+
+Hasta 1.7.0 el SINR solo contaba como interferencia a los transmisores con exactamente la misma frecuencia. En Wi-Fi eso no basta. En 2.4 GHz los canales están separados 5 MHz pero cada uno ocupa 20, así que el canal 3 pisa al 1 y al 6. Además, al usuario le importa la tasa de datos, no el SINR. Esta capa resuelve las dos cosas.
+
+**Canales.** Cada transmisor puede tener banda, ancho y canal (`TransmitterSpec.wifi_band`, `wifi_width_mhz` y `wifi_channel`, más `wifi_streams` para los flujos espaciales del AP). Su frecuencia se calcula sola a partir del canal: el centro está en 2407 + 5·n MHz en 2.4 GHz, en 5000 + 5·n en 5 GHz y en 5950 + 5·n en 6 GHz. Con 40, 80 o 160 MHz se elige el bloque por su primer canal: el bloque 36 de 80 MHz ocupa los canales 36–48 y está centrado en 5210 MHz.
+
+| Banda | Canales | Anchos | Notas |
+|---|---|---|---|
+| 2.4 GHz | 1–13 | 20 MHz | Solo 1, 6 y 11 no se enciman |
+| 5 GHz | 36–177 | 20, 40, 80, 160 MHz | Bloques del estándar; 52–144 son DFS y 169–177 (UNII-4) solo valen en algunos países |
+| 6 GHz | 1–233 | 20, 40, 80, 160 MHz | Requiere 802.11ax (Wi-Fi 6E) |
+
+Un transmisor sin canal Wi-Fi funciona como antes: frecuencia libre y el ancho de banda de la configuración.
+
+**Interferencia entre canales vecinos.** La potencia de cada interferente se multiplica por la fracción de su espectro que cae dentro del canal del receptor. Ese espectro es la máscara de transmisión OFDM del estándar:
+
+* 0 dBr hasta W/2 − 1 MHz, −20 dBr en W/2 + 1, −28 en W y −40 en 1.5·W, lineal en dB entre esos puntos.
+* La integral es exacta (por tramos exponenciales) y el receptor es un filtro ideal del ancho de su canal.
+* Un transmisor sin canal Wi-Fi se toma con espectro plano en su ancho de banda.
+
+| Interferente (20 MHz) sobre un receptor en el canal 1 de 2.4 GHz | Separación | Factor |
+|---|---|---|
+| Canal 1 | 0 MHz | −0.04 dB |
+| Canal 2 | 5 MHz | −1.2 dB |
+| Canal 3 | 10 MHz | −3.0 dB |
+| Canal 4 | 15 MHz | −6.3 dB |
+| Canal 5 | 20 MHz | −23.5 dB |
+| Canal 6 | 25 MHz | −30.0 dB |
+
+En 5 GHz, dos canales de 20 MHz contiguos (36 y 40) quedan a −23.5 dB. Un AP de 80 MHz (bloque 36) mete −6.1 dB en un receptor de 20 MHz en el canal 36, porque solo una cuarta parte de su potencia cae ahí.
+
+El SINR de cada punto es P_servidor / (Σ_j F_j·P_j + N), donde F_j es el factor de traslape de cada interferente y N es el ruido térmico en el ancho del canal del servidor (−174 dBm/Hz + 10·log10(W) + la figura de ruido). El servidor sigue siendo el AP con más potencia recibida.
+
+**MCS y tasa de datos.** En cada punto se elige la MCS más alta cuyo SINR mínimo se cumple. Los umbrales salen de la sensibilidad mínima del estándar (de −82 dBm para MCS 0 a −52 dBm para MCS 11, a 20 MHz) menos el ruido que el estándar supone: figura de ruido de 10 dB y 5 dB de margen de implementación ya incluidos.
+
+| MCS | Modulación y código | SINR mínimo |
+|---|---|---|
+| 0 | BPSK 1/2 | 9 dB |
+| 1 | QPSK 1/2 | 12 dB |
+| 2 | QPSK 3/4 | 14 dB |
+| 3 | 16-QAM 1/2 | 17 dB |
+| 4 | 16-QAM 3/4 | 21 dB |
+| 5 | 64-QAM 2/3 | 25 dB |
+| 6 | 64-QAM 3/4 | 26 dB |
+| 7 | 64-QAM 5/6 | 27 dB |
+| 8 | 256-QAM 3/4 | 32 dB |
+| 9 | 256-QAM 5/6 | 34 dB |
+| 10 | 1024-QAM 3/4 | 37 dB |
+| 11 | 1024-QAM 5/6 | 39 dB |
+
+La tasa PHY es subportadoras de datos × bits por subportadora × tasa de código × flujos / duración del símbolo. Los flujos son el mínimo entre los del AP, los del cliente (`Settings.wifi_client_streams`) y el máximo del estándar (`Settings.wifi_standard`):
+
+* **802.11n (Wi-Fi 4):** MCS 0–7, 20 o 40 MHz, hasta 4 flujos, guarda de 0.8 o 0.4 µs.
+* **802.11ac (Wi-Fi 5):** MCS 0–9, hasta 160 MHz y 8 flujos. Las combinaciones que el estándar no permite (20 MHz con MCS 9 y un flujo, por ejemplo) bajan a la MCS anterior. En 2.4 GHz trabaja como 802.11n.
+* **802.11ax (Wi-Fi 6/6E):** MCS 0–11, hasta 160 MHz y 8 flujos, símbolo de 12.8 µs y guarda de 0.8, 1.6 o 3.2 µs. Es el único permitido en 6 GHz.
+
+**Contención.** El mapa *AP que comparten el canal* cuenta, en cada punto, cuántos otros AP cuyo canal se traslapa con el del servidor llegan por arriba del umbral CCA (`Settings.wifi_cca_dbm`, −82 dBm por defecto). Esos AP no solo interfieren: con CSMA/CA se turnan el tiempo de aire, así que la tasa útil se reparte entre ellos (del orden de tasa / (1 + N) con todos ocupados). OpenRPS muestra N pero no hace esa división, porque depende del tráfico.
+
+**Sugerencia de canales** (`open_rps.channel_plan.plan_channels`; en la interfaz, *Simulación → Sugerir canales Wi-Fi*):
+
+* **Qué se busca.** Cada AP conserva su banda y su ancho. Se elige la asignación de canales que da la mayor eficiencia espectral media en el área, es decir, la media de log2(1 + SINR) con el SINR acotado al de la MCS más alta (más SINR ya no da más tasa).
+* **Cómo se busca.** Por descenso por coordenadas: se cambia un AP a la vez, probando todos sus canales. Se arranca del plan actual y de 8 planes aleatorios con semilla fija, así que el resultado es reproducible.
+* **Qué canales.** En 2.4 GHz solo 1, 6 y 11. En 5 GHz no se usan los DFS ni los UNII-4 salvo que se pida (`include_dfs`, `include_unii4`).
+* **Rapidez.** Usa las potencias recibidas de una simulación, sin volver a trazar rayos, sobre a lo más 20 000 píxeles. Cambiar de canal dentro de una banda mueve la frecuencia y con ella la pérdida, pero poco: 0.2 dB entre los canales 1 y 11 y 1 dB de punta a punta de la banda de 5 GHz. Al aplicar el plan se vuelve a simular.
+
+**Validación** (`tests/test_v1_8.py`):
+
+* Los centros y los bloques de canales coinciden con las tablas del estándar, y el factor de traslape coincide con una integración numérica de la máscara.
+* Las tasas coinciden con las publicadas: 65 Mbit/s (n, 20 MHz, MCS 7, un flujo), 300 (n, 40 MHz, dos flujos, guarda corta), 866.7 (ac, 80 MHz, MCS 9, dos flujos), 1201 y 2402 (ax, 80 y 160 MHz, MCS 11, dos flujos).
+* **SINR a mano.** Con dos AP en los canales 1 y 3 en espacio libre, el SINR calculado a mano (19.42 dB, con el factor de −3.01 dB) es igual al del mapa y al del receptor de prueba: MCS 3 y 68.8 Mbit/s con dos flujos.
+* **Sugerencia.** Cuatro AP todos en el canal 1 pasan a 6, 1, 11 y 6: la mediana del SINR sube de 6.7 a 36.2 dB y la tasa media de 23 a 224 Mbit/s.
+* **Sin Wi-Fi no cambia nada.** Un proyecto sin canales Wi-Fi da exactamente las mismas grillas y el mismo archivo que en 1.7.0.
+
+**Ejemplo** (`examples/proyecto_wifi.orps.json`). Es la oficina del ejemplo anterior con cuatro AP en 2.4 GHz en los canales 1, 3, 6 y 9, un error típico. La sugerencia los pasa a 11, 1, 6 y 11:
+
+| Área servida | Canales 1, 3, 6, 9 | Canales sugeridos 11, 1, 6, 11 |
+|---|---|---|
+| Mediana del SINR | 15.8 dB | 30.3 dB |
+| Puntos con SINR ≥ 20 dB | 29 % | 79 % |
+| Tasa PHY media | 55 Mbit/s | 175 Mbit/s |
+| Puntos con conexión (≥ MCS 0) | 82 % | 99 % |
+
+La simulación tarda 2.2 s y la sugerencia 0.3 s. Los dos AP que quedan en el canal 11 están en esquinas opuestas, separados por varios muros.
+
+**Lo que conviene saber:**
+
+* **La máscara es una cota superior.** Los equipos reales suelen emitir menos fuera de su canal que lo que la máscara permite, así que la interferencia entre canales vecinos real suele ser algo menor.
+* **La tasa es la PHY, no el throughput.** Lo que mide una prueba de velocidad es más o menos 60–70 % de la tasa PHY por las cabeceras y los acuses, y se reparte entre los clientes y los AP en contención.
+* **Los flujos espaciales multiplican la tasa** solo si el canal tiene rango suficiente (multitrayecto rico). Aquí se supone que sí.
+* **Revisa qué canales permite tu país** antes de aplicar un plan, sobre todo en 5 GHz (DFS, UNII-4) y en 6 GHz.
+
 ---
 
 ## 2. Estructura del Proyecto
@@ -369,6 +467,8 @@ open_rps/
 │   ├── project.py        # Proyectos .orps.json: escenario, edificios 2.5D, materiales (nuevo en 1.4.0)
 │   ├── measurements.py   # Mediciones (CSV), comparación con la predicción y calibración (nuevo en 1.7.0)
 │   ├── calibrate_cli.py  # Comando open-rps-calibrate (nuevo en 1.7.0)
+│   ├── wifi.py           # Canales 802.11, máscara espectral, MCS y tasas PHY (nuevo en 1.8.0)
+│   ├── channel_plan.py   # Sugerencia de canales Wi-Fi (nuevo en 1.8.0)
 │   └── gui/              # Interfaz gráfica (nuevo en 1.4.0)
 │       ├── server.py     # Servidor local (http.server) y API JSON
 │       └── static/       # Página: HTML, CSS, JavaScript y three.js (vendor/)
@@ -378,7 +478,8 @@ open_rps/
 │   ├── proyecto_urbano.orps.json   # Microcelda urbana (ábrelo en la interfaz gráfica)
 │   ├── proyecto_oficina.orps.json  # Planta de oficinas con Wi-Fi a 5.2 GHz
 │   ├── plano_oficina.png           # Plano de esa oficina, para practicar el plano de fondo (1.7.0)
-│   └── mediciones_oficina.csv      # 56 mediciones sintéticas de esa oficina, para practicar la calibración
+│   ├── mediciones_oficina.csv      # 56 mediciones sintéticas de esa oficina, para practicar la calibración
+│   └── proyecto_wifi.orps.json     # Esa oficina con cuatro AP en canales que se enciman (1.8.0)
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -407,8 +508,8 @@ Cualquiera de las opciones instala la librería (`import open_rps`) y los comand
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.7.0-py3-none-any.whl
-pip install dist/open_rps-1.7.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.8.0-py3-none-any.whl
+pip install dist/open_rps-1.8.0-py3-none-any.whl
 ```
 
 ---
@@ -551,6 +652,12 @@ El comando levanta un servidor local en `http://127.0.0.1:8765/`, que solo es ac
 * **Receptor de prueba** (S): haz clic o arrastra en 2D o 3D. Se dibujan todos los rayos, incluidos los bloqueados, en discontinua. El panel inferior muestra la potencia y las dispersiones por transmisor, el perfil potencia–retardo (respuesta al impulso) y la tabla de rayos con sus ángulos y pérdidas por muros. Se recalcula al mover cualquier objeto.
 * **Estadísticas:** porcentaje del área cubierta sobre un umbral de potencia, área con SINR ≥ 0 dB, percentiles e histograma de la métrica, y reparto del área entre servidores.
 * **Plano de fondo y mediciones** (1.7.0, sección 1.H): *Archivo → Plano de fondo* y *Archivo → Importar mediciones*. La herramienta Medición (N) sirve para anotar puntos. La pestaña *Mediciones* compara la predicción con lo medido y calibra el modelo.
+* **Wi-Fi** (1.8.0, sección 1.I):
+  * **Canal de cada AP.** En *Propiedades → Wi-Fi* se eligen banda, ancho, canal y flujos espaciales; la frecuencia se pone sola y el canal aparece junto al AP en el mapa.
+  * **Estándar.** En *Configuración → Wi-Fi* se eligen el estándar, el intervalo de guarda, los flujos del cliente y el umbral CCA.
+  * **Mapas:** *Wi-Fi: tasa de datos (PHY)*, *Wi-Fi: MCS* y *Wi-Fi: AP que comparten el canal*.
+  * **Receptor de prueba.** Dice el servidor, el SINR, la MCS y la tasa, y qué AP interfieren: con cuánta potencia llegan, cuánto se enciman sus canales y cuánto aportan.
+  * **Sugerencia de canales.** *Simulación → Sugerir canales Wi-Fi* compara el plan actual con el sugerido y lo aplica con un clic (se deshace con Ctrl+Z).
 * **Archivo:** abrir y guardar proyectos `.orps.json`; el último proyecto se guarda además en el navegador. Hay ejemplos incluidos y se puede exportar el resultado como CSV, JSON o SVG (los mismos archivos que el CLI) o la vista como PNG.
 
 Cada edificio se convierte en el motor en un muro vertical por arista y un techo poligonal (sección 1.E). Con el material por defecto (concreto) las fachadas atenúan 14.6 dB a 2.4 GHz. Con "Metal" son opacas y con "Muro ideal" solo reflejan. Los modelos empíricos ignoran edificios y muros, como en la librería.
@@ -593,6 +700,34 @@ result.project.save("oficina_calibrada.orps.json")
 ```
 
 Un proyecto con plano de fondo o con mediciones se guarda como versión 2 del formato. Sin ellos sigue siendo la versión 1, y lo abren OpenRPS 1.4 a 1.6.
+
+### H. Wi-Fi desde Python (nuevo en 1.8.0)
+
+```python
+from open_rps.project import Project
+from open_rps.channel_plan import plan_channels
+from open_rps.wifi import channel_center_hz, overlap_factor, phy_rate_mbps, ChannelSpec
+
+project = Project.load("examples/proyecto_wifi.orps.json")
+project.transmitters[0].wifi_channel = 11              # banda, ancho y canal de cada AP
+project.settings.wifi_standard = "ax"                  # "n", "ac" o "ax"
+project.settings.wifi_client_streams = 2
+project.validate()                                     # recalcula la frecuencia a partir del canal
+result = project.run()
+print(result.summary()["wifi"])                        # tasa media y mediana, % con conexión, contención
+rate = result.wifi_rate_mbps                           # también wifi_mcs y wifi_contention ([Ny, Nx])
+print(project.probe((12.0, 6.0)).wifi)                 # servidor, SINR, MCS, tasa e interferentes
+
+plan = plan_channels(project, result)                  # include_dfs=True, include_unii4=True
+for a in plan.assignments:
+    print(a["name"], a["before"], "->", a["after"])
+print(plan.before["mean_rate_mbps"], "->", plan.after["mean_rate_mbps"])
+
+channel_center_hz("5", 36, 80)                         # 5.21e9: centro del bloque 36-48
+phy_rate_mbps("ax", 11, 80, streams=2, gi_us=0.8)      # 1201 Mbit/s
+```
+
+Un proyecto con canales Wi-Fi se guarda como versión 3 del formato. Sin ellos los campos de Wi-Fi no se escriben y el archivo es igual al de 1.7.0.
 
 `Project.from_dict` valida todo el documento. Rechaza campos desconocidos, polígonos que se cruzan, materiales inexistentes, `tx_id` repetidos y grillas de más de 4 millones de píxeles, y en cada caso lanza un `ProjectError` (subclase de `ValueError`) que dice qué elemento y qué campo fallan.
 
@@ -638,6 +773,14 @@ Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del mo
   * un parámetro con pocos puntos se deja igual.
 * **Formato, comando y API:** el formato de archivo (versión 1 sin plano ni mediciones, validación del plano y de las mediciones), el comando `open-rps-calibrate` y la API de la interfaz (leer CSV, comparar y calibrar).
 
+`tests/test_v1_8.py` cubre lo añadido en 1.8.0:
+
+* **Canales:** centros, bloques de 40, 80 y 160 MHz en 5 y 6 GHz, canales DFS y validación.
+* **Espectro:** el factor de traslape contra una integración numérica de la máscara, su asimetría entre anchos distintos y el espectro plano de los transmisores sin canal.
+* **Tasas:** valores publicados de 802.11n, ac y ax, combinaciones excluidas de 802.11ac, umbrales de SINR y elección de la MCS.
+* **Motor:** SINR calculado a mano con canales vecinos, mezcla de AP con y sin canal, receptor de prueba igual al mapa, CSV y resumen.
+* **Proyectos:** ida y vuelta por JSON, versión 3 solo con Wi-Fi, validación (6 GHz sin 802.11ax, anchos no permitidos) y la sugerencia de canales, también por la API de la interfaz.
+
 `tests/test_gui_server.py` arranca el servidor de la interfaz en un puerto libre y prueba la API: archivos estáticos, protección frente a rutas `../`, simulación y decodificación de las grillas, exportaciones, receptor de prueba, errores y rechazo de peticiones de otros orígenes.
 
 Para repetir la comparación bit a bit contra una copia real de la versión 1.2.0 (el test se omite si la variable no está definida):
@@ -676,8 +819,9 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 * **Campo lejano con un umbral fijo.** Se aplica Friis a cualquier distancia por encima de `min_distance_m`; por debajo el píxel se marca `NaN`. El valor por defecto (1 m) es un umbral sencillo, no la distancia de Fraunhofer $2D^2/\lambda$ de una antena concreta (su tamaño $D$ no se modela): con antenas grandes o frecuencias bajas hay que subirlo a mano. Los píxeles a pocos metros de la antena siguen siendo poco representativos de un despliegue real.
 * **Modelos empíricos.** Hata y COST-231 son ajustes estadísticos para macroceldas (1–20 km, antena base de 30–200 m). Usarlos a 2.4 GHz, con antenas más bajas o a menos de 1 km es extrapolar; por defecto el código avisa pero no lo impide (`strict=True` sí lo impide). Estos modos no producen dispersión de retardo ni angular.
 * **Sombra sin correlación espacial.** `shadow_fading_sigma_db` añade una muestra log-normal independiente en cada píxel y para cada transmisor. La sombra real está correlacionada a lo largo de decenas de metros y entre emplazamientos; aquí el mapa resultante tiene aspecto de "sal y pimienta". Es adecuada para estudiar estadísticas (márgenes, probabilidad de cobertura), no para obtener mapas de aspecto realista. No depende del entorno ni de la distancia.
-* **SINR simplificado.** Enlace descendente, todos los transmisores emitiendo siempre (carga completa), receptor ideal salvo por su figura de ruido. Solo interfieren los transmisores con exactamente la misma frecuencia portadora; no hay interferencia de canal adyacente, ni reparto de recursos, ni control de potencia, ni traspasos. El mejor servidor sigue siendo el de mayor potencia recibida (no el de mayor SINR). La dispersión de retardo y angular de cada píxel se refiere solo a los rayos del mejor servidor.
-* **Banda estrecha.** Una única frecuencia por transmisor; los coeficientes no dependen del ancho de banda (`bandwidth_hz` solo interviene en la potencia de ruido).
+* **SINR simplificado.** Enlace descendente, todos los transmisores emitiendo siempre (carga completa), receptor ideal salvo por su figura de ruido. Sin canales Wi-Fi solo interfieren los transmisores con exactamente la misma frecuencia portadora. Con canales Wi-Fi (sección 1.I) también interfieren los canales vecinos, según la máscara espectral del estándar, que es una cota superior de lo que emite un equipo real. No hay reparto de recursos, control de potencia ni traspasos. El mejor servidor sigue siendo el de mayor potencia recibida (no el de mayor SINR). La dispersión de retardo y angular de cada píxel se refiere solo a los rayos del mejor servidor.
+* **Wi-Fi simplificado.** La tasa es la PHY de la MCS que permite el SINR, no el throughput: no se restan cabeceras ni acuses, y la contención se cuenta pero no reparte la tasa. Los umbrales de SINR son los de la sensibilidad mínima del estándar; un equipo bueno conecta con unos dB menos. Los flujos espaciales multiplican la tasa sin comprobar el rango del canal, y no hay conformación de haz, OFDMA, canal primario ni 40 MHz en 2.4 GHz. Para el CCA se cuenta igual un AP del mismo canal que uno de un canal que solo se encima en parte (en un equipo real este último se detecta por energía, a −62 dBm). La sugerencia de canales usa las pérdidas de la simulación anterior, sin el pequeño cambio de frecuencia, y no sabe qué canales permite cada país.
+* **Banda estrecha.** Una única frecuencia por transmisor; los coeficientes no dependen del ancho de banda. El ancho solo interviene en la potencia de ruido y, con canales Wi-Fi, en cuánto se enciman los canales: un AP de 160 MHz se propaga con la pérdida de su frecuencia central.
 * **Materiales a una sola frecuencia.** Un muro lo comparten todos los transmisores, así que la conductividad y la penetración de un material se evalúan a la frecuencia de referencia del proyecto (sección 1.E) aunque haya transmisores en varias bandas. La pérdida por penetración sigue siendo un número fijo por cruce: no depende del ángulo ni del espesor.
 * **Reflexiones desde el interior de los edificios.** Como cada fachada es un muro suelto que refleja por las dos caras, puede aparecer un rayo que entra por una fachada, se refleja en la opuesta por dentro y vuelve a salir. Paga la pérdida de penetración de cada cruce, así que con materiales opacos o muy atenuantes no aporta nada.
 * **Mapas SVG.** Hasta 40 000 celdas hay un rectángulo por celda con su valor al pasar el ratón. Por encima se omiten esos valores y las celdas vecinas del mismo color se fusionan: una grilla de 400 × 400 pasa de 11.5 MB a unos 2 MB en los mapas continuos y a 15 kB en el de mejor servidor (misma imagen), pero para grillas mucho mayores sigue siendo preferible el CSV. El mapa de mejor servidor usa la paleta Okabe-Ito de 8 colores, distinguibles con las formas habituales de daltonismo; a partir del noveno transmisor comparten un gris ("Other"), por lo que cada transmisor se rotula además sobre el mapa.
@@ -685,6 +829,21 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 ---
 
 ## 7. Historial de cambios
+
+### Versión 1.8.0
+
+* **Novedades** (sección 1.I):
+  * **Canales Wi-Fi** por transmisor (`wifi_band`, `wifi_width_mhz`, `wifi_channel`, `wifi_streams`): 2.4, 5 y 6 GHz, de 20 a 160 MHz, con la frecuencia calculada a partir del canal. Módulo nuevo `open_rps.wifi`.
+  * **Interferencia entre canales vecinos** con la máscara espectral OFDM del estándar (`overlap_factor`), en el SINR de los mapas y del receptor de prueba.
+  * **Mapas de Wi-Fi:** MCS, tasa PHY (802.11n, ac y ax, con flujos espaciales e intervalo de guarda) y AP que comparten el canal (`SimulationResult.wifi_mcs`, `wifi_rate_mbps`, `wifi_contention`), también en el CSV y en el resumen. La configuración nueva está en `Settings.wifi_standard`, `wifi_guard_interval_us`, `wifi_client_streams` y `wifi_cca_dbm`.
+  * **Receptor de prueba:** bloque Wi-Fi con el servidor, el SINR, la MCS, la tasa y la lista de interferentes (`ProbeResult.wifi`).
+  * **Sugerencia de canales** (`open_rps.channel_plan.plan_channels`), en la interfaz (*Simulación → Sugerir canales Wi-Fi*) y en la API (`/api/wifi/plan`).
+  * **Ejemplo:** `examples/proyecto_wifi.orps.json`.
+* **Cambios que conviene conocer:**
+  * El formato de proyecto pasa a la versión 3 solo cuando algún transmisor tiene canal Wi-Fi. Sin canales el archivo es igual al de 1.7.0.
+  * Con canales Wi-Fi, el ruido de cada punto se calcula en el ancho del canal de su servidor, no con `bandwidth_hz`.
+  * Las leyendas de los mapas de MCS y de contención solo marcan enteros.
+* **Simulación:** sin canales Wi-Fi no cambia. Con el mismo proyecto da exactamente lo mismo que 1.7.0.
 
 ### Versión 1.7.0
 

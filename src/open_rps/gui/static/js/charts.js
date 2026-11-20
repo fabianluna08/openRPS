@@ -37,16 +37,22 @@ export function renderLegend(container, store) {
     BLUE_RAMP.forEach((c, k) => grad.append(svg("stop", { offset: `${(k / (BLUE_RAMP.length - 1)) * 100}%`, "stop-color": c })));
     defs.append(grad);
     bar.append(defs, svg("rect", { x: pad, y: 4, width: width - 2 * pad, height: 12, rx: 2, fill: `url(#${gradId})` }));
-    for (const t of niceTicks(lo, hi, 4)) {
-      const x = pad + ((t - lo) / (hi - lo)) * (width - 2 * pad);
+    const integer = Boolean(layer.def.integer);
+    let ticks = niceTicks(lo, hi, 4);
+    if (integer) {
+      ticks = ticks.filter((t) => Number.isInteger(t));
+      if (ticks.length < 2) ticks = [...new Set([Math.ceil(lo), Math.floor(hi)])].filter((t) => t >= lo && t <= hi);
+    }
+    for (const t of ticks) {
+      const x = pad + ((t - lo) / (hi - lo || 1)) * (width - 2 * pad);
       bar.append(svg("line", { x1: x, x2: x, y1: 16, y2: 20, stroke: INK2, "stroke-width": 1 }));
       const label = svg("text", { x, y: 32, "text-anchor": "middle", "font-size": 11, fill: INK2 });
-      label.textContent = fmt(t, Math.abs(hi - lo) < 5 ? 1 : 0);
+      label.textContent = fmt(t, integer || Math.abs(hi - lo) >= 5 ? 0 : 1);
       bar.append(label);
     }
     container.append(bar);
     container.append(el("div", { class: "legend-row" }, el("span", { class: "legend-swatch", style: "background:#e1e0d9" }),
-      el("span", { class: "muted", text: "Sin datos (sin señal o interior bloqueado)" })));
+      el("span", { class: "muted", text: layer.def.noDataLegend || "Sin datos (sin señal o interior bloqueado)" })));
   }
   if (store.outdated) container.append(el("div", { class: "muted", text: "El proyecto cambió: vuelve a ejecutar (F5)." }));
 }
@@ -98,6 +104,7 @@ export function renderProbe(container, store, app) {
   }
   left.append(summary);
   if (best) left.append(el("div", { class: "note", text: `★ Mejor servidor: ${store.txName(best.id)}. τ̄ exceso: retardo medio respecto al primer rayo. Las métricas de retardo y ángulo ponderan cada rayo por su potencia.` }));
+  if (data.wifi && data.wifi.serving_tx_id !== null && data.wifi.serving_tx_id !== undefined) left.append(probeWifi(store, data.wifi));
   if (data.mode !== "raytracing") {
     left.append(el("p", { class: "note", text: "En los modelos empíricos no hay rayos ni respuesta al impulso: solo la potencia que predice el modelo. Cambia a ray tracing en la Configuración para verlos." }));
     return;
@@ -565,5 +572,40 @@ function calibrationBox(store, app, rev) {
   } else if (c) {
     box.append(el("p", { class: "note", text: "El proyecto cambió después de calibrar: vuelve a calibrar." }));
   }
+  return box;
+}
+
+// Wi-Fi en el punto del receptor: SINR con lo que mete cada AP según cuánto se enciman los canales, y la MCS resultante
+function probeWifi(store, w) {
+  const box = el("div", { class: "probe-wifi" });
+  const serving = store.tx(w.serving_tx_id);
+  const ch = serving && serving.wifi_channel !== null && serving.wifi_channel !== undefined
+    ? `canal ${serving.wifi_channel}, ${serving.wifi_width_mhz} MHz` : "sin canal Wi-Fi";
+  box.append(el("div", { class: "props-section", text: "Wi-Fi en este punto" }));
+  const rows = [["Servidor", `${store.txName(w.serving_tx_id)} (${ch})`],
+    ["SINR", `${fmt(num(w.sinr_db), 1)} dB`],
+    ["Interferencia + ruido", `${fmt(num(w.interference_plus_noise_dbm), 1)} dBm (ruido ${fmt(num(w.noise_dbm), 1)} dBm)`]];
+  if (w.standard) {
+    const mcs = num(w.mcs);
+    rows.push(["MCS", mcs < 0 ? "ninguna: el SINR no alcanza ni MCS 0" : `MCS ${mcs} · ${w.streams} flujo(s) · ${w.standard === "ax" ? "802.11ax" : w.standard === "ac" ? "802.11ac" : "802.11n"}`],
+      ["Tasa PHY", `${fmt(num(w.rate_mbps), 1)} Mbit/s`],
+      ["AP que comparten el canal", `${w.contention} (por arriba del umbral CCA)`]);
+  }
+  box.append(simpleTable(rows));
+  if (w.interferers && w.interferers.length) {
+    const table = el("table", { class: "data" },
+      el("tr", {}, ...["Interfiere", "Canal", "P_r (dBm)", "Encimado (dB)", "Aporta (dBm)"].map((h, k) => el("th", { class: k > 1 ? "num" : "", text: h }))));
+    for (const i of w.interferers) {
+      const t = store.tx(i.tx_id);
+      table.append(el("tr", {},
+        el("td", {}, el("span", { class: "key-line", style: `background:${txColor(store.txSlot(i.tx_id))}` }), document.createTextNode(store.txName(i.tx_id))),
+        el("td", { text: t && t.wifi_channel !== null && t.wifi_channel !== undefined ? `${t.wifi_channel} (${t.wifi_width_mhz} MHz)` : "—" }),
+        el("td", { class: "num", text: fmt(num(i.rx_power_dbm), 1) }),
+        el("td", { class: "num", text: fmt(num(i.overlap_db), 1) }),
+        el("td", { class: "num", text: fmt(num(i.interference_dbm), 1) })));
+    }
+    box.append(table);
+    box.append(el("p", { class: "note", text: "Encimado: fracción de la potencia del otro AP que cae dentro del canal del servidor, según la máscara espectral de 802.11 (0 dB = mismo canal). Los AP en canales que no se enciman no aparecen." }));
+  } else box.append(el("p", { class: "note", text: "Ningún otro AP transmite en un canal que se encime con el del servidor." }));
   return box;
 }

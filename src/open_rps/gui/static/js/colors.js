@@ -55,6 +55,10 @@ export const METRICS = {
   interference: { label: "Interferencia + ruido", short: "I + N", unit: "dBm", kind: "seq", digits: 1 },
   delay_spread: { label: "Dispersión de retardo RMS", short: "σ_τ", unit: "ns", kind: "seq", digits: 1, zeroBased: true },
   angular_spread: { label: "Dispersión angular (salida)", short: "σ_φ", unit: "°", kind: "seq", digits: 1, zeroBased: true },
+  wifi_rate: { label: "Wi-Fi: tasa de datos (PHY)", short: "Tasa", unit: "Mbit/s", kind: "seq", digits: 0, zeroBased: true },
+  wifi_mcs: { label: "Wi-Fi: MCS", short: "MCS", unit: "", kind: "seq", digits: 0, zeroBased: true, integer: true,
+    negativeIsNone: true, noData: "sin conexión o sin datos", noDataLegend: "Sin conexión (SINR bajo el de MCS 0), sin señal o interior bloqueado" },
+  wifi_contention: { label: "Wi-Fi: AP que comparten el canal", short: "AP", unit: "", kind: "seq", digits: 0, zeroBased: true, integer: true },
 };
 
 export function niceStep(span, target = 6) {
@@ -84,7 +88,10 @@ export function autoRange(values, zeroBased = false) {
   let lo = finite[Math.floor(0.01 * (finite.length - 1))];
   let hi = finite[Math.ceil(0.99 * (finite.length - 1))];
   if (zeroBased) lo = 0;
-  if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+  if (hi - lo < 1e-9) {
+    if (zeroBased) hi = lo + 1;
+    else { lo -= 1; hi += 1; }
+  }
   const step = niceStep(hi - lo, 8);
   return [Math.floor(lo / step) * step, Math.ceil(hi / step) * step];
 }

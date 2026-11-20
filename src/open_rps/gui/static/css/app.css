@@ -218,3 +218,7 @@ table.data.clickable tr:not(:first-child):hover td { background: var(--accent-so
 .warn-note { color: var(--warn); }
 .modal-body .field { display: grid; grid-template-columns: 130px 1fr; align-items: center; gap: 8px; margin: 6px 0; }
 .stats-grid table.calib-table td.num { white-space: nowrap; }
+/* 1.8.0: Wi-Fi */
+.modal-body .inline-check { display: flex; align-items: flex-start; gap: 6px; margin: 6px 0; font-size: 13px; }
+.probe-wifi { margin-top: 10px; }
+.plan-result table.data { margin-top: 8px; }

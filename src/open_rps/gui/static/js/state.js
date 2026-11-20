@@ -1,6 +1,8 @@
 // Estado de la aplicación: proyecto (el mismo JSON que open_rps.project.Project.to_dict), selección,
 // resultado, receptor de prueba y opciones de la vista.  Historial para deshacer/rehacer.
 
+const WIFI_TX_KEYS = ["wifi_band", "wifi_channel", "wifi_width_mhz", "wifi_streams"];
+const WIFI_SETTINGS_DEFAULTS = { wifi_standard: "ax", wifi_guard_interval_us: 0.8, wifi_client_streams: 2, wifi_cca_dbm: -82 };
 const AUTOSAVE_KEY = "openrps.project.v1";
 const MAX_HISTORY = 80;
 
@@ -83,8 +85,18 @@ export class Store {
     if (p.floor_plan) p.floor_plan.image = this.images.get(p.floor_plan.image) || p.floor_plan.image;
     else delete p.floor_plan;
     if (!p.measurements || !p.measurements.length) delete p.measurements;
-    // Sin plano ni mediciones el archivo sigue siendo de la versión 1 (lo abren OpenRPS 1.4 a 1.6)
-    p.version = p.floor_plan || p.measurements ? 2 : 1;
+    // Los campos de Wi-Fi solo se escriben si se usan, como hace open_rps.project.Project.to_dict
+    const wifi = p.transmitters.some((t) => t.wifi_channel !== null && t.wifi_channel !== undefined);
+    for (const t of p.transmitters) {
+      if (t.wifi_channel === null || t.wifi_channel === undefined) for (const k of WIFI_TX_KEYS) delete t[k];
+    }
+    const st = p.settings;
+    if (!wifi && Object.entries(WIFI_SETTINGS_DEFAULTS).every(([k, v]) => st[k] === undefined || st[k] === v)) {
+      for (const k of Object.keys(WIFI_SETTINGS_DEFAULTS)) delete st[k];
+    }
+    // Versión del formato: 1 sin plano, mediciones ni Wi-Fi (lo abren OpenRPS 1.4 a 1.6), 2 con plano o
+    // mediciones (1.7), 3 con Wi-Fi (1.8)
+    p.version = wifi || "wifi_standard" in st ? 3 : p.floor_plan || p.measurements ? 2 : 1;
     return p;
   }
 

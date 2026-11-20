@@ -1,5 +1,6 @@
 // Panel del proyecto (árbol) y panel de propiedades (formularios de cada elemento).
 import { fmt, fmtFreq, txColor } from "./colors.js";
+import { GUARD_INTERVALS, WIFI_BANDS, WIFI_STANDARDS, centreMHz, channelOptions, normalizeWifi, widthsFor } from "./wifi.js";
 import { centroid, isSimplePolygon, round } from "./geometry.js";
 import { nextId, nextTxId } from "./state.js";
 
@@ -129,7 +130,7 @@ function fieldRow(obj, spec, onCommit) {
   }
   if (spec.type === "select") {
     input = el("select");
-    for (const [v, label] of spec.options) {
+    for (const [v, label] of typeof spec.options === "function" ? spec.options(obj) : spec.options) {
       const option = el("option", { value: v, text: label });
       if (String(v) === String(value)) option.selected = true;
       input.append(option);
@@ -173,13 +174,16 @@ function fieldRow(obj, spec, onCommit) {
 
 function buildForm(container, obj, specs, onCommit) {
   for (const spec of specs) {
-    if (spec.section) { container.append(el("div", { class: "props-section", text: spec.section })); continue; }
+    if (spec.section) {
+      if (!spec.show || spec.show(obj)) container.append(el("div", { class: "props-section", text: spec.section }));
+      continue;
+    }
     if (spec.show && !spec.show(obj)) continue;
     container.append(fieldRow(obj, spec, onCommit));
   }
 }
 
-const TX_FIELDS = [
+const TX_FIELDS = (standard) => [
   { key: "name", label: "Nombre", type: "text" },
   { key: "enabled", label: "Activo", type: "checkbox" },
   { section: "Posición" },
@@ -188,8 +192,18 @@ const TX_FIELDS = [
   { key: "z", label: "Altura", unit: "m", min: 0 },
   { section: "Radio" },
   { key: "tx_power_dbm", label: "Potencia", unit: "dBm" },
-  { key: "frequency_hz", label: "Frecuencia", unit: "MHz", scale: 1e6, min: 0 },
+  { key: "frequency_hz", label: "Frecuencia", unit: "MHz", scale: 1e6, min: 0, show: (t) => !t.wifi_band },
   { key: "antenna_gain_dbi", label: "Ganancia", unit: "dBi" },
+  { section: "Wi-Fi" },
+  { key: "wifi_band", label: "Banda", type: "select", options: [["", "— (sin Wi-Fi)"], ...WIFI_BANDS],
+    help: "Con un canal Wi-Fi la frecuencia es la del centro del canal, y el SINR cuenta lo que se enciman los canales" },
+  { key: "wifi_width_mhz", label: "Ancho", type: "select", integer: true, show: (t) => !!t.wifi_band,
+    options: (t) => widthsFor(t.wifi_band, standard).map((w) => [w, `${w} MHz`]) },
+  { key: "wifi_channel", label: "Canal", type: "select", integer: true, show: (t) => !!t.wifi_band,
+    options: (t) => channelOptions(t.wifi_band, t.wifi_width_mhz || 20),
+    help: "El canal primario; con 40, 80 o 160 MHz el AP ocupa todo el bloque" },
+  { key: "wifi_streams", label: "Flujos espaciales", type: "select", integer: true, show: (t) => !!t.wifi_band,
+    options: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => [n, `${n} (${n}×${n} MIMO)`]), help: "Se usa el menor entre el AP y el cliente" },
   { section: "Antena" },
   { key: "pattern", label: "Diagrama", type: "select", options: [["isotropic", "Isotrópica"], ["sector", "Sector 3GPP"]] },
   { key: "azimuth_deg", label: "Azimut", unit: "°", show: (t) => t.pattern === "sector", help: "0° = eje +x, 90° = eje +y" },
@@ -233,7 +247,17 @@ const SETTINGS_FIELDS = [
   { section: "SINR" },
   { key: "sinr", label: "Calcular SINR", type: "checkbox" },
   { key: "noise_figure_db", label: "Figura de ruido", unit: "dB", show: (s) => s.sinr },
-  { key: "bandwidth_hz", label: "Ancho de banda", unit: "MHz", scale: 1e6, min: 0, show: (s) => s.sinr },
+  { key: "bandwidth_hz", label: "Ancho de banda", unit: "MHz", scale: 1e6, min: 0, show: (s) => s.sinr,
+    help: "Para los transmisores sin canal Wi-Fi (los Wi-Fi usan el ancho de su canal)" },
+  { section: "Wi-Fi", show: (s) => s._wifi },
+  { key: "wifi_standard", label: "Estándar", type: "select", options: WIFI_STANDARDS, show: (s) => s._wifi,
+    help: "Generación de los AP y de los clientes. Wi-Fi 5 en 2.4 GHz trabaja como Wi-Fi 4; 6 GHz requiere Wi-Fi 6E" },
+  { key: "wifi_guard_interval_us", label: "Intervalo de guarda", type: "select", integer: true, show: (s) => s._wifi,
+    options: (s) => (GUARD_INTERVALS[s.wifi_standard] || [0.8]).map((g) => [g, `${g} µs`]) },
+  { key: "wifi_client_streams", label: "Flujos del cliente", type: "select", integer: true, show: (s) => s._wifi,
+    options: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => [n, String(n)]), help: "Un teléfono suele tener 2; una laptop, 2 o 3" },
+  { key: "wifi_cca_dbm", label: "Umbral CCA", unit: "dBm", show: (s) => s._wifi,
+    help: "Un AP del mismo canal que llega por arriba de este nivel comparte el tiempo de aire (mapa de contención)" },
   { section: "Suelo y materiales" },
   { key: "ground_eps_r", label: "εr del suelo", min: 1 },
   { key: "ground_sigma", label: "σ del suelo", unit: "S/m", min: 0 },
@@ -314,10 +338,19 @@ export function renderProperties(container, titleEl, store, app) {
   const commit = (mutate) => (key, value) => store.change(() => mutate(key, value));
   if (s.type === "tx") {
     titleEl.textContent = "Transmisor";
-    buildForm(container, obj, TX_FIELDS, commit((k, v) => { store.tx(s.id)[k] = v; }));
+    const standard = p.settings.wifi_standard || "ax";
+    const view = { ...obj, wifi_band: obj.wifi_band || "", wifi_width_mhz: obj.wifi_width_mhz || 20, wifi_streams: obj.wifi_streams || 2 };
+    buildForm(container, view, TX_FIELDS(standard), commit((k, v) => {
+      const t = store.tx(s.id);
+      if (k === "wifi_band" || k === "wifi_width_mhz" || k === "wifi_channel") {
+        t[k] = k === "wifi_band" ? (v || null) : v;
+        normalizeWifi(t, standard);
+      } else t[k] = v;
+    }));
     const slot = store.txSlot(obj.tx_id);
+    const wifi = obj.wifi_band ? ` · canal ${obj.wifi_channel} en ${fmt(centreMHz(obj.wifi_band, obj.wifi_channel, obj.wifi_width_mhz || 20), 0)} MHz` : "";
     container.append(el("div", { class: "readout" }, el("span", { class: "key-line", style: `background:${txColor(slot)}` }),
-      el("span", { text: `tx_id ${obj.tx_id} · EIRP ${fmt(obj.tx_power_dbm + obj.antenna_gain_dbi, 1)} dBm · λ = ${fmt(299792458 / obj.frequency_hz * 100, 1)} cm` })));
+      el("span", { text: `tx_id ${obj.tx_id} · EIRP ${fmt(obj.tx_power_dbm + obj.antenna_gain_dbi, 1)} dBm · λ = ${fmt(299792458 / obj.frequency_hz * 100, 1)} cm${wifi}` })));
     container.append(actions(store, app, s));
   } else if (s.type === "building") {
     titleEl.textContent = "Edificio";
@@ -359,7 +392,19 @@ export function renderProperties(container, titleEl, store, app) {
     container.append(el("div", { class: "props-actions" }, el("button", { class: "btn", text: "Ajustar a los objetos", onclick: () => app.fitAreaToObjects() })));
   } else if (s.type === "settings") {
     titleEl.textContent = "Configuración de la simulación";
-    buildForm(container, obj, SETTINGS_FIELDS, commit((k, v) => { store.project.settings[k] = v; }));
+    const anyWifi = p.transmitters.some((t) => t.wifi_band);
+    const view = { wifi_standard: "ax", wifi_guard_interval_us: 0.8, wifi_client_streams: 2, wifi_cca_dbm: -82, ...obj, _wifi: anyWifi };
+    buildForm(container, view, SETTINGS_FIELDS, commit((k, v) => {
+      const st = store.project.settings;
+      st[k] = v;
+      if (k === "wifi_standard") {
+        // Guarda y anchos que el nuevo estándar admite
+        const gis = GUARD_INTERVALS[v];
+        if (!gis.includes(st.wifi_guard_interval_us)) st.wifi_guard_interval_us = gis[0];
+        for (const t of store.project.transmitters) if (t.wifi_band) normalizeWifi(t, v);
+      }
+    }));
+    if (!anyWifi) container.append(el("p", { class: "note", text: "Para los mapas de Wi-Fi (tasa de datos, MCS y contención), asigna una banda y un canal Wi-Fi a los transmisores." }));
     if (obj.mode !== "raytracing") {
       container.append(el("p", { class: "note", text: "Los modelos empíricos ignoran los edificios y muros: ni reflejan ni obstruyen. Usa ray tracing para verlos en el mapa." }));
     } else {
