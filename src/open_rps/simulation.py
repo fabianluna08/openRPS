@@ -14,6 +14,7 @@ import numpy as np
 from .models import PropagationModel
 from .multipath import ChannelImpulseResponse, circular_angular_spread, rms_delay_spread
 from .raytracer import RayTracer, Transmitter, PlanarReflector
+from .wifi import STANDARDS, ChannelSpec, bands_overlap, best_mcs, overlap_matrix
 
 # Upper bound of receiver points traced per numpy batch (keeps memory bounded on big grids)
 _MAX_CHUNK_POINTS = 200_000
@@ -88,6 +89,13 @@ class SimulationResult:
     sinr_db: Optional[np.ndarray] = None                      # Shape: [Ny, Nx], filled by compute_sinr()
     interference_plus_noise_dbm: Optional[np.ndarray] = None  # Shape: [Ny, Nx], filled by compute_sinr()
     sinr_settings: Optional[dict] = None                      # noise parameters used by compute_sinr()
+    # 1.8.0: band occupied by each Tx (same order as the Tx axis).  With at least one Wi-Fi channel the SINR
+    # counts the spectral overlap of every transmitter and the noise of the width of the serving channel
+    tx_channels: Optional[List[ChannelSpec]] = None
+    wifi_mcs: Optional[np.ndarray] = None            # Shape: [Ny, Nx], filled by compute_wifi() (-1 = below MCS 0)
+    wifi_rate_mbps: Optional[np.ndarray] = None      # Shape: [Ny, Nx], PHY rate of that MCS (0 below MCS 0)
+    wifi_contention: Optional[np.ndarray] = None     # Shape: [Ny, Nx], other APs sharing the channel above CCA
+    wifi_settings: Optional[dict] = None
 
     def best_server_indices(self) -> np.ndarray:
         """
@@ -135,7 +143,16 @@ class SimulationResult:
           include antenna pattern, shadow fading and coherent sum if they were used).
         * Pixels without server are NaN.  So are pixels where the power of some
           co-channel interferer is unknown (NaN: closer to it than ``min_distance_m``).
+
+        With ``tx_channels`` and at least one Wi-Fi channel among them (1.8.0) the
+        rule is the spectral one instead: every transmitter j interferes with the
+        fraction F[s, j] of its power that falls inside the band of the serving
+        transmitter s (``wifi.overlap_matrix``: the 802.11 transmit mask, or a flat
+        spectrum for a transmitter without Wi-Fi channel), and the noise is the one of
+        the width of the serving channel (``bandwidth_hz`` is then not used).
         """
+        if self.tx_channels is not None and any(c.wifi for c in self.tx_channels):
+            return self._sinr_spectral(noise_figure_db, temperature_k)
         noise_mw = 10.0 ** (thermal_noise_dbm(bandwidth_hz, noise_figure_db, temperature_k) / 10.0)
         index = self.best_server_indices()
         num_tx = self.rx_power_dbm.shape[0]
@@ -159,6 +176,76 @@ class SimulationResult:
             i_plus_n_dbm = 10.0 * np.log10(total_mw)
             sinr = np.where(served, np.asarray(self.max_rx_power_dbm, dtype=float), np.nan) - i_plus_n_dbm
         return sinr, i_plus_n_dbm
+
+    def _sinr_spectral(self, noise_figure_db: float, temperature_k: float) -> Tuple[np.ndarray, np.ndarray]:
+        """SINR with the spectral overlap of every transmitter (see ``sinr_map``)."""
+        channels = list(self.tx_channels)
+        index = self.best_server_indices()
+        num_tx = self.rx_power_dbm.shape[0]
+        if len(channels) != num_tx:
+            raise ValueError(f"tx_channels has {len(channels)} entries for {num_tx} transmitters")
+        served = (index >= 0) & (index < num_tx)
+        total_mw = np.full(index.shape, np.nan)
+        power_mw = 10.0 ** (np.asarray(self.rx_power_dbm, dtype=float) / 10.0)   # -inf -> 0, NaN stays
+        factors = overlap_matrix(channels)
+        for s in range(num_tx):
+            sel = served & (index == s)
+            if not sel.any():
+                continue
+            w = factors[s][:, None, None]
+            # Only the transmitters that overlap count (a NaN power of one that does not overlap is ignored)
+            interference = np.where(w > 0, power_mw * w, 0.0).sum(axis=0)
+            noise = 10.0 ** (thermal_noise_dbm(channels[s].width_hz, noise_figure_db, temperature_k) / 10.0)
+            total_mw = np.where(sel, interference + noise, total_mw)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            i_plus_n_dbm = 10.0 * np.log10(total_mw)
+            sinr = np.where(served, np.asarray(self.max_rx_power_dbm, dtype=float), np.nan) - i_plus_n_dbm
+        return sinr, i_plus_n_dbm
+
+    def compute_wifi(self, standards: List[Optional[str]], streams: List[int], guard_interval_us: float = 0.8,
+                     cca_dbm: float = -82.0):
+        """
+        Wi-Fi maps of the pixels whose best server has a Wi-Fi channel (NaN elsewhere),
+        after ``compute_sinr()`` (1.8.0):
+
+        * ``wifi_mcs``: highest MCS that the SINR allows (-1 below MCS 0), see ``wifi.best_mcs``;
+        * ``wifi_rate_mbps``: its PHY rate with ``streams`` spatial streams (0 below MCS 0);
+        * ``wifi_contention``: how many other APs on a channel that overlaps the one of
+          the serving AP arrive above ``cca_dbm`` (they share the air time with it).
+
+        ``standards`` and ``streams`` are per transmitter (same order as the Tx axis;
+        ``None`` = no Wi-Fi channel).
+        """
+        if self.sinr_db is None or self.tx_channels is None:
+            raise ValueError("compute_wifi() needs tx_channels and compute_sinr() first")
+        channels = list(self.tx_channels)
+        index = self.best_server_indices()
+        num_tx = self.rx_power_dbm.shape[0]
+        served = (index >= 0) & (index < num_tx)
+        power = np.asarray(self.rx_power_dbm, dtype=float)
+        mcs = np.full(index.shape, np.nan)
+        rate = np.full(index.shape, np.nan)
+        contention = np.full(index.shape, np.nan)
+        for s, spec in enumerate(channels):
+            if not spec.wifi or standards[s] is None:
+                continue
+            sel = served & (index == s)
+            if not sel.any():
+                continue
+            width = int(round(spec.width_hz / 1e6))
+            m, r = best_mcs(self.sinr_db[sel], standards[s], width, int(streams[s]), guard_interval_us)
+            mcs[sel] = m
+            rate[sel] = r
+            count = np.zeros(index.shape)
+            for j, other in enumerate(channels):
+                if j != s and bands_overlap(spec, other):
+                    with np.errstate(invalid="ignore"):
+                        count += power[j] >= cca_dbm
+            contention[sel] = count[sel]
+        self.wifi_mcs, self.wifi_rate_mbps, self.wifi_contention = mcs, rate, contention
+        self.wifi_settings = {"standards": list(standards), "streams": [int(n) for n in streams],
+                              "guard_interval_us": float(guard_interval_us), "cca_dbm": float(cca_dbm)}
+        return rate
 
     def compute_sinr(self, noise_figure_db: float = 7.0, bandwidth_hz: float = 20e6,
                      temperature_k: float = 290.0) -> np.ndarray:
@@ -192,6 +279,9 @@ class SimulationResult:
         with_sinr = self.sinr_db is not None and self.interference_plus_noise_dbm is not None
         if with_sinr:
             header += ["sinr_db", "interference_plus_noise_dbm"]
+        with_wifi = self.wifi_rate_mbps is not None
+        if with_wifi:
+            header += ["wifi_mcs", "wifi_rate_mbps", "wifi_contention"]
         with open(filename, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
@@ -207,6 +297,10 @@ class SimulationResult:
                     row = [x, y, best_tx, f"{p_rx:.2f}", f"{pl:.2f}", f"{ds:.2f}", f"{asp:.2f}"]
                     if with_sinr:
                         row += [f"{float(self.sinr_db[j, i]):.2f}", f"{float(self.interference_plus_noise_dbm[j, i]):.2f}"]
+                    if with_wifi:
+                        m, r, c = (float(g[j, i]) for g in (self.wifi_mcs, self.wifi_rate_mbps, self.wifi_contention))
+                        row += ["" if math.isnan(m) else int(m), "" if math.isnan(r) else f"{r:.1f}",
+                                "" if math.isnan(c) else int(c)]
                     writer.writerow(row)
 
     def summary(self) -> dict:
@@ -224,6 +318,16 @@ class SimulationResult:
                 "mean_interference_plus_noise_dbm": (
                     None if self.interference_plus_noise_dbm is None
                     else _finite_stat(np.mean, self.interference_plus_noise_dbm)),
+            }
+        if self.wifi_rate_mbps is not None:
+            rate = self.wifi_rate_mbps
+            finite = rate[np.isfinite(rate)]
+            summary["wifi"] = {
+                **(self.wifi_settings or {}),
+                "mean_rate_mbps": _finite_stat(np.mean, rate),
+                "median_rate_mbps": float(np.median(finite)) if finite.size else None,
+                "fraction_connected": float(np.mean(finite > 0)) if finite.size else None,
+                "mean_contention": _finite_stat(np.mean, self.wifi_contention),
             }
         return summary
 

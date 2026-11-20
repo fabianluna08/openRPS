@@ -1,0 +1,455 @@
+{
+  "format": "openrps-project",
+  "version": 3,
+  "name": "Oficina Wi-Fi (2.4 GHz)",
+  "description": "Cuatro AP en 2.4 GHz en los canales 1, 3, 6 y 9, que se enciman. Mira los mapas de Wi-Fi y prueba Simulación → Sugerir canales Wi-Fi.",
+  "area": {
+    "x_min": -2.0,
+    "x_max": 42.0,
+    "y_min": -2.0,
+    "y_max": 22.0,
+    "resolution_m": 0.25,
+    "rx_height_m": 1.0
+  },
+  "settings": {
+    "mode": "raytracing",
+    "coherent": false,
+    "min_distance_m": 0.5,
+    "shadow_sigma_db": 0.0,
+    "seed": null,
+    "hata_environment": "urban_medium",
+    "log_distance_exponent": 3.0,
+    "log_distance_d0_m": 1.0,
+    "sinr": true,
+    "noise_figure_db": 7.0,
+    "bandwidth_hz": 20000000.0,
+    "wifi_standard": "ax",
+    "wifi_guard_interval_us": 0.8,
+    "wifi_client_streams": 2,
+    "wifi_cca_dbm": -82.0,
+    "ground_eps_r": 15.0,
+    "ground_sigma": 0.005,
+    "reference_frequency_hz": null,
+    "diffraction": true,
+    "max_reflections": 1,
+    "max_diffractions": 1,
+    "mixed_interactions": false
+  },
+  "materials": [
+    {
+      "id": "concreto",
+      "name": "Concreto",
+      "color": "#8d8a83",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 5.24,
+      "sigma_c": 0.0462,
+      "sigma_d": 0.7822,
+      "penetration": "frequency",
+      "loss_db": 15.0,
+      "loss_a_db": 5.0,
+      "loss_b_db_per_ghz": 4.0,
+      "note": "P.2040; penetración 3GPP: 5 + 4·f dB"
+    },
+    {
+      "id": "ladrillo",
+      "name": "Ladrillo",
+      "color": "#b0603c",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 3.91,
+      "sigma_c": 0.0238,
+      "sigma_d": 0.16,
+      "penetration": "fixed",
+      "loss_db": 10.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "P.2040 (1–10 GHz); penetración típica 10 dB"
+    },
+    {
+      "id": "vidrio",
+      "name": "Vidrio",
+      "color": "#7fb7d9",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 6.31,
+      "sigma_c": 0.0036,
+      "sigma_d": 1.3394,
+      "penetration": "frequency",
+      "loss_db": 2.5,
+      "loss_a_db": 2.0,
+      "loss_b_db_per_ghz": 0.2,
+      "note": "P.2040; penetración 3GPP: 2 + 0.2·f dB"
+    },
+    {
+      "id": "vidrio_irr",
+      "name": "Vidrio IRR (bajo emisivo)",
+      "color": "#4f8fb3",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 6.31,
+      "sigma_c": 0.0036,
+      "sigma_d": 1.3394,
+      "penetration": "frequency",
+      "loss_db": 23.7,
+      "loss_a_db": 23.0,
+      "loss_b_db_per_ghz": 0.3,
+      "note": "Penetración 3GPP: 23 + 0.3·f dB"
+    },
+    {
+      "id": "madera",
+      "name": "Madera",
+      "color": "#a47844",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 1.99,
+      "sigma_c": 0.0047,
+      "sigma_d": 1.0718,
+      "penetration": "frequency",
+      "loss_db": 5.1,
+      "loss_a_db": 4.85,
+      "loss_b_db_per_ghz": 0.12,
+      "note": "P.2040; penetración 3GPP: 4.85 + 0.12·f dB"
+    },
+    {
+      "id": "tablaroca",
+      "name": "Tablaroca",
+      "color": "#d8d3c6",
+      "reflection": "fresnel",
+      "reflectivity": 0.5,
+      "eps_r": 2.73,
+      "sigma_c": 0.0085,
+      "sigma_d": 0.9395,
+      "penetration": "fixed",
+      "loss_db": 3.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "P.2040; penetración típica 3 dB"
+    },
+    {
+      "id": "metal",
+      "name": "Metal",
+      "color": "#5c6670",
+      "reflection": "constant",
+      "reflectivity": 1.0,
+      "eps_r": 1.0,
+      "sigma_c": 10000000.0,
+      "sigma_d": 0.0,
+      "penetration": "opaque",
+      "loss_db": 0.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "Reflector perfecto y opaco"
+    },
+    {
+      "id": "ideal",
+      "name": "Muro ideal (solo refleja)",
+      "color": "#b9b4a8",
+      "reflection": "constant",
+      "reflectivity": 0.5,
+      "eps_r": 5.0,
+      "sigma_c": 0.0,
+      "sigma_d": 0.0,
+      "penetration": "none",
+      "loss_db": 0.0,
+      "loss_a_db": 0.0,
+      "loss_b_db_per_ghz": 0.0,
+      "note": "Comportamiento de OpenRPS 1.2: refleja y no tapa"
+    }
+  ],
+  "transmitters": [
+    {
+      "tx_id": 0,
+      "name": "AP sala de juntas",
+      "x": 6.5,
+      "y": 16.0,
+      "z": 2.8,
+      "tx_power_dbm": 17.0,
+      "frequency_hz": 2412000000.0,
+      "antenna_gain_dbi": 3.0,
+      "pattern": "isotropic",
+      "azimuth_deg": 0.0,
+      "beamwidth_az_deg": 65.0,
+      "beamwidth_el_deg": 65.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 1,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    },
+    {
+      "tx_id": 1,
+      "name": "AP oficina 2",
+      "x": 15.0,
+      "y": 4.0,
+      "z": 2.8,
+      "tx_power_dbm": 17.0,
+      "frequency_hz": 2422000000.0,
+      "antenna_gain_dbi": 3.0,
+      "pattern": "isotropic",
+      "azimuth_deg": 0.0,
+      "beamwidth_az_deg": 65.0,
+      "beamwidth_el_deg": 65.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 3,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    },
+    {
+      "tx_id": 2,
+      "name": "AP oficina 6",
+      "x": 29.5,
+      "y": 16.0,
+      "z": 2.8,
+      "tx_power_dbm": 17.0,
+      "frequency_hz": 2437000000.0,
+      "antenna_gain_dbi": 3.0,
+      "pattern": "isotropic",
+      "azimuth_deg": 0.0,
+      "beamwidth_az_deg": 65.0,
+      "beamwidth_el_deg": 65.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 6,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    },
+    {
+      "tx_id": 3,
+      "name": "AP oficina 4",
+      "x": 35.0,
+      "y": 4.0,
+      "z": 2.8,
+      "tx_power_dbm": 17.0,
+      "frequency_hz": 2452000000.0,
+      "antenna_gain_dbi": 3.0,
+      "pattern": "isotropic",
+      "azimuth_deg": 0.0,
+      "beamwidth_az_deg": 65.0,
+      "beamwidth_el_deg": 65.0,
+      "downtilt_deg": 0.0,
+      "enabled": true,
+      "wifi_band": "2.4",
+      "wifi_channel": 9,
+      "wifi_width_mhz": 20,
+      "wifi_streams": 2
+    }
+  ],
+  "buildings": [],
+  "walls": [
+    {
+      "id": "w1",
+      "name": "Fachada sur",
+      "start": [
+        0.0,
+        0.0
+      ],
+      "end": [
+        40.0,
+        0.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto"
+    },
+    {
+      "id": "w2",
+      "name": "Fachada este",
+      "start": [
+        40.0,
+        0.0
+      ],
+      "end": [
+        40.0,
+        20.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto"
+    },
+    {
+      "id": "w3",
+      "name": "Fachada norte",
+      "start": [
+        40.0,
+        20.0
+      ],
+      "end": [
+        0.0,
+        20.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "vidrio"
+    },
+    {
+      "id": "w4",
+      "name": "Fachada oeste",
+      "start": [
+        0.0,
+        20.0
+      ],
+      "end": [
+        0.0,
+        0.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "concreto"
+    },
+    {
+      "id": "w5",
+      "name": "Pasillo sur",
+      "start": [
+        0.0,
+        8.0
+      ],
+      "end": [
+        17.0,
+        8.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w6",
+      "name": "Pasillo sur 2",
+      "start": [
+        19.0,
+        8.0
+      ],
+      "end": [
+        40.0,
+        8.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w7",
+      "name": "Pasillo norte",
+      "start": [
+        0.0,
+        12.0
+      ],
+      "end": [
+        25.0,
+        12.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w8",
+      "name": "Pasillo norte 2",
+      "start": [
+        27.0,
+        12.0
+      ],
+      "end": [
+        40.0,
+        12.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w9",
+      "name": "División sur 1",
+      "start": [
+        10.0,
+        0.0
+      ],
+      "end": [
+        10.0,
+        8.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w10",
+      "name": "División sur 2",
+      "start": [
+        20.0,
+        0.0
+      ],
+      "end": [
+        20.0,
+        8.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w11",
+      "name": "División sur 3",
+      "start": [
+        30.0,
+        0.0
+      ],
+      "end": [
+        30.0,
+        8.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w12",
+      "name": "División norte 1",
+      "start": [
+        13.0,
+        12.0
+      ],
+      "end": [
+        13.0,
+        20.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w13",
+      "name": "División norte 2",
+      "start": [
+        26.0,
+        12.0
+      ],
+      "end": [
+        26.0,
+        20.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "tablaroca"
+    },
+    {
+      "id": "w14",
+      "name": "Cubo de elevador",
+      "start": [
+        33.0,
+        12.0
+      ],
+      "end": [
+        33.0,
+        20.0
+      ],
+      "z_min_m": 0.0,
+      "z_max_m": 3.0,
+      "material": "metal"
+    }
+  ]
+}

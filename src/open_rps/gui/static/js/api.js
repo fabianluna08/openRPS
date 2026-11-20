@@ -32,6 +32,7 @@ export const api = {
   parseMeasurements: (project, csv) => request("/api/measurements/parse", { project, csv }),
   compare: (project) => request("/api/compare", { project }),
   calibrate: (project, options) => request("/api/calibrate", { project, options }),
+  planChannels: (project, options, resultId) => request("/api/wifi/plan", { project, options, result_id: resultId }),
   exportUrl: (resultId, what) => `/api/export/${encodeURIComponent(resultId)}/${encodeURIComponent(what)}`,
 };
 

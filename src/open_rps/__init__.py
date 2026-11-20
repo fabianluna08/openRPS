@@ -39,5 +39,16 @@ from .measurements import (
     compare as compare_measurements,
     calibrate,
 )
+from .wifi import (
+    ChannelSpec,
+    WifiError,
+    channel_center_hz,
+    valid_channels,
+    overlap_factor,
+    phy_rate_mbps,
+    required_sinr_db,
+    best_mcs,
+)
+from .channel_plan import ChannelPlan, plan_channels
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"

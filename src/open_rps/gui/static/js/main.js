@@ -1,6 +1,7 @@
 // OpenRPS - interfaz gráfica: arranque y coordinación de vistas, paneles, menús y simulación.
 import { api, decodeResult } from "./api.js";
 import { renderLegend, renderMeasurements, renderProbe, renderStats } from "./charts.js";
+import { normalizeWifi } from "./wifi.js";
 import { METRICS, fmt } from "./colors.js";
 import { currentLayer, invalidateLayer, metricOptions, pixelAt } from "./coverage.js";
 import { centroid, round } from "./geometry.js";
@@ -84,7 +85,7 @@ const app = {
     if (k < 0) { $("status-value").textContent = ""; return; }
     const v = layer.values[k];
     $("status-value").textContent = layer.def.kind === "cat" ? `${layer.label}: ${v >= 0 ? store.txName(v) : "ninguno"}`
-      : `${METRICS[layer.metric].short}: ${isFinite(v) ? `${fmt(v, layer.def.digits)} ${layer.def.unit}` : "sin datos"}`;
+      : `${METRICS[layer.metric].short}: ${isFinite(v) ? `${fmt(v, layer.def.digits)} ${layer.def.unit}` : (layer.def.noData || "sin datos")}`;
   },
 
   async run() {
@@ -287,6 +288,78 @@ const app = {
       p.area.y_max = Math.ceil((plan.y_m + h) / r) * r;
     });
     view2d.fit();
+  },
+
+  // ----- Wi-Fi: sugerencia de canales
+  planChannels() {
+    const p = store.project;
+    if (!p.transmitters.some((t) => t.enabled && t.wifi_band)) {
+      app.notify("warn", "Primero asigna una banda y un canal Wi-Fi a los AP (Propiedades del transmisor → Wi-Fi).", { modal: true });
+      return;
+    }
+    const dfs = el("input", { type: "checkbox" });
+    const unii4 = el("input", { type: "checkbox" });
+    const out = el("div", { class: "plan-result" });
+    const button = el("button", { class: "btn primary", text: "Calcular" });
+    const go = async () => {
+      button.disabled = true;
+      out.replaceChildren(el("p", { class: "note", text: "Buscando la mejor combinación de canales…" }));
+      try {
+        const resultId = store.result && !store.outdated ? store.result.result_id : null;
+        const plan = await api.planChannels(store.apiProject(), { include_dfs: dfs.checked, include_unii4: unii4.checked }, resultId);
+        out.replaceChildren(...planView(plan));
+      } catch (error) {
+        out.replaceChildren(el("p", { class: "note warn-note", text: `No se pudo calcular: ${error.message}` }));
+      } finally {
+        button.disabled = false;
+      }
+    };
+    button.addEventListener("click", go);
+    const planView = (plan) => {
+      const table = el("table", { class: "data" },
+        el("tr", {}, ...["AP", "Banda", "Ancho", "Canal actual", "Sugerido"].map((h) => el("th", { text: h }))));
+      for (const a of plan.assignments) {
+        table.append(el("tr", {}, el("td", { text: a.name }), el("td", { text: `${a.band} GHz` }), el("td", { text: `${a.width_mhz} MHz` }),
+          el("td", { class: "num", text: String(a.before) }),
+          el("td", { class: "num" }, el(a.after !== a.before ? "strong" : "span", { text: String(a.after) }))));
+      }
+      const b = plan.before;
+      const f = plan.after;
+      const pct = (v) => `${fmt(100 * v, 0)} %`;
+      const metrics = el("table", { class: "data" },
+        el("tr", {}, el("th", { text: "Área servida por Wi-Fi" }), el("th", { class: "num", text: "Ahora" }), el("th", { class: "num", text: "Sugerido" })),
+        ...[["Mediana del SINR", `${fmt(b.median_sinr_db, 1)} dB`, `${fmt(f.median_sinr_db, 1)} dB`],
+          ["Con SINR ≥ 20 dB", pct(b.fraction_sinr_20db), pct(f.fraction_sinr_20db)],
+          ["Tasa PHY media", `${fmt(b.mean_rate_mbps, 0)} Mbit/s`, `${fmt(f.mean_rate_mbps, 0)} Mbit/s`],
+          ["Con conexión (≥ MCS 0)", pct(b.fraction_connected), pct(f.fraction_connected)]]
+          .map(([k, x, y]) => el("tr", {}, el("td", { text: k }), el("td", { class: "num", text: x }), el("td", { class: "num", text: y }))));
+      const changed = plan.assignments.filter((a) => a.after !== a.before);
+      const apply = el("button", { class: "btn primary", text: changed.length ? `Aplicar (${changed.length} cambio(s))` : "Sin cambios", disabled: !changed.length });
+      apply.addEventListener("click", async () => {
+        store.change((proj) => {
+          for (const a of plan.assignments) {
+            const t = proj.transmitters.find((x) => x.tx_id === a.tx_id);
+            if (t) { t.wifi_channel = a.after; normalizeWifi(t, proj.settings.wifi_standard || "ax"); }
+          }
+        });
+        $("modal").hidden = true;
+        store.addLog("info", `Canales Wi-Fi aplicados: ${changed.map((a) => `${a.name} → ${a.after}`).join(", ")}. Ctrl+Z los deshace.`);
+        await app.run();
+      });
+      const nodes = [table, metrics];
+      for (const note of plan.notes) nodes.push(el("p", { class: "note warn-note", text: note }));
+      nodes.push(el("p", { class: "note", text: `${plan.evaluations} combinaciones evaluadas. La búsqueda usa las potencias de la última simulación (cambiar de canal dentro de una banda mueve la frecuencia y la pérdida en ~1 dB a lo más): al aplicar se vuelve a simular.` }));
+      nodes.push(el("div", { class: "props-actions" }, apply));
+      return nodes;
+    };
+    showModal("Sugerir canales Wi-Fi", [
+      el("p", { text: "Cada AP conserva su banda y su ancho de canal; se elige el canal que da la mayor eficiencia espectral media en el área (el SINR de cada punto, hasta el de la MCS más alta). En 2.4 GHz solo se usan 1, 6 y 11." }),
+      el("label", { class: "inline-check" }, dfs, el("span", { text: "Usar canales DFS en 5 GHz (52–144: el AP debe detectar radares y puede cambiar de canal solo)" })),
+      el("label", { class: "inline-check" }, unii4, el("span", { text: "Usar 5850–5895 MHz (canales 169–177: solo en algunos países)" })),
+      el("p", { class: "note", text: "Revisa qué canales permite tu país antes de aplicar el plan." }),
+      el("div", { class: "props-actions" }, button),
+      out,
+    ]);
   },
 
   // ----- mediciones
@@ -610,7 +683,8 @@ function helpModal() {
     el("p", { text: "Flujo de trabajo: define el área de predicción y la configuración, coloca transmisores, dibuja edificios (2.5D: planta poligonal y altura) y muros con su material, ejecuta la predicción y explora los mapas. Con la herramienta Receptor ves los rayos en 2D y 3D y la respuesta al impulso del canal en cualquier punto." }),
     table,
     el("p", { text: "Con mediciones: Archivo → Plano de fondo para cargar el plano y escalarlo con dos puntos; Archivo → Importar mediciones (CSV con x, y y la potencia en dBm) o la herramienta Medición (N); después, la pestaña Mediciones compara y calibra." }),
-    el("p", { class: "note", text: "Los proyectos se guardan como archivos .orps.json (el mismo formato que open_rps.project.Project en Python), con el plano y las mediciones dentro. El último proyecto se guarda también en el navegador." }),
+    el("p", { text: "Con Wi-Fi: asigna a cada transmisor una banda, un ancho y un canal (panel Propiedades → Wi-Fi) y elige el estándar en Configuración. Aparecen los mapas de tasa de datos, MCS y AP que comparten el canal; el receptor muestra qué AP interfieren y cuánto. Simulación → Sugerir canales Wi-Fi propone un plan de canales." }),
+    el("p", { class: "note", text: "Los proyectos se guardan como archivos .orps.json (el mismo formato que open_rps.project.Project en Python), con el plano, las mediciones y los canales Wi-Fi dentro. El último proyecto se guarda también en el navegador." }),
   ]);
 }
 
@@ -620,7 +694,8 @@ function aboutModal() {
     el("p", { text: `OpenRPS ${info.version || ""}: simulador de propagación de ondas de radio de código abierto, para uso docente. Licencia GPL-2.0.` }),
     el("p", { text: "Motor: ray tracing 3D (rayo directo, reflexión en el suelo, uno o dos rebotes especulares en muros y suelo, difracción UTD en una o dos aristas por rayo, rayos que combinan un rebote con una difracción, y obstrucción por muros y techos) y modelos empíricos (FSPL, Two-Ray, Log-distancia, Okumura-Hata, COST-231 Hata)." }),
     el("p", { text: "Desde la 1.7.0 puedes cargar el plano de fondo, importar o anotar mediciones, compararlas con la predicción y calibrar las pérdidas de los materiales y la potencia de las antenas (pestaña Mediciones)." }),
-    el("p", { class: "note", text: "Limitaciones: a lo más dos interacciones por rayo (dos rebotes, dos difracciones o un rebote y una difracción) y terreno plano. Los modelos no están validados contra campañas de medición: calíbralos con las tuyas. Consulta la sección «Limitaciones físicas» del README antes de usar los resultados." }),
+    el("p", { text: "Desde la 1.8.0 hay una capa Wi-Fi (802.11n/ac/ax en 2.4, 5 y 6 GHz): interferencia entre canales vecinos según la máscara espectral, SINR, MCS y tasa PHY por punto, contención por canal compartido y sugerencia de canales." }),
+    el("p", { class: "note", text: "Limitaciones: a lo más dos interacciones por rayo (dos rebotes, dos difracciones o un rebote y una difracción) y terreno plano. Los modelos no están validados contra campañas de medición: calíbralos con las tuyas. En Wi-Fi, la interferencia entre canales usa la máscara del estándar (una cota superior) y la tasa es la PHY, no el throughput real. Consulta la sección «Limitaciones físicas» del README antes de usar los resultados." }),
     el("p", { class: "note", text: "La vista 3D usa three.js r187 (licencia MIT), incluido en el paquete." }),
   ]);
 }
@@ -654,6 +729,7 @@ const actions = {
   "import-measurements": () => app.pickMeasurementsCsv(),
   compare: () => { app.showMeasurements(); app.compareMeasurements(); },
   "show-measurements": () => app.showMeasurements(),
+  "wifi-plan": () => app.planChannels(),
 };
 
 function bindUi() {

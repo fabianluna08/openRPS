@@ -1,5 +1,6 @@
 // Vista 2D: plano del escenario, editor (transmisores, edificios, muros) y mapa de cobertura.
 import { INK, INK2, MUTED, SURFACE, fmt, niceStep, rampColor, txColor } from "./colors.js";
+import { channelLabel } from "./wifi.js";
 import { currentLayer, imageExtent, pixelAt } from "./coverage.js";
 import { centroid, distToSegment, isSimplePolygon, pointInPolygon, round, snap } from "./geometry.js";
 import { nextId, nextTxId } from "./state.js";
@@ -405,7 +406,8 @@ export class View2D {
         ctx.textBaseline = "middle";
         haloText(ctx, tx.name || `Tx ${tx.tx_id}`, sx + 12, sy, tx.enabled ? INK : MUTED);
         ctx.font = "11px system-ui, sans-serif";
-        haloText(ctx, `${fmt(tx.z, 0)} m · ${fmt(tx.tx_power_dbm, 0)} dBm`, sx + 12, sy + 13, INK2);
+        const channel = channelLabel(tx);
+        haloText(ctx, `${fmt(tx.z, 0)} m · ${fmt(tx.tx_power_dbm, 0)} dBm${channel ? ` · ${channel}` : ""}`, sx + 12, sy + 13, INK2);
       }
       ctx.restore();
     });

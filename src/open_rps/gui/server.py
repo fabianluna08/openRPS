@@ -16,6 +16,7 @@ API (every body is JSON):
     POST /api/measurements/parse {project, csv}   measurements read from CSV text (1.7.0)
     POST /api/compare   {project}     prediction vs the measurements of the project (1.7.0)
     POST /api/calibrate {project, options}   fitted parameters, before/after and the changes (1.7.0)
+    POST /api/wifi/plan {project, options, result_id?}   suggested Wi-Fi channels (1.8.0)
     GET  /api/export/<result_id>/<what>   csv | json | svg-<metric> of a cached result
 """
 
@@ -40,6 +41,7 @@ import numpy as np
 from .. import __version__
 from ..project import (EXAMPLES, HATA_ENVIRONMENTS, PENETRATION_MODELS, REFLECTION_MODELS, SIMULATION_MODES,
                        Project, ProjectError, default_materials)
+from ..channel_plan import plan_channels
 from ..measurements import calibrate, compare, read_csv
 from ..visualizer import MapVisualizer
 
@@ -78,6 +80,10 @@ def result_payload(result, report: Dict[str, Any], result_id: str) -> Dict[str, 
     if result.sinr_db is not None:
         metrics["sinr"] = encode_grid(result.sinr_db)
         metrics["interference"] = encode_grid(result.interference_plus_noise_dbm)
+    if result.wifi_rate_mbps is not None:
+        metrics["wifi_rate"] = encode_grid(result.wifi_rate_mbps)
+        metrics["wifi_mcs"] = encode_grid(result.wifi_mcs)
+        metrics["wifi_contention"] = encode_grid(result.wifi_contention)
     per_tx = None
     if result.rx_power_dbm.size <= MAX_PER_TX_VALUES:
         per_tx = [encode_grid(grid) for grid in result.rx_power_dbm]
@@ -228,6 +234,17 @@ class OpenRPSRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, compare(self._project(body)).to_dict())
             elif path == "/api/calibrate":
                 self._json(HTTPStatus.OK, calibration_payload(self._project(body), body.get("options") or {}))
+            elif path == "/api/wifi/plan":
+                project = self._project(body)
+                options = body.get("options") or {}
+                # The last simulation of this same project, if the page says it is still valid (its transmitters
+                # must match); else the plan simulates it
+                cached = self.server.results.get(str(body.get("result_id") or ""))
+                if cached is not None and list(cached.tx_ids or []) != [t.tx_id for t in project.enabled_transmitters()]:
+                    cached = None
+                plan = plan_channels(project, result=cached, include_dfs=bool(options.get("include_dfs")),
+                                     include_unii4=bool(options.get("include_unii4")))
+                self._json(HTTPStatus.OK, plan.to_dict())
             else:
                 self._error(HTTPStatus.NOT_FOUND, f"ruta desconocida {path}")
         except ProjectError as error:

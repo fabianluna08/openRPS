@@ -39,6 +39,7 @@ export function currentLayer(store) {
     }
     label = `${def.label} · ${store.txName(txId)}`;
   }
+  if (def.negativeIsNone) values = values.map((x) => (x < 0 ? NaN : x));   // MCS -1: no connection
   let range = null;
   if (def.kind === "seq") {
     range = v.rangeAuto || !(v.rangeMax > v.rangeMin) ? autoRange(values, def.zeroBased) : [v.rangeMin, v.rangeMax];
