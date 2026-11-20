@@ -10,7 +10,9 @@ Two equivalent entry points are provided:
 Physical scope (see README, "Limitaciones fisicas"): direct ray, ground reflection
 and one specular reflection per wall; optionally (new in 1.5.0) one diffraction per
 edge (``DiffractionEdge``, UTD) and every double reflection wall-wall / wall-ground
-(``RayTracer(max_reflections=2)``).  Walls do not block rays unless they are given a
+(``RayTracer(max_reflections=2)``); new in 1.6.0, rays diffracted by two edges in a
+row (``max_diffractions=2``) and rays that combine one reflection with one
+diffraction (``mixed_interactions=True``).  Walls do not block rays unless they are given a
 ``transmission_loss_db`` (see ``PlanarReflector``): then every ray leg that crosses
 the wall is attenuated by that loss (``inf`` = opaque wall, the ray carries no power).
 Antennas are isotropic unless ``Transmitter(pattern="sector")`` is used.  The tracer
@@ -21,7 +23,7 @@ or coherently is decided by whoever sums them (``RayField.total_power_linear``,
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -611,6 +613,7 @@ class RayField:
     rx_theta_deg: np.ndarray
     valid: np.ndarray         # bool
     obstruction_loss_db: Optional[np.ndarray] = None   # dB lost through walls, already included in amplitude
+    labels: Optional[list] = None   # (kind, interactions) of each row of the axis K (new in 1.6.0)
 
     @property
     def power_linear(self) -> np.ndarray:
@@ -626,6 +629,22 @@ class RayField:
         if coherent:
             return np.abs(self.amplitude.sum(axis=0)) ** 2
         return self.power_linear.sum(axis=0)
+
+
+def _segment_distance(p1, q1, p2, q2) -> float:
+    """Minimum distance between the segments p1-q1 and p2-q2 (3D)."""
+    p1, q1, p2, q2 = (np.asarray(v, dtype=float) for v in (p1, q1, p2, q2))
+    d1, d2, r = q1 - p1, q2 - p2, p1 - p2
+    a, e, f = float(d1 @ d1), float(d2 @ d2), float(d2 @ r)
+    c, b = float(d1 @ r), float(d1 @ d2)
+    denom = a * e - b * b
+    s = min(1.0, max(0.0, (b * f - c * e) / denom)) if denom > 1e-12 * a * e else 0.0
+    t = (b * s + f) / e
+    if t < 0.0:
+        t, s = 0.0, min(1.0, max(0.0, -c / a))
+    elif t > 1.0:
+        t, s = 1.0, min(1.0, max(0.0, (b - c) / a))
+    return float(np.linalg.norm((p1 + s * d1) - (p2 + t * d2)))
 
 
 def _plane_ref(index: int) -> Tuple[str, int]:
@@ -673,12 +692,39 @@ class RayTracer:
     the loss through the walls that the ray crosses, for the walls that have a
     ``transmission_loss_db`` (none by default; see ``PlanarReflector``).
     """
-    def __init__(self, ground_eps_r: float = 15.0, ground_sigma: float = 0.005, max_reflections: int = 1):
+    def __init__(self, ground_eps_r: float = 15.0, ground_sigma: float = 0.005, max_reflections: int = 1,
+                 max_diffractions: int = 1, mixed_interactions: bool = False):
         self.ground_eps_r = ground_eps_r
         self.ground_sigma = ground_sigma
         self.reflectors: List[PlanarReflector] = []
         self.edges: List[DiffractionEdge] = []
         self.max_reflections = max_reflections
+        self.max_diffractions = max_diffractions
+        self.mixed_interactions = mixed_interactions
+        self._visibility_cache = (None, None)
+        self._active_cache = (None, None)
+
+    @property
+    def max_diffractions(self) -> int:
+        """1 (default): one diffraction per ray.  2: also rays diffracted by two edges in a row (new in 1.6.0)."""
+        return self._max_diffractions
+
+    @max_diffractions.setter
+    def max_diffractions(self, value: int):
+        if isinstance(value, bool) or value not in (1, 2):
+            raise ValueError(f"max_diffractions must be 1 or 2, got {value!r}")
+        self._max_diffractions = int(value)
+
+    @property
+    def mixed_interactions(self) -> bool:
+        """True: also rays reflected and then diffracted, or diffracted and then reflected (new in 1.6.0)."""
+        return self._mixed_interactions
+
+    @mixed_interactions.setter
+    def mixed_interactions(self, value: bool):
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"mixed_interactions must be True or False, got {value!r}")
+        self._mixed_interactions = bool(value)
 
     @property
     def max_reflections(self) -> int:
@@ -705,17 +751,436 @@ class RayTracer:
         planes = range(-1, len(self.reflectors))
         return [(a, b) for a in planes for b in planes if a != b]
 
+    def _higher_order(self) -> List[Tuple[str, int, int]]:
+        """
+        Candidate rays with two interactions, in the order of ``candidate_rays``:
+        ("double", a, b) double reflections, ("rd", a, e) reflection then diffraction,
+        ("dr", e, b) diffraction then reflection and ("dd", i, j) two diffractions
+        (planes: -1 = ground, 0.. = reflectors; edges: 0..).
+        """
+        specs = [("double", a, b) for a, b in self._plane_pairs()]
+        planes = range(-1, len(self.reflectors))
+        edges = range(len(self.edges))
+        if self.mixed_interactions:
+            specs += [("rd", a, e) for a in planes for e in edges]
+            specs += [("dr", e, b) for e in edges for b in planes]
+        if self.max_diffractions >= 2:
+            specs += [("dd", i, j) for i in edges for j in edges if i != j]
+        return specs
+
+    @staticmethod
+    def _spec_label(spec) -> Tuple[str, Tuple[Tuple[str, int], ...]]:
+        kind, a, b = spec
+        if kind == "double":
+            return "double", (_plane_ref(a), _plane_ref(b))
+        if kind == "rd":
+            return "reflection-diffraction", (_plane_ref(a), ("edge", b))
+        if kind == "dr":
+            return "diffraction-reflection", (("edge", a), _plane_ref(b))
+        return "double-diffraction", (("edge", a), ("edge", b))
+
     def candidate_rays(self) -> List[Tuple[str, Tuple[Tuple[str, int], ...]]]:
         """
         (kind, interactions) of every candidate ray, in the order of the axis K of
         ``trace_points`` (and of the rays of ``trace_paths``).  Interactions are
         ("ground", -1), ("wall", index of the reflector) or ("edge", index of the edge).
+        Kinds: "direct", "ground", "wall", "diffraction", "double" (two reflections) and,
+        new in 1.6.0, "reflection-diffraction", "diffraction-reflection" and
+        "double-diffraction".
         """
         rays = [("direct", ()), ("ground", (("ground", -1),))]
         rays += [("wall", (("wall", r),)) for r in range(len(self.reflectors))]
         rays += [("diffraction", (("edge", e),)) for e in range(len(self.edges))]
-        rays += [("double", (_plane_ref(a), _plane_ref(b))) for a, b in self._plane_pairs()]
+        rays += [self._spec_label(spec) for spec in self._higher_order()]
         return rays
+
+    # ------------------------------------------------------------------ visibility (pruning, new in 1.6.0)
+    def _scene_key(self):
+        """Fingerprint of the geometry that the visibility depends on (the reflectors can be edited in place)."""
+        walls = tuple((id(r), r.p0.tobytes(), r.normal.tobytes(), r.bounds, r.transmission_loss_db,
+                       None if r.footprint is None else np.asarray(r.footprint).tobytes()) for r in self.reflectors)
+        edges = tuple((id(e), e.start.tobytes(), e.end.tobytes(), e.face_direction.tobytes(), e.wedge_n)
+                      for e in self.edges)
+        return walls, edges
+
+    @staticmethod
+    def _patch_samples(refl: PlanarReflector) -> Optional[np.ndarray]:
+        """A few points of a bounded wall patch (None for unbounded walls, which are always visible)."""
+        box = refl.bounds
+        if box is None or not all(np.isfinite(box)):
+            return None
+        fractions = (1.0 / 6.0, 0.5, 5.0 / 6.0)
+        grid = np.array([[box[0] + (box[1] - box[0]) * fx, box[2] + (box[3] - box[2]) * fy,
+                          box[4] + (box[5] - box[4]) * fz] for fx in fractions for fy in fractions for fz in fractions])
+        grid = grid - refl.signed_distance(grid)[:, None] * refl.normal
+        grid = grid[refl.contains(grid)]
+        if not len(grid):
+            return None
+        return np.unique(np.round(grid, 9), axis=0)
+
+    @staticmethod
+    def _edge_samples(edge: DiffractionEdge) -> np.ndarray:
+        return edge.start + np.array([0.02, 0.25, 0.5, 0.75, 0.98])[:, None] * (edge.end - edge.start)
+
+    def _opaque_walls(self) -> List[PlanarReflector]:
+        return [r for r in self.reflectors if r.transmission_loss_db is not None and np.isinf(r.transmission_loss_db)]
+
+    @staticmethod
+    def _blocked(opaque: List[PlanarReflector], a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """True where the segments a -> b ([S, 3]) cross an opaque wall."""
+        blocked = np.zeros(len(a), dtype=bool)
+        for wall in opaque:
+            todo = np.flatnonzero(~blocked)
+            if not todo.size:
+                break
+            blocked[todo] = wall.crosses(a[todo], b[todo])
+        return blocked
+
+    def _pair_visibility(self, opaque, samples_a: list, samples_b: list) -> np.ndarray:
+        """[len(a), len(b)] True if some segment between the samples of a and of b is not blocked."""
+        visible = np.ones((len(samples_a), len(samples_b)), dtype=bool)
+        seg_a, seg_b, owner = [], [], []
+        for i, sa in enumerate(samples_a):
+            for j, sb in enumerate(samples_b):
+                if sa is None or sb is None:
+                    continue
+                visible[i, j] = False
+                seg_a.append(np.repeat(sa, len(sb), axis=0))
+                seg_b.append(np.tile(sb, (len(sa), 1)))
+                owner.append(np.full(len(sa) * len(sb), i * len(samples_b) + j))
+        if seg_a:
+            a, b, owner = np.concatenate(seg_a), np.concatenate(seg_b), np.concatenate(owner)
+            clear = ~self._blocked(opaque, a, b)
+            flat = visible.reshape(-1)
+            flat[np.unique(owner[clear])] = True
+        return visible
+
+    def _visibility(self) -> Dict[str, Any]:
+        """Sampled visibility between walls and edges through opaque walls (cached per geometry)."""
+        key = self._scene_key()
+        if self._visibility_cache[0] == key:
+            return self._visibility_cache[1]
+        opaque = self._opaque_walls()
+        wall_samples = [self._patch_samples(r) for r in self.reflectors]
+        edge_samples = [self._edge_samples(e) for e in self.edges]
+        data = {"opaque": opaque, "wall_samples": wall_samples, "edge_samples": edge_samples, "dd_geometry": {},
+                "patch_corners": [self._patch_corners(r) for r in self.reflectors]}
+        if self.edges and opaque and (self.mixed_interactions or self.max_diffractions >= 2):
+            data["wall_edge"] = self._pair_visibility(opaque, wall_samples, edge_samples) if self.mixed_interactions \
+                else np.ones((len(self.reflectors), len(self.edges)), dtype=bool)
+            data["edge_edge"] = self._pair_visibility(opaque, edge_samples, edge_samples) \
+                if self.max_diffractions >= 2 else np.ones((len(self.edges),) * 2, dtype=bool)
+        else:
+            data["wall_edge"] = np.ones((len(self.reflectors), len(self.edges)), dtype=bool)
+            data["edge_edge"] = np.ones((len(self.edges),) * 2, dtype=bool)
+        self._visibility_cache = (key, data)
+        return data
+
+    def _mirror_reaches(self, a: int, e: int, image: np.ndarray, s_tx: float) -> bool:
+        """
+        False if no point of edge e can be seen from the image of Tx through the patch
+        of wall a (exact): the reflection points lie on the segment where the triangle
+        (image, edge) meets the plane, after clipping the edge to the side of Tx.
+        """
+        wall, edge = self.reflectors[a], self.edges[e]
+        box = wall.bounds
+        if box is None:
+            return True
+        tol = OBSTRUCTION_TOL_M
+        ends = np.array([edge.start, edge.end])
+        dist = np.sign(s_tx) * wall.signed_distance(ends)
+        if dist.min() < tol:                         # clip the edge where it crosses the plane
+            if dist.max() <= tol:
+                return False
+            t = (dist[0] - tol) / (dist[0] - dist[1])
+            cut = ends[0] + t * (ends[1] - ends[0])
+            ends = np.array([ends[int(np.argmax(dist))], cut])
+        s_image = -s_tx
+        hits = []
+        for c in ends:
+            s_c = float(wall.signed_distance(c))
+            hits.append(image + (s_image / (s_image - s_c)) * (c - image))
+        lo, hi = np.min(hits, axis=0), np.max(hits, axis=0)
+        margin = 1e-6
+        return all(hi[axis] >= box[2 * axis] - margin and lo[axis] <= box[2 * axis + 1] + margin for axis in range(3))
+
+    @staticmethod
+    def _angular_range(about: DiffractionEdge, points):
+        """
+        Angles (in the convention of ``about.cylindrical``) under which the convex hull
+        of ``points`` ([N, 3]: the ends of a segment, the corners of a wall patch) is seen
+        from the line of edge ``about``, as a list of (lo, hi) intervals of [0, 2 pi];
+        None when the hull meets that line or comes too close to it, where every angle
+        is possible.  A convex set that misses the line lies in a half-plane around it,
+        so its angles fill the circle except the largest gap between the angles of the
+        points, which then exceeds pi.  The intervals are widened by 1e-4 rad (points on
+        the cut phi = 0 may count as 0 or 2 pi, and patches are tested 1 nm wider).
+        """
+        pts = np.asarray(points, dtype=float) - about.start
+        perp = pts - (pts @ about.axis)[:, None] * about.axis
+        x, y = perp @ about.face_direction, perp @ about.face_normal
+        if np.any(np.hypot(x, y) <= 1e-3):
+            return None
+        two_pi, delta = 2.0 * math.pi, 1e-4
+        phi = np.sort(np.mod(np.arctan2(y, x), two_pi))
+        gaps = np.diff(np.append(phi, phi[0] + two_pi))
+        g = int(np.argmax(gaps))
+        if gaps[g] <= math.pi + 2.0 * delta:
+            return None
+        lo, hi = float(phi[(g + 1) % len(phi)]) - delta, float(phi[g]) + delta   # counter-clockwise lo -> hi
+        if g == len(phi) - 1:                       # the gap is the one that contains the cut: no wrap
+            intervals = [(lo, hi)]
+        else:                                       # the arc crosses the cut
+            intervals = [(lo, two_pi), (0.0, hi)]
+        out = []
+        for a, b in intervals:                      # fold what the widening pushed across the cut
+            if a < 0.0:
+                out += [(0.0, b), (two_pi + a, two_pi)]
+            elif b > two_pi:
+                out += [(a, two_pi), (0.0, b - two_pi)]
+            else:
+                out.append((a, b))
+        return out
+
+    @staticmethod
+    def _zone_reachable(intervals, phi_in, phi_out, n: float, margin):
+        """
+        Whether some pair of angles, one taken from ``intervals`` (a list of (lo, hi))
+        and the other given, passes ``_transition_zone`` with the given margin (or a
+        larger one): ``phi_in`` None means the incidence angle ranges over the intervals
+        (``phi_out`` an array, the result too), ``phi_out`` None that the observation
+        angle does (``phi_in`` and the result scalars).
+        """
+        pi = math.pi
+        rsb = 2.0 * n - 1.0
+        if phi_out is None:
+            for lo, hi in intervals:
+                if hi >= phi_in + pi - margin or lo <= phi_in - pi + margin:
+                    return True
+                if any(lo <= b + margin and hi >= b - margin for b in (pi - phi_in, rsb * pi - phi_in)):
+                    return True
+            return False
+        ok = np.zeros(np.shape(phi_out), dtype=bool)
+        for lo, hi in intervals:
+            ok |= (phi_out >= lo + pi - margin) | (phi_out <= hi - pi + margin)
+            ok |= (phi_out >= pi - hi - margin) & (phi_out <= pi - lo + margin)
+            ok |= (phi_out >= rsb * pi - hi - margin) & (phi_out <= rsb * pi - lo + margin)
+        return ok
+
+    @staticmethod
+    def _keller_fits(edge: DiffractionEdge, s_p, r_p, s_range, r_min):
+        """
+        Necessary condition for the point of edge ``edge`` that ends the shortest path
+        from P (coordinates s_p, r_p around the edge, scalars or arrays) to some point Q
+        of a segment to lie on the edge.  Given Q, that point is exactly
+        s = s_p + (s_q - s_p) w with w = r_p / (r_p + r_q) (the unfolded path), so it is
+        bounded with the range of s_q over the segment (``s_range``) and w <= r_p / (r_p
+        + r_min), r_min the distance from the segment to the edge line.
+        """
+        slack = _BOUNDS_TOL_M + 1e-7
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = np.where(r_p + r_min > 0, r_p / (r_p + r_min), 1.0)
+        above = s_p - edge.length - slack
+        below = -s_p - slack
+        return (((above <= 0) | (w * np.maximum(0.0, s_p - s_range[0]) >= above))
+                & ((below <= 0) | (w * np.maximum(0.0, s_range[1] - s_p) >= below)))
+
+    @staticmethod
+    def _patch_corners(refl: PlanarReflector) -> Optional[np.ndarray]:
+        """
+        Corners of the patch of a bounded wall: where its plane meets the edges of the
+        bounding box (a convex polygon that contains the patch); None if unbounded.
+        """
+        box = refl.bounds
+        if box is None or not all(np.isfinite(box)):
+            return None
+        corners = np.array([[x, y, z] for x in box[0:2] for y in box[2:4] for z in box[4:6]])
+        dist = refl.signed_distance(corners)
+        points = list(corners[np.abs(dist) <= 1e-12])
+        for a in range(8):
+            for b in range(a + 1, 8):
+                if np.count_nonzero(corners[a] != corners[b]) != 1 or dist[a] * dist[b] >= 0.0:
+                    continue
+                t = dist[a] / (dist[a] - dist[b])
+                points.append(corners[a] + t * (corners[b] - corners[a]))
+        return np.array(points) if points else None
+
+    @staticmethod
+    def _box_distance(a: np.ndarray, b: np.ndarray) -> float:
+        """Distance between the bounding boxes of two point sets (a lower bound of their distance)."""
+        gap = np.maximum(0.0, np.maximum(a.min(axis=0) - b.max(axis=0), b.min(axis=0) - a.max(axis=0)))
+        return float(np.linalg.norm(gap))
+
+    def _dr_pair_possible(self, e: int, b: int, tx_p: np.ndarray, k: float) -> bool:
+        """
+        Necessary condition of a ray Tx -> edge e -> wall b -> Rx to pass the
+        transition-zone test at the edge for some receiver: it leaves the edge towards
+        the reflection point, so its angle is one of those under which the edge sees the
+        wall patch (``_angular_range``), and L = r_t^2 s2 / (s1 (s1 + s2)) with s1 at most
+        the distance from Tx to the farther end of the edge and s2 at least the distance
+        from the edge to the patch.
+        """
+        corners = self._visibility()["patch_corners"][b]
+        if corners is None:
+            return True
+        edge = self.edges[e]
+        intervals = self._angular_range(edge, corners)
+        if intervals is None:
+            return True
+        _, r_t, phi_t = (float(v) for v in edge.cylindrical(tx_p))
+        far = max(float(np.linalg.norm(edge.start - tx_p)), float(np.linalg.norm(edge.end - tx_p)))
+        near = self._box_distance(np.array([edge.start, edge.end]), corners)
+        low = r_t * r_t * near / (far * (far + near))
+        margin = min(math.pi, math.sqrt(20.0 / (k * max(low, 1e-300))))
+        return margin >= math.pi or bool(self._zone_reachable(intervals, phi_t, None, edge.wedge_n, margin))
+
+    @staticmethod
+    def _segment_from_line(edge: DiffractionEdge, start, end):
+        """(s range along the edge, distance to the edge line) of the segment start-end."""
+        ends = np.array([start, end], dtype=float) - edge.start
+        s_ends = ends @ edge.axis
+        perp = ends - s_ends[:, None] * edge.axis
+        v = perp[1] - perp[0]
+        vv = float(v @ v)
+        t = 0.0 if vv == 0.0 else min(1.0, max(0.0, -float(perp[0] @ v) / vv))
+        return (float(s_ends.min()), float(s_ends.max())), float(np.linalg.norm(perp[0] + t * v))
+
+    def _dd_pair_possible(self, ei: DiffractionEdge, ej: DiffractionEdge, tx_p: np.ndarray, gap: float,
+                          k: float) -> bool:
+        """
+        Necessary conditions, for some receiver, of a doubly diffracted ray Tx -> edge i
+        -> edge j: the point on edge i can lie on the segment (``_keller_fits``) and the
+        ray can pass the transition-zone test at edge i (``_transition_zone``) for some
+        point of edge j.  Exact on the angles (``_angular_range``) and with the smallest
+        possible distance parameter, L >= r_t^2 gap / (d (d + gap)), d the farthest
+        distance from Tx to edge i (L = r_t^2 l2 / (l1 (l1 + l2)), l2 >= gap, l1 <= d).
+        """
+        s_t, r_t, phi_t = (float(v) for v in ei.cylindrical(tx_p))
+        s_range, r_min = self._segment_from_line(ei, ej.start, ej.end)
+        if not bool(self._keller_fits(ei, s_t, r_t, s_range, r_min)):
+            return False
+        far = max(float(np.linalg.norm(ei.start - tx_p)), float(np.linalg.norm(ei.end - tx_p)))
+        low = r_t * r_t * gap / (far * (far + gap))
+        margin = min(math.pi, math.sqrt(20.0 / (k * max(low, 1e-300))))
+        intervals = self._angular_range(ei, [ej.start, ej.end])
+        if margin >= math.pi or intervals is None:
+            return True
+        return bool(self._zone_reachable(intervals, phi_t, None, ei.wedge_n, margin))
+
+    def _dd_geometry(self, i: int, j: int) -> dict:
+        """
+        What the per-receiver pruning of the doubly diffracted rays i -> j needs, which
+        depends only on the two edges (cached with the scene): the distance between
+        them, the angles under which edge j sees edge i, and the position and distance
+        of edge i relative to the line of edge j.
+        """
+        cache = self._visibility()["dd_geometry"]
+        if (i, j) not in cache:
+            ei, ej = self.edges[i], self.edges[j]
+            s_range, r_min = self._segment_from_line(ej, ei.start, ei.end)
+            cache[(i, j)] = {"gap": _segment_distance(ei.start, ei.end, ej.start, ej.end),
+                             "angles": self._angular_range(ej, [ei.start, ei.end]),
+                             "s_range": s_range, "r_min": r_min}
+        return cache[(i, j)]
+
+    def _active_higher_order(self, tx: Transmitter) -> List[Tuple[int, Tuple[str, int, int]]]:
+        """
+        (position in ``candidate_rays``, spec) of the two-interaction candidates that
+        can exist for this transmitter.  Exact geometric tests (Tx or images on a
+        plane, patches entirely behind a plane, Tx inside a wedge, edges inside each
+        other's wedge or touching) and, for the rays with a diffraction (new in 1.6.0),
+        a sampled visibility test: an object pair (or Tx-object pair) is dropped when
+        all the segments between their sample points cross an opaque wall.
+        """
+        specs = self._higher_order()
+        if not specs:
+            return []
+        tx_p = np.array([tx.x, tx.y, tx.z], dtype=float)
+        key = (tx_p.tobytes(), self._scene_key(), self.max_reflections, self.max_diffractions, self.mixed_interactions)
+        if self._active_cache[0] == key:
+            return self._active_cache[1]
+        tol = OBSTRUCTION_TOL_M
+        first = 2 + len(self.reflectors) + len(self.edges)
+        vis = self._visibility()
+        opaque = vis["opaque"]
+        need_tx_vis = any(spec[0] != "double" for spec in specs)
+        tx_sees_wall = np.ones(len(self.reflectors), dtype=bool)
+        tx_sees_edge = np.ones(len(self.edges), dtype=bool)
+        if need_tx_vis and opaque:
+            tx_sees_wall = self._pair_visibility(opaque, [tx_p[None, :]], vis["wall_samples"])[0]
+            tx_sees_edge = self._pair_visibility(opaque, [tx_p[None, :]], vis["edge_samples"])[0]
+        s_tx = {a: float(self._plane_distance(a, tx_p)) for a in range(-1, len(self.reflectors))}
+        tx_in_wedge = []
+        for edge in self.edges:
+            _, r, phi = (float(v) for v in edge.cylindrical(tx_p))
+            tx_in_wedge.append(r > tol and phi <= edge.exterior_angle + _ANGLE_TOL)
+
+        def edge_side(a, e):
+            """Signed distances of the ends of edge e to plane a."""
+            edge = self.edges[e]
+            return self._plane_distance(a, np.array([edge.start, edge.end]))
+
+        def outside_wedge(e, points):
+            """True if some of ``points`` lies in the exterior of wedge e (or on its edge line)."""
+            _, r, phi = self.edges[e].cylindrical(np.asarray(points, dtype=float))
+            return bool(np.any((phi <= self.edges[e].exterior_angle + _ANGLE_TOL) | (r <= tol)))
+
+        active = []
+        for offset, spec in enumerate(specs):
+            kind, a, b = spec
+            if kind == "double":
+                if not abs(s_tx[a]) > tol:
+                    continue
+                image = self._mirror(a, tx_p, s_tx[a])
+                s_image = float(self._plane_distance(b, image))
+                if not abs(s_image) > tol:
+                    continue
+                if b >= 0:
+                    box = self.reflectors[b].bounds
+                    if box is not None and all(np.isfinite(box)):
+                        corners = np.array([[x, y, z] for x in box[0:2] for y in box[2:4] for z in box[4:6]])
+                        if np.all(np.sign(s_tx[a]) * self._plane_distance(a, corners) < -tol):
+                            continue
+            elif kind == "rd":
+                e = b
+                if not abs(s_tx[a]) > tol:
+                    continue
+                ends = edge_side(a, e)
+                if np.all(np.abs(ends) <= tol) or not np.max(np.sign(s_tx[a]) * ends) > tol:
+                    continue
+                if a >= 0 and not (tx_sees_wall[a] and vis["wall_edge"][a, e]):
+                    continue
+                image = self._mirror(a, tx_p, s_tx[a])
+                _, r_i, phi_i = (float(v) for v in self.edges[e].cylindrical(image))
+                if not (r_i > tol and phi_i <= self.edges[e].exterior_angle + _ANGLE_TOL):
+                    continue
+                if a >= 0 and not self._mirror_reaches(a, e, image, s_tx[a]):
+                    continue
+            elif kind == "dr":
+                e = a
+                if not (tx_in_wedge[e] and tx_sees_edge[e]):
+                    continue
+                if np.all(np.abs(edge_side(b, e)) <= tol):
+                    continue
+                if b >= 0 and not vis["wall_edge"][b, e]:
+                    continue
+                if b >= 0 and not self._dr_pair_possible(e, b, tx_p, 2.0 * math.pi * tx.frequency_hz / SPEED_OF_LIGHT):
+                    continue
+            else:                                                       # "dd"
+                i, j = a, b
+                if not (tx_in_wedge[i] and tx_sees_edge[i] and vis["edge_edge"][i, j]):
+                    continue
+                ei, ej = self.edges[i], self.edges[j]
+                gap = _segment_distance(ei.start, ei.end, ej.start, ej.end)
+                if gap <= tol:
+                    continue                                            # edges that touch: a vertex, not two edges
+                if not outside_wedge(i, [ej.start, ej.end]) or not outside_wedge(j, [ei.start, ei.end]):
+                    continue
+                if not self._dd_pair_possible(ei, ej, tx_p, gap, 2.0 * math.pi * tx.frequency_hz / SPEED_OF_LIGHT):
+                    continue
+            active.append((first + offset, spec))
+        self._active_cache = (key, active)
+        return active
 
     def obstruction_loss_db(self, p_start, p_end) -> np.ndarray:
         """
@@ -855,43 +1320,88 @@ class RayTracer:
         (-1 = ground), which is the only wall not tested at that bend.
         """
         loss = np.zeros(len(idx))
-        for index, wall, s_tx, s_rx in obstacles:
+        if not obstacles:
+            return loss
+        # Bounding boxes of the vertices (over all the points): a leg whose box misses the box of a
+        # wall (with its 1 nm margin) cannot cross it, so that wall is skipped for that leg
+        lows = np.array([np.min(np.reshape(v, (-1, 3)), axis=0) for v in vertices])
+        highs = np.array([np.max(np.reshape(v, (-1, 3)), axis=0) for v in vertices])
+        leg_lo, leg_hi = np.minimum(lows[:-1], lows[1:]), np.maximum(highs[:-1], highs[1:])
+        bend_lo, bend_hi = np.minimum(leg_lo[:-1], leg_lo[1:]), np.maximum(leg_hi[:-1], leg_hi[1:])
+        unbounded = (-np.inf, np.inf) * 3
+        boxes = np.array([wall.bounds if wall.bounds is not None else unbounded for _, wall, _, _ in obstacles])
+        wall_lo, wall_hi = boxes[:, 0::2] - _BOUNDS_TOL_M, boxes[:, 1::2] + _BOUNDS_TOL_M
+        leg_hit = ~np.any((leg_hi[None] < wall_lo[:, None]) | (leg_lo[None] > wall_hi[:, None]), axis=-1)
+        bend_hit = ~np.any((bend_hi[None] < wall_lo[:, None]) | (bend_lo[None] > wall_hi[:, None]), axis=-1)
+
+        for w, (index, wall, s_tx, s_rx) in enumerate(obstacles):
+            legs = np.flatnonzero(leg_hit[w]).tolist()
+            bends = [(b, own) for b, own in enumerate(bend_owns, start=1)
+                     if own is not None and own != index and bend_hit[w, b - 1]]
+            if not legs and not bends:
+                continue
             dist = [s_tx] + [wall.signed_distance(v) for v in vertices[1:-1]] + [s_rx[idx]]
-            for leg in range(len(vertices) - 1):
+            for leg in legs:
                 crossed = wall._crosses(dist[leg], dist[leg + 1], vertices[leg], vertices[leg + 1])
                 np.add(loss, wall.transmission_loss_db, out=loss, where=crossed)
-            for b, own in enumerate(bend_owns, start=1):
-                if own is None or own == index:
-                    continue
+            for b, own in bends:
                 crossed = wall._crosses_at_bend(dist[b - 1], dist[b], dist[b + 1],
                                                 vertices[b - 1], vertices[b], vertices[b + 1])
                 np.add(loss, wall.transmission_loss_db, out=loss, where=crossed)
         return loss
 
     def _extra_rays(self, tx: Transmitter, pts: np.ndarray, k: float, amp_1m: float, sector: bool,
-                    want_vertices: bool) -> List[_Rays]:
+                    want_vertices: bool) -> List[Tuple[int, _Rays]]:
         """
-        The rays added in 1.5.0 (one diffraction per edge, then every double
-        reflection), in the order of ``candidate_rays``, for the flat array of
-        receiver points ``pts`` ([M, 3]).  Shared by ``trace_paths`` (one point) and
-        ``trace_points``, so both give the same rays.
+        The rays added since 1.5.0, as (position in ``candidate_rays``, rays) in that
+        order, for the flat array of receiver points ``pts`` ([M, 3]): one diffraction
+        per edge, then the two-interaction candidates that can exist for this
+        transmitter (``_active_higher_order``).  Shared by ``trace_paths`` (one point)
+        and ``trace_points``, so both give the same rays.
         """
         tx_p = np.array([tx.x, tx.y, tx.z], dtype=float)
         obstacles = [(index, refl, float(refl.signed_distance(tx_p)), refl.signed_distance(pts))
                      for index, refl in enumerate(self.reflectors) if refl.obstructs]
-        out = [self._diffracted_ray(tx, tx_p, pts, e, edge, k, amp_1m, sector, obstacles, want_vertices)
+        first = 2 + len(self.reflectors)
+        out = [(first + e, self._diffracted_ray(tx, tx_p, pts, e, edge, k, amp_1m, sector, obstacles, want_vertices))
                for e, edge in enumerate(self.edges)]
-        if self.max_reflections >= 2:
-            cache = {}
+        cache = {}
 
-            def rx_distance(index):
-                if index not in cache:
-                    cache[index] = self._plane_distance(index, pts)
-                return cache[index]
+        def rx_distance(index):
+            if index not in cache:
+                cache[index] = self._plane_distance(index, pts)
+            return cache[index]
 
-            for a, b in self._plane_pairs():
-                out.append(self._double_ray(tx, tx_p, pts, a, b, k, amp_1m, sector, obstacles, rx_distance,
-                                            want_vertices))
+        edge_coords = {}
+
+        def rx_cylindrical(e):
+            if e not in edge_coords:
+                edge_coords[e] = self.edges[e].cylindrical(pts)
+            return edge_coords[e]
+
+        edge_far = {}
+
+        def rx_far(e):
+            """Distance from each receiver to the farther end of edge e."""
+            if e not in edge_far:
+                edge = self.edges[e]
+                edge_far[e] = np.maximum(np.linalg.norm(pts - edge.start, axis=-1),
+                                         np.linalg.norm(pts - edge.end, axis=-1))
+            return edge_far[e]
+
+        for position, (kind, a, b) in self._active_higher_order(tx):
+            if kind == "double":
+                ray = self._double_ray(tx, tx_p, pts, a, b, k, amp_1m, sector, obstacles, rx_distance, want_vertices)
+            elif kind == "rd":
+                ray = self._reflect_diffract_ray(tx, tx_p, pts, a, b, k, amp_1m, obstacles, rx_cylindrical,
+                                                 want_vertices)
+            elif kind == "dr":
+                ray = self._diffract_reflect_ray(tx, tx_p, pts, a, b, k, amp_1m, obstacles, rx_distance,
+                                                 want_vertices)
+            else:
+                ray = self._double_diffraction_ray(tx, tx_p, pts, a, b, k, amp_1m, obstacles, rx_cylindrical,
+                                                   rx_far, want_vertices)
+            out.append((position, ray))
         return out
 
     def _finish(self, ray: _Rays, tx: Transmitter, tx_p, idx, amp, length, first_point, last_point, rx,
@@ -992,6 +1502,317 @@ class RayTracer:
         length = np.linalg.norm(rx - image_ab, axis=-1)
         amp = (amp_1m / length) * gamma * np.exp(-1j * k * length)
         return self._finish(ray, tx, tx_p, idx, amp, length, p1, p2, rx, obstacles, [p1, p2], [a, b],
+                            want_vertices)
+
+    def _utd(self, edge: DiffractionEdge, phi_in, phi_out, k, s_in, s_out, sin_beta0, frequency_hz,
+             grazing_leg: Optional[str] = None):
+        """
+        UTD coefficient of ``edge`` for incidence phi_in from distance s_in and observation phi_out at s_out.
+        grazing_leg ("in" or "out"): the incident or the diffracted ray is the leg between two edges of a
+        double diffraction; where that leg runs along a face (within 1e-6 rad), the coefficient of that face
+        is the one of a perfect conductor (-1 soft, +1 hard): Luebbers' heuristic, which gives -1 at grazing
+        incidence for every lossy face, is not reliable there and would cancel the field along a roof.
+        """
+        ext = edge.exterior_angle
+        phi_in = np.minimum(phi_in, ext)
+        phi_out = np.minimum(phi_out, ext)
+        distance_parameter = s_in * s_out * sin_beta0 ** 2 / (s_in + s_out)
+        r0, rn = edge.face_coefficients(phi_in, phi_out, frequency_hz)
+        if grazing_leg is not None:
+            leg = phi_in if grazing_leg == "in" else phi_out
+            pec = -1.0 if edge.polarization == "soft" else 1.0
+            r0 = np.where(leg < 1e-6, pec, r0)
+            rn = np.where(leg > ext - 1e-6, pec, rn)
+        return np.asarray(utd_coefficient(phi_out, phi_in, edge.wedge_n, k, distance_parameter, sin_beta0, r0, rn,
+                                          edge.isb_scale))
+
+    @staticmethod
+    def _transition_zone(phi_in, phi_out, n: float, kL) -> np.ndarray:
+        """
+        True where the observation angle is in the shadow of the wedge or near one of
+        its shadow boundaries (incident: phi_in +- pi; reflected: pi - phi_in and
+        (2n - 1) pi - phi_in): where kL a / 2 < 10, i.e. |phi - boundary| < sqrt(20 / kL),
+        the transition function F differs from 1 by more than ~5 %.  Elsewhere a
+        diffracted ray is a correction of the order of -40 dB to the rays that reach
+        the point without it (used for the two-interaction rays with a diffraction).
+        """
+        margin = np.minimum(math.pi, np.sqrt(20.0 / np.maximum(kL, 1e-300)))
+        isb = phi_in + math.pi
+        return ((phi_out > isb - margin) | (phi_out < phi_in - math.pi + margin)
+                | (np.abs(phi_out - (math.pi - phi_in)) < margin)
+                | (np.abs(phi_out - ((2.0 * n - 1.0) * math.pi - phi_in)) < margin))
+
+    def _reflect_diffract_ray(self, tx, tx_p, pts, a, e, k, amp_1m, obstacles, rx_cylindrical, want_vertices) -> _Rays:
+        """Tx -> P (plane a) -> Q (edge e) -> Rx: the edge is lit by the image of Tx across plane a."""
+        tol = OBSTRUCTION_TOL_M
+        ray = _Rays("reflection-diffraction", (_plane_ref(a), ("edge", e)))
+        edge = self.edges[e]
+        s_a_tx = float(self._plane_distance(a, tx_p))
+        image = self._mirror(a, tx_p, s_a_tx)
+        s_i, r_i, phi_i = (float(v) for v in edge.cylindrical(image))
+        s_r, r_r, phi_r = rx_cylindrical(e)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_q = s_i + (s_r - s_i) * (r_i / (r_i + r_r))
+        ok = ((r_r > tol) & (phi_r <= edge.exterior_angle + _ANGLE_TOL)
+              & (s_q >= -_BOUNDS_TOL_M) & (s_q <= edge.length + _BOUNDS_TOL_M))
+        idx = np.flatnonzero(ok)
+        if not idx.size:
+            return ray
+        s_q, s_r, r_r, phi_r = s_q[idx], s_r[idx], r_r[idx], phi_r[idx]
+        q = edge.start + s_q[:, None] * edge.axis
+        s_a_q = self._plane_distance(a, q)
+        keep = _same_side(s_a_tx, s_a_q, tol)                         # Q in front of the mirror, like Tx
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = -s_a_tx / (-s_a_tx - s_a_q)
+            p = image + t[:, None] * (q - image)
+        keep &= self._plane_contains(a, p)
+        if not keep.any():
+            return ray
+        idx, q, p, s_q, s_r, r_r, phi_r = idx[keep], q[keep], p[keep], s_q[keep], s_r[keep], r_r[keep], phi_r[keep]
+        s1 = np.sqrt(r_i * r_i + (s_q - s_i) ** 2)                    # image -> Q = Tx -> P -> Q
+        s2 = np.sqrt(r_r * r_r + (s_r - s_q) ** 2)
+        zone = self._transition_zone(phi_i, phi_r, edge.wedge_n, k * s1 * s2 * (r_i / s1) ** 2 / (s1 + s2))
+        if not zone.any():
+            return ray
+        idx, q, p, s1, s2, phi_r = idx[zone], q[zone], p[zone], s1[zone], s2[zone], phi_r[zone]
+        rx = pts[idx]
+        d = self._utd(edge, phi_i, phi_r, k, s1, s2, r_i / s1, tx.frequency_hz)
+        leg1 = p - tx_p
+        normal = np.array([0.0, 0.0, 1.0]) if a < 0 else self.reflectors[a].normal
+        gamma = self._plane_coefficient(a, np.abs(leg1 @ normal) / np.linalg.norm(leg1, axis=-1), tx.frequency_hz)
+        total = s1 + s2
+        amp = (amp_1m / s1) * gamma * d * np.sqrt(s1 / (s2 * total)) * np.exp(-1j * k * total)
+        return self._finish(ray, tx, tx_p, idx, amp, total, p, q, rx, obstacles, [p, q], [a, None], want_vertices)
+
+    def _diffract_reflect_ray(self, tx, tx_p, pts, e, b, k, amp_1m, obstacles, rx_distance, want_vertices) -> _Rays:
+        """Tx -> Q (edge e) -> P (plane b) -> Rx: the edge is observed from the image of Rx across plane b."""
+        tol = OBSTRUCTION_TOL_M
+        ray = _Rays("diffraction-reflection", (("edge", e), _plane_ref(b)))
+        edge = self.edges[e]
+        s_t, r_t, phi_t = (float(v) for v in edge.cylindrical(tx_p))
+        s_b_rx = rx_distance(b)
+        idx = np.flatnonzero(np.abs(s_b_rx) > tol)
+        if not idx.size:
+            return ray
+        rx = pts[idx]
+        normal = np.array([0.0, 0.0, 1.0]) if b < 0 else self.reflectors[b].normal
+        images = rx * np.array([1.0, 1.0, -1.0]) if b < 0 else rx - 2.0 * s_b_rx[idx][:, None] * normal
+        s_j, r_j, phi_j = edge.cylindrical(images)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_q = s_t + (s_j - s_t) * (r_t / (r_t + r_j))
+        keep = ((r_j > tol) & (phi_j <= edge.exterior_angle + _ANGLE_TOL)
+                & (s_q >= -_BOUNDS_TOL_M) & (s_q <= edge.length + _BOUNDS_TOL_M))
+        if not keep.any():
+            return ray
+        idx, rx, images, s_j, r_j, phi_j, s_q = idx[keep], rx[keep], images[keep], s_j[keep], r_j[keep], phi_j[keep], s_q[keep]
+        q = edge.start + s_q[:, None] * edge.axis
+        s_b_q = self._plane_distance(b, q)
+        s_rx = s_b_rx[idx]
+        keep = (((s_b_q > tol) & (s_rx > tol)) | ((s_b_q < -tol) & (s_rx < -tol)))   # Q in front of the mirror, like Rx
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = s_b_q / (s_b_q + s_rx)                                 # s_b(image) = -s_b(Rx)
+            p = q + t[:, None] * (images - q)
+        keep &= self._plane_contains(b, p)
+        if not keep.any():
+            return ray
+        idx, rx, images, s_j, r_j, phi_j, s_q, q, p = (v[keep] for v in (idx, rx, images, s_j, r_j, phi_j, s_q, q, p))
+        s1 = np.sqrt(r_t * r_t + (s_q - s_t) ** 2)
+        s2 = np.sqrt(r_j * r_j + (s_j - s_q) ** 2)                    # Q -> image = Q -> P -> Rx
+        zone = self._transition_zone(phi_t, phi_j, edge.wedge_n, k * s1 * s2 * (r_t / s1) ** 2 / (s1 + s2))
+        if not zone.any():
+            return ray
+        idx, rx, q, p, s1, s2, phi_j = idx[zone], rx[zone], q[zone], p[zone], s1[zone], s2[zone], phi_j[zone]
+        d = self._utd(edge, phi_t, phi_j, k, s1, s2, r_t / s1, tx.frequency_hz)
+        leg3 = rx - p
+        gamma = self._plane_coefficient(b, np.abs(leg3 @ normal) / np.linalg.norm(leg3, axis=-1), tx.frequency_hz)
+        total = s1 + s2
+        amp = (amp_1m / s1) * d * np.sqrt(s1 / (s2 * total)) * gamma * np.exp(-1j * k * total)
+        return self._finish(ray, tx, tx_p, idx, amp, total, q, p, rx, obstacles, [q, p], [None, b], want_vertices)
+
+    def _double_diffraction_ray(self, tx, tx_p, pts, i, j, k, amp_1m, obstacles, rx_cylindrical, rx_far,
+                                want_vertices) -> _Rays:
+        """
+        Tx -> Q1 (edge i) -> Q2 (edge j) -> Rx.  Q1 and Q2 minimize the path length
+        (the generalized Keller law at both edges), found per receiver by Newton's
+        method on the two edge parameters (a convex problem); the path exists if both
+        lie on their segments.  Cascaded UTD: the wave diffracted by edge i has its
+        caustics at Q1 and at distance s1 behind it, which gives
+        E = E0 * D1 * D2 / sqrt(s1 s2 s3 (s1 + s2 + s3)), with L1 = s1 s2 sin^2 / (s1 + s2)
+        and L2 = s2 s3 sin^2 / (s2 + s3) (exact for parallel edges); D2 is halved when
+        the ray reaches edge j grazing one of its faces (Kouyoumjian & Pathak).
+
+        Before Newton's method, two necessary conditions per receiver drop most points:
+        the point on edge j can lie on the segment (``_keller_fits``), and the receiver
+        can be in the transition zone of edge j for some direction of arrival from edge
+        i, with the smallest possible distance parameter L >= r_rx^2 gap / (d (d + gap)),
+        d the distance to the farther end of edge j.
+        """
+        tol = OBSTRUCTION_TOL_M
+        ray = _Rays("double-diffraction", (("edge", i), ("edge", j)))
+        e1, e2 = self.edges[i], self.edges[j]
+        _, r_t, phi_t = (float(v) for v in e1.cylindrical(tx_p))
+        s_r, r_r, phi_r = rx_cylindrical(j)
+        geo = self._dd_geometry(i, j)
+        ok = ((r_r > tol) & (phi_r <= e2.exterior_angle + _ANGLE_TOL)
+              & self._keller_fits(e2, s_r, r_r, geo["s_range"], geo["r_min"]))
+        idx = np.flatnonzero(ok)
+        if idx.size and geo["angles"] is not None:
+            far, gap = rx_far(j)[idx], geo["gap"]
+            low = r_r[idx] ** 2 * gap / (far * (far + gap))
+            margin = np.minimum(math.pi, np.sqrt(20.0 / (k * np.maximum(low, 1e-300))))
+            idx = idx[(margin >= math.pi) | self._zone_reachable(geo["angles"], None, phi_r[idx], e2.wedge_n, margin)]
+        if not idx.size:
+            return ray
+        rx = pts[idx]
+        u1, u2 = e1.axis, e2.axis
+        if abs(float(u1 @ u2)) > 1.0 - 1e-12:
+            t1, t2, converged = self._parallel_double_keller(e1, e2, tx_p, rx)
+        else:
+            t1, t2, converged = self._newton_double_keller(e1, e2, tx_p, rx, r_t, s_r[idx], r_r[idx])
+        keep = (converged & (t1 >= -_BOUNDS_TOL_M) & (t1 <= e1.length + _BOUNDS_TOL_M)
+                & (t2 >= -_BOUNDS_TOL_M) & (t2 <= e2.length + _BOUNDS_TOL_M))
+        if not keep.any():
+            return ray
+        idx, rx, t1, t2 = idx[keep], rx[keep], t1[keep], t2[keep]
+        return self._double_diffraction_amplitude(ray, tx, tx_p, idx, rx, e1, e2, t1, t2, r_t, phi_t, k, amp_1m,
+                                                  obstacles, want_vertices)
+
+    @staticmethod
+    def _parallel_double_keller(e1, e2, tx_p, rx):
+        """
+        Diffraction points on two parallel edges, in closed form: in the plane normal
+        to the edges the path is fixed (Tx, edge 1, edge 2, Rx project to points), and
+        along the edges the shortest path splits the advance in proportion to the
+        normal distances r1, d12, r3 (the straight line of the unfolded path).
+        """
+        u = e1.axis
+        sign = 1.0 if float(u @ e2.axis) > 0 else -1.0
+        s_t = float((tx_p - e1.start) @ u)
+        s_r = (rx - e1.start) @ u
+        s_a2 = float((e2.start - e1.start) @ u)
+        r1 = float(np.linalg.norm((tx_p - e1.start) - s_t * u))
+        d12 = float(np.linalg.norm((e2.start - e1.start) - s_a2 * u))
+        r3 = np.linalg.norm((rx - e2.start) - ((rx - e2.start) @ u)[:, None] * u, axis=-1)
+        total = r1 + d12 + r3
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_q1 = s_t + (s_r - s_t) * (r1 / total)
+            s_q2 = s_t + (s_r - s_t) * ((r1 + d12) / total)
+        t1 = s_q1
+        t2 = sign * (s_q2 - s_a2)
+        converged = np.isfinite(t1) & np.isfinite(t2) & (total > 0)
+        return t1, t2, converged
+
+    @staticmethod
+    def _newton_double_keller(e1, e2, tx_p, rx, r_t, s_r, r_r):
+        """Diffraction points on two skew edges: Newton's method on the (convex) path length."""
+        u1, u2 = e1.axis, e2.axis
+        # Initial guess: Keller point on edge i towards the middle of edge j, then on edge j from there
+        mid = 0.5 * (e2.start + e2.end)
+        s_m, r_m, _ = (float(v) for v in e1.cylindrical(mid))
+        s_t = float((tx_p - e1.start) @ u1)
+        t1 = np.full(len(rx), s_t + (s_m - s_t) * r_t / (r_t + r_m))
+        q1 = e1.start + t1[:, None] * u1
+        s_q1, r_q1, _ = e2.cylindrical(q1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t2 = np.where(r_q1 + r_r > 0, s_q1 + (s_r - s_q1) * r_q1 / (r_q1 + r_r), 0.5 * e2.length)
+        scale = e1.length + e2.length + 1.0
+        cos12 = float(u1 @ u2)
+        converged = np.zeros(len(rx), dtype=bool)
+        # Each point is iterated until its own gradient reaches round-off (or its step stops shrinking)
+        # and then frozen, so its result does not depend on the other points of the batch: vectorized and
+        # point-by-point runs agree exactly, and both directions of a path meet at the same points.
+        # A point is accepted when its gradient is below 1e-10 by then.
+        busy = np.arange(len(rx))
+        last_step = np.full(len(rx), np.inf)
+        # By components (the arrays are long, the vectors 3-D): Q1 = A1 + t1 u1, Q2 = A2 + t2 u2
+        (a1x, a1y, a1z), (u1x, u1y, u1z) = e1.start, u1
+        (a2x, a2y, a2z), (u2x, u2y, u2z) = e2.start, u2
+        tx_x, tx_y, tx_z = (float(v) for v in tx_p)
+        rx_x, rx_y, rx_z = rx[:, 0], rx[:, 1], rx[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            for iteration in range(41):
+                a, b = t1[busy], t2[busy]
+                q1x, q1y, q1z = a1x + a * u1x, a1y + a * u1y, a1z + a * u1z
+                q2x, q2y, q2z = a2x + b * u2x, a2y + b * u2y, a2z + b * u2z
+                d1x, d1y, d1z = q1x - tx_x, q1y - tx_y, q1z - tx_z
+                d2x, d2y, d2z = q2x - q1x, q2y - q1y, q2z - q1z
+                d3x, d3y, d3z = rx_x[busy] - q2x, rx_y[busy] - q2y, rx_z[busy] - q2z
+                l1 = np.sqrt(d1x * d1x + d1y * d1y + d1z * d1z)
+                l2 = np.sqrt(d2x * d2x + d2y * d2y + d2z * d2z)
+                l3 = np.sqrt(d3x * d3x + d3y * d3y + d3z * d3z)
+                c1a = (d1x * u1x + d1y * u1y + d1z * u1z) / l1
+                c1b = (d2x * u1x + d2y * u1y + d2z * u1z) / l2
+                c2a = (d2x * u2x + d2y * u2y + d2z * u2z) / l2
+                c2b = (d3x * u2x + d3y * u2y + d3z * u2z) / l3
+                g1 = c1a - c1b
+                g2 = c2a - c2b
+                grad = np.abs(g1) + np.abs(g2)
+                ok = (grad < 1e-10) & np.isfinite(l2)
+                done = (ok & ((grad < 1e-14) | (last_step[busy] < 1e-12 * scale))) | (iteration == 40)
+                converged[busy[done]] = ok[done]
+                go = ~done
+                if not go.any():
+                    break
+                if not go.all():
+                    busy, a, b = busy[go], a[go], b[go]
+                    g1, g2, l1, l2, l3 = g1[go], g2[go], l1[go], l2[go], l3[go]
+                    c1a, c1b, c2a, c2b = c1a[go], c1b[go], c2a[go], c2b[go]
+                h11 = (1.0 - c1a * c1a) / l1 + (1.0 - c1b * c1b) / l2
+                h22 = (1.0 - c2a * c2a) / l2 + (1.0 - c2b * c2b) / l3
+                h12 = -(cos12 - c1b * c2a) / l2
+                det = h11 * h22 - h12 * h12
+                good = np.isfinite(det) & (det > 1e-14 * np.maximum(h11 * h22, 1e-300))
+                dt1 = np.where(good, -(h22 * g1 - h12 * g2) / det, -g1 / np.maximum(h11, 1e-12))
+                dt2 = np.where(good, -(h11 * g2 - h12 * g1) / det, -g2 / np.maximum(h22, 1e-12))
+                dt1 = np.clip(np.nan_to_num(dt1), -scale, scale)
+                dt2 = np.clip(np.nan_to_num(dt2), -scale, scale)
+                last_step[busy] = np.abs(dt1) + np.abs(dt2)
+                t1[busy] = a + dt1
+                t2[busy] = b + dt2
+        return t1, t2, converged
+
+    def _double_diffraction_amplitude(self, ray, tx, tx_p, idx, rx, e1, e2, t1, t2, r_t, phi_t, k, amp_1m,
+                                      obstacles, want_vertices) -> _Rays:
+        tol = OBSTRUCTION_TOL_M
+        u1, u2 = e1.axis, e2.axis
+        q1 = e1.start + t1[:, None] * u1
+        q2 = e2.start + t2[:, None] * u2
+        _, r_q2, phi_q2 = e1.cylindrical(q2)           # leaving edge i towards Q2
+        _, r_q1, phi_q1 = e2.cylindrical(q1)           # reaching edge j from Q1
+        keep = ((r_q2 > tol) & (phi_q2 <= e1.exterior_angle + _ANGLE_TOL)
+                & (r_q1 > tol) & (phi_q1 <= e2.exterior_angle + _ANGLE_TOL))
+        if not keep.any():
+            return ray
+        idx, rx, q1, q2, phi_q2, phi_q1 = idx[keep], rx[keep], q1[keep], q2[keep], phi_q2[keep], phi_q1[keep]
+        _, r_rx, phi_rx = e2.cylindrical(rx)
+        l1 = np.linalg.norm(q1 - tx_p, axis=-1)
+        l2 = np.linalg.norm(q2 - q1, axis=-1)
+        l3 = np.linalg.norm(rx - q2, axis=-1)
+        # Only where the ray is in the shadow or transition zone of both edges: elsewhere the ray diffracted
+        # by one of them alone reaches the point with the full field (symmetric, so reciprocal)
+        zone = (self._transition_zone(phi_q1, phi_rx, e2.wedge_n, k * l2 * l3 * (r_rx / l3) ** 2 / (l2 + l3))
+                & self._transition_zone(phi_t, phi_q2, e1.wedge_n, k * l1 * l2 * (r_t / l1) ** 2 / (l1 + l2)))
+        # Soft polarization along an opaque face (two corners of the same facade): the coefficient of that
+        # edge is exactly 0 (the field tangent to the face vanishes; with the face coefficient -1 the four
+        # UTD terms cancel in pairs), so the ray carries no power and is left out instead of being kept
+        # as a round-off residue of ~1e-36
+        along_i = (phi_q2 < 1e-6) | (phi_q2 > e1.exterior_angle - 1e-6)
+        along_j = (phi_q1 < 1e-6) | (phi_q1 > e2.exterior_angle - 1e-6)
+        if e1.polarization == "soft" and e1.isb_scale == 1.0:
+            zone &= ~along_i
+        if e2.polarization == "soft" and e2.isb_scale == 1.0:
+            zone &= ~along_j
+        if not zone.any():
+            return ray
+        idx, rx, q1, q2, phi_q2, phi_q1, r_rx, phi_rx, l1, l2, l3 = (
+            v[zone] for v in (idx, rx, q1, q2, phi_q2, phi_q1, r_rx, phi_rx, l1, l2, l3))
+        d_1 = self._utd(e1, phi_t, phi_q2, k, l1, l2, r_t / l1, tx.frequency_hz, grazing_leg="out")
+        d_2 = self._utd(e2, phi_q1, phi_rx, k, l2, l3, r_rx / l3, tx.frequency_hz, grazing_leg="in")
+        grazing = (phi_q1 < 1e-6) | (phi_q1 > e2.exterior_angle - 1e-6)
+        d_2 = np.where(grazing, 0.5 * d_2, d_2)
+        total = l1 + l2 + l3
+        amp = amp_1m * d_1 * d_2 / np.sqrt(l1 * l2 * l3 * total) * np.exp(-1j * k * total)
+        return self._finish(ray, tx, tx_p, idx, amp, total, q1, q2, rx, obstacles, [q1, q2], [None, None],
                             want_vertices)
 
     def trace_paths(self, tx: Transmitter, rx_pos: Tuple[float, float, float]) -> ChannelImpulseResponse:
@@ -1160,7 +1981,7 @@ class RayTracer:
 
         # --- 4. Diffraction by edges and 5. double reflections (new in 1.5.0) ---
         if self.edges or self.max_reflections >= 2:
-            for extra in self._extra_rays(tx, rx_p[None, :], k, amp_1m, sector, want_vertices=True):
+            for _, extra in self._extra_rays(tx, rx_p[None, :], k, amp_1m, sector, want_vertices=True):
                 if not extra.idx.size:
                     continue
                 tx_phi_e, tx_theta_e, rx_phi_e, rx_theta_e = (float(v[0]) for v in extra.angles)
@@ -1181,12 +2002,16 @@ class RayTracer:
 
         return cir
 
-    def trace_points(self, tx: Transmitter, points: np.ndarray) -> RayField:
+    def trace_points(self, tx: Transmitter, points: np.ndarray, compact: bool = False) -> RayField:
         """
         Vectorized equivalent of ``trace_paths`` for an array of receiver points.
 
         points: array of shape [..., 3] with the receiver coordinates (x, y, z).
-        Returns a RayField whose arrays have shape [2 + n_reflectors, ...].
+        Returns a RayField whose arrays have shape [K, ...], K following
+        ``candidate_rays()`` (``RayField.labels`` says which ray each row is).
+        compact=True (new in 1.6.0) leaves out the two-interaction candidates that
+        cannot exist for this transmitter (see ``_active_higher_order``): fewer rows,
+        the same rays and the same totals.
         Obstruction by walls with a ``transmission_loss_db`` is applied exactly as in
         ``trace_paths``; ``RayField.obstruction_loss_db`` holds the loss of each ray.
         """
@@ -1195,7 +2020,14 @@ class RayTracer:
             raise ValueError("points must have shape [..., 3]")
         shape = pts.shape[:-1]
         n_first = 2 + len(self.reflectors)
-        n_rays = n_first + len(self.edges) + len(self._plane_pairs())
+        labels = self.candidate_rays()
+        row_of = None
+        if compact:
+            active = self._active_higher_order(tx)
+            n_fixed = n_first + len(self.edges)
+            row_of = {position: n_fixed + row for row, (position, _) in enumerate(active)}
+            labels = labels[:n_fixed] + [labels[position] for position, _ in active]
+        n_rays = len(labels)
 
         amplitude = np.zeros((n_rays,) + shape, dtype=complex)
         tau_ns = np.full((n_rays,) + shape, np.nan)
@@ -1296,13 +2128,13 @@ class RayTracer:
             gamma_wall = np.asarray(gamma_wall)
             store(2 + r, ok_wall, d_wall, gamma_wall, p_wall_hit, p_wall_hit, via=p_wall_hit, own=r)
 
-        # --- 4. Diffraction by edges and 5. double reflections (new in 1.5.0) ---
+        # --- 4. Diffraction by edges and 5. two-interaction rays (new in 1.5.0 / 1.6.0) ---
         if n_rays > n_first:
             flat = pts.reshape(-1, 3)
-            for i, extra in enumerate(self._extra_rays(tx, flat, k, amp_1m, sector, want_vertices=False)):
+            for position, extra in self._extra_rays(tx, flat, k, amp_1m, sector, want_vertices=False):
                 if not extra.idx.size:
                     continue
-                r = n_first + i
+                r = position if row_of is None or position < n_first + len(self.edges) else row_of[position]
                 amplitude[r].reshape(-1)[extra.idx] = extra.amplitude
                 tau_ns[r].reshape(-1)[extra.idx] = extra.tau_ns
                 for a, values in enumerate(extra.angles):
@@ -1320,4 +2152,5 @@ class RayTracer:
             rx_theta_deg=angles[3],
             valid=valid,
             obstruction_loss_db=loss_db,
+            labels=labels,
         )

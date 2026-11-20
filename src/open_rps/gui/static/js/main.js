@@ -87,8 +87,13 @@ const app = {
     running = true;
     $("run-button").disabled = true;
     $("busy").hidden = false;
-    $("busy-text").textContent = store.project.settings.mode === "raytracing" && store.project.settings.max_reflections === 2
-      ? "Simulando (con reflexiones dobles: puede tardar)…" : "Simulando…";
+    const s = store.project.settings;
+    const slow = s.mode !== "raytracing" ? [] : [
+      s.max_reflections === 2 && "reflexiones dobles",
+      s.diffraction && s.max_diffractions === 2 && "difracción doble",
+      s.diffraction && s.mixed_interactions && "reflexión + difracción",
+    ].filter(Boolean);
+    $("busy-text").textContent = slow.length ? `Simulando (con ${slow.join(", ")}: puede tardar)…` : "Simulando…";
     const revision = store.revision;
     const snapshot = JSON.parse(store.snapshot());
     try {
@@ -103,7 +108,12 @@ const app = {
       store.addLog("info", `Predicción lista en ${fmt(rep.elapsed_s, 2)} s: ${MODE_LABELS[rep.mode]}, ${result.grid.nx} × ${result.grid.ny} píxeles, `
         + `${rep.transmitters} transmisor(es), ${rep.reflectors} muro(s) en el motor (${rep.obstructing_reflectors} obstruyen)`
         + (rep.mode === "raytracing" ? `, ${rep.edges} arista(s) que difractan, ${rep.max_reflections === 2 ? "hasta dos rebotes" : "un rebote"}`
-          + ` (${rep.candidate_rays} rayos candidatos por punto).` : "."));
+          + (rep.edges ? `, ${rep.max_diffractions === 2 ? "hasta dos difracciones" : "una difracción"} por rayo` : "")
+          + (rep.mixed_interactions ? ", rayos de reflexión + difracción" : "")
+          + ` (${rep.candidate_rays} rayos candidatos por punto`
+          + (rep.active_rays_per_tx && rep.active_rays_per_tx.length
+            ? `; tras descartar los imposibles, ${rep.active_rays_per_tx.join(" / ")} por transmisor` : "")
+          + ")." : "."));
       for (const w of rep.warnings || []) store.addLog("warn", w);
       if (rep.warnings && rep.warnings.length) app.notify("warn", `${rep.warnings.length} aviso(s) del modelo: mira la pestaña Mensajes.`);
     } catch (error) {
@@ -361,8 +371,8 @@ function aboutModal() {
   const info = store.info || {};
   showModal("Acerca de OpenRPS", [
     el("p", { text: `OpenRPS ${info.version || ""}: simulador de propagación de ondas de radio de código abierto, para uso docente. Licencia GPL-2.0.` }),
-    el("p", { text: "Motor: ray tracing 3D (rayo directo, reflexión en el suelo, uno o dos rebotes especulares en muros y suelo, difracción UTD en las aristas de edificios y muros, y obstrucción por muros y techos) y modelos empíricos (FSPL, Two-Ray, Log-distancia, Okumura-Hata, COST-231 Hata)." }),
-    el("p", { class: "note", text: "Limitaciones: una sola difracción por rayo (sin difracciones sucesivas ni combinadas con reflexiones), terreno plano y sin validación experimental. Consulta la sección «Limitaciones físicas» del README antes de usar los resultados." }),
+    el("p", { text: "Motor: ray tracing 3D (rayo directo, reflexión en el suelo, uno o dos rebotes especulares en muros y suelo, difracción UTD en una o dos aristas por rayo, rayos que combinan un rebote con una difracción, y obstrucción por muros y techos) y modelos empíricos (FSPL, Two-Ray, Log-distancia, Okumura-Hata, COST-231 Hata)." }),
+    el("p", { class: "note", text: "Limitaciones: a lo más dos interacciones por rayo (dos rebotes, dos difracciones o un rebote y una difracción), terreno plano y sin validación experimental. Consulta la sección «Limitaciones físicas» del README antes de usar los resultados." }),
     el("p", { class: "note", text: "La vista 3D usa three.js r187 (licencia MIT), incluido en el paquete." }),
   ]);
 }

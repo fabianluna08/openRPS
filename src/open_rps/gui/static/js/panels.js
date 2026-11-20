@@ -198,6 +198,13 @@ const SETTINGS_FIELDS = [
   { key: "mode", label: "Modelo", type: "select", options: Object.entries(MODE_LABELS) },
   { key: "diffraction", label: "Difracción (UTD)", type: "checkbox", show: (s) => s.mode === "raytracing",
     help: "Rayos difractados en las esquinas y bordes de techo de los edificios y en los bordes de los muros" },
+  { key: "max_diffractions", label: "Difracciones por rayo", type: "select", integer: true,
+    show: (s) => s.mode === "raytracing" && s.diffraction,
+    options: [[1, "Una arista"], [2, "Hasta dos aristas (más lento)"]],
+    help: "Con dos, el rayo puede pasar por dos aristas seguidas: sobre un edificio alto y ancho, o rodeando dos esquinas" },
+  { key: "mixed_interactions", label: "Reflexión + difracción", type: "checkbox",
+    show: (s) => s.mode === "raytracing" && s.diffraction,
+    help: "Rayos que rebotan en un muro y luego se difractan en una arista, o al revés (más lento)" },
   { key: "max_reflections", label: "Reflexiones", type: "select", integer: true, show: (s) => s.mode === "raytracing",
     options: [[1, "Un rebote"], [2, "Hasta dos rebotes (más lento)"]],
     help: "Con dos rebotes se suman las reflexiones muro–muro y muro–suelo" },
@@ -321,7 +328,7 @@ export function renderProperties(container, titleEl, store, app) {
     if (obj.mode !== "raytracing") {
       container.append(el("p", { class: "note", text: "Los modelos empíricos ignoran los edificios y muros: ni reflejan ni obstruyen. Usa ray tracing para verlos en el mapa." }));
     } else {
-      container.append(el("p", { class: "note", text: "Ray tracing de OpenRPS: rayo directo, reflexión en el suelo y rebotes especulares en los muros (uno, o hasta dos), difracción UTD en las aristas (una por rayo) y obstrucción por los muros que tapan. No combina difracción con reflexiones ni difracciones sucesivas." }));
+      container.append(el("p", { class: "note", text: "Ray tracing de OpenRPS: rayo directo, reflexión en el suelo y rebotes especulares en los muros (uno, o hasta dos), difracción UTD en las aristas (una, o hasta dos por rayo), rayos que combinan un rebote con una difracción y obstrucción por los muros que tapan. Cada rayo tiene a lo más dos interacciones." }));
     }
   } else if (s.type === "project") {
     titleEl.textContent = "Proyecto";

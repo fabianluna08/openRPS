@@ -433,18 +433,20 @@ class PropagationSimulator:
         delay_spread_tx = np.full((num_tx, ny, nx), float("nan"))
         angular_spread_tx = np.full((num_tx, ny, nx), float("nan"))
 
-        n_candidates = len(self.ray_tracer.candidate_rays())
-        chunk_points = min(_MAX_CHUNK_POINTS, max(1, _MAX_RAY_POINTS // n_candidates))
-        rows_per_chunk = max(1, chunk_points // max(1, nx))
-        for j0 in range(0, ny, rows_per_chunk):
-            rows = slice(j0, min(ny, j0 + rows_per_chunk))
-            points = np.empty((len(y_coords[rows]), nx, 3))
-            points[..., 0] = x_coords[None, :]
-            points[..., 1] = y_coords[rows, None]
-            points[..., 2] = rx_height_m
-
-            for tx_idx, tx in enumerate(self.transmitters):
-                rays = self.ray_tracer.trace_points(tx, points)
+        tracer = self.ray_tracer
+        n_fixed = 2 + len(tracer.reflectors) + len(tracer.edges)
+        for tx_idx, tx in enumerate(self.transmitters):
+            # Rows of the RayField of this transmitter: the candidates that can exist for it (compact mode)
+            n_candidates = n_fixed + len(tracer._active_higher_order(tx))
+            chunk_points = min(_MAX_CHUNK_POINTS, max(1, _MAX_RAY_POINTS // n_candidates))
+            rows_per_chunk = max(1, chunk_points // max(1, nx))
+            for j0 in range(0, ny, rows_per_chunk):
+                rows = slice(j0, min(ny, j0 + rows_per_chunk))
+                points = np.empty((len(y_coords[rows]), nx, 3))
+                points[..., 0] = x_coords[None, :]
+                points[..., 1] = y_coords[rows, None]
+                points[..., 2] = rx_height_m
+                rays = tracer.trace_points(tx, points, compact=True)
                 power = rays.power_linear                    # [K, rows, nx] mW
                 p_total = rays.total_power_linear(coherent=True) if coherent else power.sum(axis=0)
                 with np.errstate(divide="ignore"):
