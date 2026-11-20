@@ -25,6 +25,7 @@ frequency-dependent values are evaluated at a single *reference frequency*: the
 one of the settings, or the frequency of the first enabled transmitter.
 """
 
+import cmath
 import copy
 import json
 import math
@@ -45,14 +46,18 @@ from .raytracer import DiffractionEdge, PlanarReflector, Transmitter, _in_polygo
 from .simulation import DEFAULT_MIN_DISTANCE_M, PropagationSimulator, SimulationResult
 
 PROJECT_FORMAT = "openrps-project"
-PROJECT_VERSION = 3              # 2: floor plan and measurements (1.7.0); 3: Wi-Fi channels (1.8.0)
+PROJECT_VERSION = 4              # 2: floor plan and measurements (1.7.0); 3: Wi-Fi channels (1.8.0);
+                                 # 4: wall thickness (1.9.0)
+MAX_WALL_THICKNESS_M = 5.0
+VACUUM_PERMITTIVITY = 8.8541878128e-12
+SPEED_OF_LIGHT = 299792458.0
 WIFI_TX_KEYS = ("wifi_band", "wifi_channel", "wifi_width_mhz", "wifi_streams")
 WIFI_SETTINGS_DEFAULTS = {"wifi_standard": "ax", "wifi_guard_interval_us": 0.8, "wifi_client_streams": 2,
                           "wifi_cca_dbm": -82.0}
 FLOOR_PLAN_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 MAX_FLOOR_PLAN_CHARS = 30_000_000   # the image as a data URL (about 22 MB of image)
 MAX_MEASUREMENTS = 100_000
-SIMULATION_MODES = ("raytracing", "fspl", "tworay", "logdistance", "hata")
+SIMULATION_MODES = ("raytracing", "fspl", "tworay", "logdistance", "hata", "multiwall")
 REFLECTION_MODELS = ("fresnel", "constant")
 PENETRATION_MODELS = ("none", "fixed", "frequency", "opaque")
 HATA_ENVIRONMENTS = ("urban_large", "urban_medium", "suburban", "open")
@@ -180,6 +185,31 @@ class Material:
             kwargs["eps_r"] = float(self.eps_r)
             kwargs["sigma"] = self.conductivity(frequency_hz)
         return kwargs
+
+
+def slab_loss_db(eps_r: float, sigma: float, frequency_hz: float, thickness_m: float) -> float:
+    """
+    Loss in dB (>= 0) of a plane wave that crosses a homogeneous slab of thickness
+    ``thickness_m`` at normal incidence (new in 1.9.0): the single-layer model of
+    ITU-R P.2040, with the multiple reflections inside the slab.  The complex relative
+    permittivity is eps_r - j sigma / (2 pi f eps_0) and the loss is -20 log10 |T|, with
+
+        T = (1 - R^2) exp(-j q) / (1 - R^2 exp(-2 j q)),   R = (1 - n) / (1 + n),
+        q = 2 pi f d n / c,   n = sqrt(complex permittivity) (Re n > 0, Im n <= 0).
+
+    A thin slab is almost transparent (0 dB as d -> 0); a lossless slab half a
+    wavelength thick (inside the material) is transparent too; a thick lossy one
+    loses about 8.686 alpha d dB plus the two interfaces.
+    """
+    if thickness_m <= 0.0:
+        return 0.0
+    eta = complex(eps_r, -sigma / (2.0 * math.pi * frequency_hz * VACUUM_PERMITTIVITY))
+    n = cmath.sqrt(eta)                                  # principal branch: Re > 0, Im <= 0
+    r2 = ((1.0 - n) / (1.0 + n)) ** 2
+    q = 2.0 * math.pi * frequency_hz * thickness_m * n / SPEED_OF_LIGHT
+    attenuation = cmath.exp(-1j * q)                     # |.| = exp(Im q) <= 1
+    t = (1.0 - r2) * attenuation / (1.0 - r2 * attenuation * attenuation)
+    return max(0.0, -20.0 * math.log10(abs(t)))
 
 
 def default_materials() -> List[Material]:
@@ -372,6 +402,7 @@ class Wall:
     z_min_m: float = 0.0
     z_max_m: float = 3.0
     material: str = "ladrillo"
+    thickness_m: Optional[float] = None     # 1.9.0: with it, the loss follows the thickness (slab_loss_db)
 
     def validate(self, materials: Dict[str, Material], what: str = "muro"):
         what = f"{what} {self.name or self.id!r}"
@@ -388,10 +419,29 @@ class Wall:
             raise ProjectError(f"{what}: z_max_m debe ser mayor que z_min_m")
         if self.material not in materials:
             raise ProjectError(f"{what}: material desconocido {self.material!r}")
+        if self.thickness_m is not None:
+            thickness = _number(self.thickness_m, f"{what}.thickness_m")
+            if not 0.0 < thickness <= MAX_WALL_THICKNESS_M:
+                raise ProjectError(f"{what}.thickness_m: el espesor debe estar entre 0 y {MAX_WALL_THICKNESS_M:g} m, "
+                                   f"se recibió {thickness:g}")
+            self.thickness_m = thickness
+
+    def penetration_loss_db(self, material: Material, frequency_hz: float) -> Optional[float]:
+        """
+        Loss per crossing of this wall: the one of its material, or, with ``thickness_m``
+        and a material with a finite loss ("fixed" or "frequency"), the loss of a slab
+        of that thickness with the eps_r and sigma of the material (``slab_loss_db``).
+        Materials that do not obstruct or are opaque stay so.
+        """
+        if self.thickness_m is None or material.penetration not in ("fixed", "frequency"):
+            return material.penetration_loss_db(frequency_hz)
+        return slab_loss_db(float(material.eps_r), material.conductivity(frequency_hz), frequency_hz,
+                            float(self.thickness_m))
 
     def reflector(self, material: Material, frequency_hz: float) -> PlanarReflector:
-        return vertical_wall(self.start, self.end, self.z_min_m, self.z_max_m, self.name or self.id,
-                             **material.reflector_kwargs(frequency_hz))
+        kwargs = material.reflector_kwargs(frequency_hz)
+        kwargs["transmission_loss_db"] = self.penetration_loss_db(material, frequency_hz)
+        return vertical_wall(self.start, self.end, self.z_min_m, self.z_max_m, self.name or self.id, **kwargs)
 
     def edges(self, material: Material, frequency_hz: float, start_free: bool = True,
               end_free: bool = True) -> List[DiffractionEdge]:
@@ -406,7 +456,9 @@ class Wall:
         length = math.hypot(x1 - x0, y1 - y0)
         along = [(x1 - x0) / length, (y1 - y0) / length, 0.0]
         normal = [along[1], -along[0], 0.0]
-        common = dict(material.surface_kwargs(frequency_hz), shadow_loss_db=material.shadow_loss_db(frequency_hz, 1))
+        loss = self.penetration_loss_db(material, frequency_hz)
+        shadow = 0.0 if loss is None else float(loss)
+        common = dict(material.surface_kwargs(frequency_hz), shadow_loss_db=shadow)
         out = [DiffractionEdge(start=[x0, y0, self.z_max_m], end=[x1, y1, self.z_max_m], face_direction=[0.0, 0.0, -1.0],
                                face_normal=normal, wedge_n=2.0, polarization="hard", name=f"{label} · borde superior",
                                **common)]
@@ -737,6 +789,14 @@ class Project:
                 data["measurements"] = [asdict(m) for m in self.measurements]
         if wifi or "wifi_standard" in data["settings"]:
             data["version"] = 3
+        thickness = False
+        for w in data["walls"]:
+            if w["thickness_m"] is None:
+                w.pop("thickness_m")
+            else:
+                thickness = True
+        if thickness:
+            data["version"] = 4
         return copy.deepcopy(data)
 
     @classmethod
@@ -859,7 +919,8 @@ class Project:
             return FreeSpacePathLoss()
         if s.mode == "tworay":
             return TwoRayGroundReflection(eps_r=s.ground_eps_r, sigma=s.ground_sigma)
-        if s.mode == "logdistance":
+        if s.mode in ("logdistance", "multiwall"):
+            # multiwall (1.9.0): log-distance plus the walls crossed by the direct path (wall_losses)
             return LogDistancePathLoss(path_loss_exponent=s.log_distance_exponent, d0_m=s.log_distance_d0_m)
         if s.mode == "hata":
             # Okumura-Hata up to 1500 MHz and COST-231 Hata above, as in the CLI
@@ -869,6 +930,11 @@ class Project:
             env = s.hata_environment if s.hata_environment in Cost231Hata.ENVIRONMENTS else "suburban"
             return Cost231Hata(env)
         return None
+
+    @property
+    def wall_losses(self) -> bool:
+        """Whether the empirical model adds the losses of the walls crossed by the direct path (multiwall mode)."""
+        return self.settings.mode == "multiwall"
 
     def run(self, sim: Optional[PropagationSimulator] = None) -> SimulationResult:
         """Run the simulation of the project over its area (warnings of the models are emitted normally)."""
@@ -881,7 +947,7 @@ class Project:
         if model is None:
             result = sim.run_raytracing_simulation(*area, coherent=s.coherent, **common)
         else:
-            result = sim.run_empirical_simulation(model, *area, **common)
+            result = sim.run_empirical_simulation(model, *area, wall_losses=self.wall_losses, **common)
         if s.sinr and sim.transmitters:
             wifi = self.wifi_setup(sim)
             if wifi is not None:
@@ -972,7 +1038,7 @@ class Project:
                 entry.update(_cir_metrics(cir, tx, self.settings.coherent))
                 entry["rays"] = [_ray_dict(ray, names, edge_names) for ray in cir.rays]
             else:
-                entry.update(_empirical_point(model, tx, x, y, z))
+                entry.update(_empirical_point(model, tx, x, y, z, sim if self.wall_losses else None))
                 entry["rays"] = []
             entries.append(entry)
         wifi = self.wifi_setup(sim)
@@ -1084,8 +1150,12 @@ def _ray_dict(ray, names: List[str], edge_names: Sequence[str] = ()) -> Dict[str
     }
 
 
-def _empirical_point(model, tx: Transmitter, x: float, y: float, z: float) -> Dict[str, Any]:
-    """Same formula as ``run_empirical_simulation`` for one point (without shadow fading)."""
+def _empirical_point(model, tx: Transmitter, x: float, y: float, z: float, sim=None) -> Dict[str, Any]:
+    """
+    Same formula as ``run_empirical_simulation`` for one point (without shadow fading).
+    With ``sim`` (multiwall mode) the losses of the walls crossed by the direct path
+    are added and listed (``walls``: name and loss of each).
+    """
     ground = math.hypot(x - tx.x, y - tx.y)
     distance = ground if getattr(model, "uses_ground_distance", False) else math.sqrt(ground ** 2 + (z - tx.z) ** 2)
     with warnings.catch_warnings():
@@ -1096,7 +1166,16 @@ def _empirical_point(model, tx: Transmitter, x: float, y: float, z: float) -> Di
         phi = math.degrees(math.atan2(y - tx.y, x - tx.x))
         theta = math.degrees(math.atan2(z - tx.z, max(1e-6, ground)))
         pl -= tx.pattern_gain_db(phi, theta)
-    return {"rx_power_dbm": tx.tx_power_dbm - pl, "path_loss_db": pl}
+    out: Dict[str, Any] = {}
+    if sim is not None:
+        a, b = np.array([tx.x, tx.y, tx.z], dtype=float), np.array([x, y, z], dtype=float)
+        crossed = [(r.name, float(r.transmission_loss_db)) for r in sim.ray_tracer.reflectors
+                   if r.obstructs and bool(r.crosses(a, b))]
+        wall_loss = float(sum(loss for _, loss in crossed))
+        pl += wall_loss
+        out = {"wall_loss_db": wall_loss, "walls": [{"name": n, "loss_db": l} for n, l in crossed]}
+    out.update({"rx_power_dbm": tx.tx_power_dbm - pl, "path_loss_db": pl})
+    return out
 
 
 # --------------------------------------------------------------------------- examples
@@ -1180,4 +1259,137 @@ def example_wifi() -> Project:
     return project.validate()
 
 
-EXAMPLES = {"urbano": example_urban, "oficina": example_office, "wifi": example_wifi}
+# Antenna presets of the interface (1.9.0): pattern, gain and -3 dB beamwidths.  The
+# directional ones use the parabolic pattern of 3GPP with beamwidths that give that
+# gain with ~70 % efficiency (G ~ 0.7 * 41253 / (az * el)); they are generic models,
+# not the measured pattern of a product.
+ANTENNA_PRESETS = {
+    "omni_2_2": {"label": "Omnidireccional 2.2 dBi", "pattern": "isotropic", "antenna_gain_dbi": 2.2},
+    "omni_5": {"label": "Omnidireccional 5 dBi", "pattern": "isotropic", "antenna_gain_dbi": 5.0},
+    "yagi_13": {"label": "Yagi 13 dBi (40° × 36°)", "pattern": "sector", "antenna_gain_dbi": 13.0,
+                "beamwidth_az_deg": 40.0, "beamwidth_el_deg": 36.0},
+    "sector_6": {"label": "Sector 6 dBi (120° × 60°)", "pattern": "sector", "antenna_gain_dbi": 6.0,
+                 "beamwidth_az_deg": 120.0, "beamwidth_el_deg": 60.0},
+    "panel_8": {"label": "Panel 8 dBi (65° × 65°)", "pattern": "sector", "antenna_gain_dbi": 8.0,
+                "beamwidth_az_deg": 65.0, "beamwidth_el_deg": 65.0},
+}
+
+
+def mw_to_dbm(milliwatts: float) -> float:
+    """Power in dBm of ``milliwatts`` mW."""
+    return 10.0 * math.log10(milliwatts)
+
+
+# Plan of the restaurant of the Acrylic Wi-Fi practice ("Restaurant Polanco"), in pixels of
+# the 587 x 496 image (x to the right, y down).  The practice calibrates it with the top
+# edge of the medium salon, from (313, 255) to (512, 255), as 100 m.
+RESTAURANT_SCALE_M_PER_PX = 100.0 / 199.0
+RESTAURANT_POINT1_PX = (313.0, 255.0)
+RESTAURANT_POINT1_M = (130.0, 115.0)
+RESTAURANT_IMAGE_PX = (587, 496)
+
+
+def restaurant_px_to_m(u: float, v: float) -> List[float]:
+    """World coordinates (m) of a point of the restaurant plan given in pixels."""
+    s = RESTAURANT_SCALE_M_PER_PX
+    return [round(RESTAURANT_POINT1_M[0] + (u - RESTAURANT_POINT1_PX[0]) * s, 4),
+            round(RESTAURANT_POINT1_M[1] - (v - RESTAURANT_POINT1_PX[1]) * s, 4)]
+
+
+def restaurant_floor_plan(image_data_url: str, opacity: float = 0.7) -> FloorPlan:
+    """The plan image of the practice placed so that it matches ``example_restaurant``."""
+    s = RESTAURANT_SCALE_M_PER_PX
+    width_px, height_px = RESTAURANT_IMAGE_PX
+    # pixel (u, v) covers [u, u + 1]: its centre (u + 0.5) is the coordinate of restaurant_px_to_m(u, v)
+    x_m = RESTAURANT_POINT1_M[0] - (RESTAURANT_POINT1_PX[0] + 0.5) * s
+    y_m = RESTAURANT_POINT1_M[1] - (height_px - RESTAURANT_POINT1_PX[1] - 0.5) * s
+    return FloorPlan(image_data_url, width_px, height_px, round(x_m, 4), round(y_m, 4), round(width_px * s, 4),
+                     opacity, True, "Restaurant Polanco.jpg")
+
+
+def example_restaurant() -> Project:
+    """
+    The Wi-Fi planning practice of Acrylic Wi-Fi Heatmaps ("Planeación con Acrylic"):
+    a restaurant with three salons and a glass terrace, concrete walls 15 cm thick, glass
+    0.3 cm, and three 2.4 GHz access points on channels 1, 6 and 11 (new in 1.9.0).
+    The plan image is not included: load it with Archivo -> Plano de fondo (see the README).
+    """
+    concrete, glass = "concreto", "vidrio"
+    segments = []                                  # (name, start px, end px, material, thickness m)
+
+    def wall_with_windows(name, y, x0, x1, windows, window_material):
+        xs = [x0]
+        for a, b in windows:
+            xs += [a, b]
+        xs.append(x1)
+        k = 0
+        for i in range(len(xs) - 1):
+            if xs[i + 1] <= xs[i]:
+                continue
+            if i % 2 == 0:
+                segments.append((f"{name} · muro", (xs[i], y), (xs[i + 1], y), concrete, 0.15))
+            else:
+                k += 1
+                segments.append((f"{name} · ventana {k}", (xs[i], y), (xs[i + 1], y), window_material,
+                                 0.003 if window_material == glass else 0.15))
+
+    # Large salon (top): the practice changes its two windows to glass
+    wall_with_windows("Salón grande norte", 151, 119, 313, [(150, 189), (250, 288)], glass)
+    segments += [("Salón grande oeste", (119, 151), (119, 289), concrete, 0.15),
+                 ("Salón grande este", (313, 151), (313, 255), concrete, 0.15),
+                 ("Salón grande / salón pequeño", (119, 289), (313, 289), concrete, 0.15),
+                 # Small salon (bottom left)
+                 ("Salón pequeño norte", (60, 289), (119, 289), concrete, 0.15),
+                 ("Salón pequeño oeste", (60, 289), (60, 390), concrete, 0.15),
+                 ("Salón pequeño sur", (60, 390), (313, 390), concrete, 0.15),
+                 ("Salón pequeño / salón mediano", (313, 289), (313, 390), concrete, 0.15),
+                 # Medium salon (right)
+                 ("Salón grande / salón mediano", (313, 255), (313, 289), concrete, 0.15),
+                 ("Salón mediano este", (512, 255), (512, 390), concrete, 0.15)]
+    # The practice leaves the windows of the medium salon as concrete (they are separate walls, to change them)
+    windows = [(334, 372), (403, 441), (462, 500)]
+    wall_with_windows("Salón mediano norte", 255, 313, 512, windows, concrete)
+    wall_with_windows("Salón mediano sur", 390, 313, 512, windows, concrete)
+    # Glass terrace under the small salon (middle line of the triple line of the plan)
+    terrace = [(100, 390), (100, 427), (150, 477), (222, 477), (273, 426), (273, 390)]
+    for k in range(len(terrace) - 1):
+        segments.append((f"Terraza · vidrio {k + 1}", terrace[k], terrace[k + 1], glass, 0.003))
+
+    walls = [Wall(f"w{k + 1}", name, restaurant_px_to_m(*a), restaurant_px_to_m(*b), 0.0, 3.0, material, thickness)
+             for k, (name, a, b, material, thickness) in enumerate(segments)]
+
+    def ap(tx_id, name, u, v, milliwatts, preset, azimuth, channel):
+        x, y = restaurant_px_to_m(u, v)
+        fields_ = {k: v for k, v in ANTENNA_PRESETS[preset].items() if k != "label"}
+        return TransmitterSpec(tx_id, name, round(x, 2), round(y, 2), 2.5, mw_to_dbm(milliwatts), 2.412e9,
+                               azimuth_deg=azimuth, wifi_band="2.4", wifi_channel=channel, wifi_width_mhz=20,
+                               wifi_streams=2, **fields_)
+
+    s = RESTAURANT_SCALE_M_PER_PX
+    project = Project(
+        name="Restaurante Polanco (práctica Acrylic Wi-Fi)",
+        description=("Práctica de planeación Wi-Fi: tres salones y una terraza de vidrio, muros de concreto de "
+                     "15 cm y vidrio de 0.3 cm, y tres AP en 2.4 GHz (canales 1, 6 y 11). Escala de la práctica: "
+                     "100 m entre las esquinas superiores del salón mediano. Modelo de interiores multimuro "
+                     "(log-distancia n = 2.5 + muros). Carga el plano con Archivo → Plano de fondo (sección "
+                     "«Práctica» del README) y aplica Ver → Estilo del mapa → Estilo Acrylic."),
+        area=Area(0.0, 233.0, -2.0, 170.0, 1.0, 1.0),
+        # Multi-wall indoor model (log-distance + walls), the kind of model of the Wi-Fi planning tools.
+        # n = 2.5 lets the 9 mW AP cover the large salon, as in the result of the practice; ray
+        # tracing (free space plus reflections) covers much more at this scale (see the README).
+        settings=Settings(mode="multiwall", log_distance_exponent=2.5, sinr=True,
+                          wifi_standard="n", wifi_client_streams=2),
+        transmitters=[
+            # 1: omni 2.2 dBi, 9 mW, channel 1, in the large salon (where the practice drags it)
+            ap(0, "AP 1 · Resta_Polanco", 206, 220, 9.0, "omni_2_2", 0.0, 1),
+            # 2: Yagi 13 dBi pointing right, 30 mW, channel 6, against the left wall of the small salon
+            ap(1, "AP 2 · Resta_Polanco", 60 + 1.0 / s, 339.5, 30.0, "yagi_13", 0.0, 6),
+            # 3: sector 6 dBi pointing left, 40 mW, channel 11, against the right wall of the medium salon
+            ap(2, "AP 3 · Resta_Polanco", 512 - 1.0 / s, 322.5, 40.0, "sector_6", 180.0, 11),
+        ],
+        walls=walls,
+    )
+    return project.validate()
+
+
+EXAMPLES = {"urbano": example_urban, "oficina": example_office, "wifi": example_wifi, "restaurante": example_restaurant}

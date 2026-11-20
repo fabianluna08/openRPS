@@ -371,6 +371,7 @@ export class View2D {
       const [sx, sy] = this.w2s(tx.x, tx.y);
       const color = txColor(slot);
       const selected = this.store.isSelected("tx", tx.tx_id);
+      if (this.store.view.hideTx && !selected) return;          // "Ocultar AP" (1.9.0): solo el seleccionado
       if (tx.pattern === "sector") {
         const half = Math.min(179, tx.beamwidth_az_deg / 2) * Math.PI / 180;
         const az = -tx.azimuth_deg * Math.PI / 180;
@@ -941,7 +942,8 @@ export class View2D {
     const id = nextId("w", proj.walls);
     const material = last ? last.material : (proj.materials.find((m) => m.id === "ladrillo") || proj.materials[0] || {}).id;
     this.store.change((pr) => pr.walls.push({ id, name: `Muro ${pr.walls.length + 1}`, start, end: p,
-      z_min_m: last ? last.z_min_m : 0, z_max_m: last ? last.z_max_m : 3, material }));
+      z_min_m: last ? last.z_min_m : 0, z_max_m: last ? last.z_max_m : 3, material,
+      thickness_m: last && last.thickness_m ? last.thickness_m : null }));     // como el último muro (1.9.0)
     this.store.select({ type: "wall", id });
     this.app.updateHint();
   }

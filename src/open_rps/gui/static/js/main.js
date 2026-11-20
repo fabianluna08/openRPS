@@ -2,7 +2,7 @@
 import { api, decodeResult } from "./api.js";
 import { renderLegend, renderMeasurements, renderProbe, renderStats } from "./charts.js";
 import { normalizeWifi } from "./wifi.js";
-import { METRICS, fmt } from "./colors.js";
+import { METRICS, PALETTES, fmt } from "./colors.js";
 import { currentLayer, invalidateLayer, metricOptions, pixelAt } from "./coverage.js";
 import { centroid, round } from "./geometry.js";
 import { MODE_LABELS, deleteSelection, duplicateSelection, el, renderProperties, renderTree } from "./panels.js";
@@ -290,6 +290,74 @@ const app = {
     view2d.fit();
   },
 
+  // ----- Estilo del mapa (1.9.0): paleta, bandas, umbral, solo dentro de los muros, ocultar AP
+  mapStyle() {
+    const v = store.view;
+    const check = (on) => { const input = el("input", { type: "checkbox" }); input.checked = !!on; return input; };
+    const palette = el("select", {}, ...Object.entries(PALETTES).map(([id, pal]) => el("option", { value: id, text: pal.label })));
+    palette.value = v.palette;
+    const banded = check(v.banded);
+    const smooth = check(v.smooth);
+    const hideOn = check(v.hideBelowOn);
+    const hideValue = el("input", { type: "number", step: "any" });
+    hideValue.value = v.hideBelow;
+    const unit = el("span", { class: "muted" });
+    const inside = check(v.insideWalls);
+    const hideTx = check(v.hideTx);
+    const opacity = el("input", { type: "range", min: "0", max: "1", step: "0.05" });
+    opacity.value = v.opacity;
+    const opacityText = el("span", { class: "muted" });
+    const sync = () => {
+      const w = store.view;
+      palette.value = w.palette;
+      banded.checked = !!w.banded;
+      smooth.checked = !!w.smooth;
+      hideOn.checked = !!w.hideBelowOn;
+      hideValue.value = w.hideBelow;
+      hideValue.disabled = !w.hideBelowOn;
+      unit.textContent = METRICS[w.metric] ? METRICS[w.metric].unit : "";
+      inside.checked = !!w.insideWalls;
+      hideTx.checked = !!w.hideTx;
+      opacity.value = w.opacity;
+      opacityText.textContent = `${Math.round(w.opacity * 100)} %`;
+    };
+    const apply = (changes) => {
+      const tx = "hideTx" in changes && changes.hideTx !== store.view.hideTx;
+      store.setView(changes);
+      syncViewControls();
+      refreshCoverage();
+      view3d.updateGround(true);
+      if (tx) view3d.rebuildScene();
+      sync();
+    };
+    palette.addEventListener("change", () => apply({ palette: palette.value }));
+    banded.addEventListener("change", () => apply({ banded: banded.checked }));
+    smooth.addEventListener("change", () => apply({ smooth: smooth.checked }));
+    hideOn.addEventListener("change", () => apply({ hideBelowOn: hideOn.checked }));
+    hideValue.addEventListener("change", () => { if (isFinite(Number(hideValue.value))) apply({ hideBelow: Number(hideValue.value) }); });
+    inside.addEventListener("change", () => apply({ insideWalls: inside.checked }));
+    hideTx.addEventListener("change", () => apply({ hideTx: hideTx.checked }));
+    opacity.addEventListener("input", () => apply({ opacity: Number(opacity.value) }));
+    const acrylic = el("button", { class: "btn primary", text: "Estilo Acrylic" });
+    acrylic.addEventListener("click", () => apply({ ...ACRYLIC_STYLE }));
+    const plain = el("button", { class: "btn", text: "Estilo de OpenRPS" });
+    plain.addEventListener("click", () => apply({ ...DEFAULT_STYLE }));
+    sync();
+    showModal("Estilo del mapa", [
+      el("div", { class: "style-presets" }, acrylic, plain),
+      el("p", { class: "note", text: "Estilo Acrylic: potencia recibida con la paleta de mapa de calor Wi-Fi en bandas sólidas, escala de −100 a 0 dBm, sin pintar por debajo de −75 dBm (Min RSSI), opacidad del 65 % y sin los AP, como en el mapa de calor de Acrylic Wi-Fi Heatmaps." }),
+      el("div", { class: "style-form" },
+        el("span", { text: "Paleta" }), palette,
+        el("span", { text: "Colores sólidos (bandas)" }), banded,
+        el("span", { text: "Colores suaves (interpolar)" }), smooth,
+        el("span", { text: "No pintar por debajo de" }), el("span", {}, hideOn, " ", hideValue, " ", unit),
+        el("span", { text: "Solo dentro de los muros" }), inside,
+        el("span", { text: "Ocultar los AP" }), hideTx,
+        el("span", { text: "Opacidad" }), el("span", {}, opacity, " ", opacityText)),
+      el("p", { class: "note", text: "«Solo dentro de los muros» pinta lo que encierran los muros y los edificios; si el contorno tiene un hueco (una puerta sin muro), la zona de afuera entra por él. Con un umbral, lo que no tiene señal tampoco se pinta." }),
+    ]);
+  },
+
   // ----- Wi-Fi: sugerencia de canales
   planChannels() {
     const p = store.project;
@@ -562,6 +630,23 @@ function refreshCoverage() {
   if (layer && layer.range) { $("range-min").value = layer.range[0]; $("range-max").value = layer.range[1]; }
 }
 
+const ACRYLIC_STYLE = { metric: "rx_power", txFilter: "best", palette: "heat", banded: true, smooth: false, hideBelowOn: true,
+  hideBelow: -75, insideWalls: false, hideTx: true, opacity: 0.65, rangeAuto: false, rangeMin: -100, rangeMax: 0 };
+const DEFAULT_STYLE = { palette: "blue", banded: false, smooth: false, hideBelowOn: false, insideWalls: false, hideTx: false,
+  opacity: 0.85, rangeAuto: true };
+
+// Controles de la barra que reflejan store.view (tras aplicar un estilo)
+function syncViewControls() {
+  const v = store.view;
+  updateMetricControls();
+  $("opacity").value = v.opacity;
+  $("range-auto").checked = v.rangeAuto;
+  $("range-min").disabled = v.rangeAuto;
+  $("range-max").disabled = v.rangeAuto;
+  if (!v.rangeAuto && v.rangeMax > v.rangeMin) { $("range-min").value = v.rangeMin; $("range-max").value = v.rangeMax; }
+  $("opt-smooth").checked = !!v.smooth;
+}
+
 function schedule3dRebuild() {
   if (rebuild3dPending) return;
   rebuild3dPending = true;
@@ -684,6 +769,7 @@ function helpModal() {
     table,
     el("p", { text: "Con mediciones: Archivo → Plano de fondo para cargar el plano y escalarlo con dos puntos; Archivo → Importar mediciones (CSV con x, y y la potencia en dBm) o la herramienta Medición (N); después, la pestaña Mediciones compara y calibra." }),
     el("p", { text: "Con Wi-Fi: asigna a cada transmisor una banda, un ancho y un canal (panel Propiedades → Wi-Fi) y elige el estándar en Configuración. Aparecen los mapas de tasa de datos, MCS y AP que comparten el canal; el receptor muestra qué AP interfieren y cuánto. Simulación → Sugerir canales Wi-Fi propone un plan de canales." }),
+    el("p", { text: "Como en Acrylic Wi-Fi Heatmaps: cada muro puede tener espesor (Propiedades → Espesor, en cm), la potencia del AP se escribe en dBm o en mW, y Antena → Modelo pone una omnidireccional, Yagi, sector o panel. Ver → Estilo del mapa tiene la paleta de mapa de calor Wi-Fi, las bandas sólidas, el umbral de RSSI mínimo, «solo dentro de los muros» y el botón Estilo Acrylic. El ejemplo «Restaurante Polanco» es la práctica de planeación con Acrylic." }),
     el("p", { class: "note", text: "Los proyectos se guardan como archivos .orps.json (el mismo formato que open_rps.project.Project en Python), con el plano, las mediciones y los canales Wi-Fi dentro. El último proyecto se guarda también en el navegador." }),
   ]);
 }
@@ -695,6 +781,7 @@ function aboutModal() {
     el("p", { text: "Motor: ray tracing 3D (rayo directo, reflexión en el suelo, uno o dos rebotes especulares en muros y suelo, difracción UTD en una o dos aristas por rayo, rayos que combinan un rebote con una difracción, y obstrucción por muros y techos) y modelos empíricos (FSPL, Two-Ray, Log-distancia, Okumura-Hata, COST-231 Hata)." }),
     el("p", { text: "Desde la 1.7.0 puedes cargar el plano de fondo, importar o anotar mediciones, compararlas con la predicción y calibrar las pérdidas de los materiales y la potencia de las antenas (pestaña Mediciones)." }),
     el("p", { text: "Desde la 1.8.0 hay una capa Wi-Fi (802.11n/ac/ax en 2.4, 5 y 6 GHz): interferencia entre canales vecinos según la máscara espectral, SINR, MCS y tasa PHY por punto, contención por canal compartido y sugerencia de canales." }),
+    el("p", { text: "Desde la 1.9.0 los muros pueden tener espesor (pérdida de una losa según ITU-R P.2040), hay modelos de antena, potencia en mW y un estilo de mapa como el de Acrylic Wi-Fi Heatmaps." }),
     el("p", { class: "note", text: "Limitaciones: a lo más dos interacciones por rayo (dos rebotes, dos difracciones o un rebote y una difracción) y terreno plano. Los modelos no están validados contra campañas de medición: calíbralos con las tuyas. En Wi-Fi, la interferencia entre canales usa la máscara del estándar (una cota superior) y la tasa es la PHY, no el throughput real. Consulta la sección «Limitaciones físicas» del README antes de usar los resultados." }),
     el("p", { class: "note", text: "La vista 3D usa three.js r187 (licencia MIT), incluido en el paquete." }),
   ]);
@@ -730,6 +817,7 @@ const actions = {
   compare: () => { app.showMeasurements(); app.compareMeasurements(); },
   "show-measurements": () => app.showMeasurements(),
   "wifi-plan": () => app.planChannels(),
+  "map-style": () => app.mapStyle(),
 };
 
 function bindUi() {

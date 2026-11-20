@@ -51,4 +51,4 @@ from .wifi import (
 )
 from .channel_plan import ChannelPlan, plan_channels
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"

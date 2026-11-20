@@ -22,6 +22,14 @@ La versión 1.8.0 añade la **capa Wi-Fi** (sección 1.I):
 * **Mapas de Wi-Fi:** MCS y tasa de datos PHY (802.11n, ac y ax) en cada punto, y cuántos AP comparten el canal.
 * **Sugerencia de canales:** OpenRPS propone el plan de canales que da más tasa en el área.
 
+La versión 1.9.0 permite hacer en OpenRPS una **práctica de planeación Wi-Fi como las de Acrylic Wi-Fi Heatmaps** (secciones 1.J y 4.I):
+
+* **Muros con espesor:** el concreto de 15 cm o el vidrio de 0.3 cm atenúan según su grosor, con el modelo de losa de ITU-R P.2040.
+* **Modelo de interiores multimuro:** pérdida log-distancia más la pérdida de cada muro que cruza la línea directa, el tipo de modelo que usan las herramientas de planeación Wi-Fi.
+* **Antenas y potencia:** modelos de antena (omnidireccional, Yagi, sector, panel) y potencia en mW.
+* **Estilo del mapa:** paleta de mapa de calor Wi-Fi en bandas, RSSI mínimo, pintar solo dentro de los muros y ocultar los AP.
+* **El ejemplo de la práctica:** el restaurante de la práctica, con sus tres salones, la terraza de vidrio y los tres AP.
+
 ---
 
 ## 1. Arquitectura y Modelos Físicos Implementados
@@ -446,6 +454,70 @@ La simulación tarda 2.2 s y la sugerencia 0.3 s. Los dos AP que quedan en el ca
 * **Los flujos espaciales multiplican la tasa** solo si el canal tiene rango suficiente (multitrayecto rico). Aquí se supone que sí.
 * **Revisa qué canales permite tu país** antes de aplicar un plan, sobre todo en 5 GHz (DFS, UNII-4) y en 6 GHz.
 
+### J. Espesor de los muros, modelo multimuro, antenas y estilo de mapa (nuevo en 1.9.0)
+
+Lo que hace falta para planear una red Wi-Fi en interiores como con Acrylic Wi-Fi Heatmaps u otra herramienta de *site survey*: muros con su material y su espesor, un modelo de interiores, antenas comerciales típicas y el mapa de calor de siempre. La sección 4.I sigue la práctica paso a paso.
+
+**Espesor de los muros** (`Wall.thickness_m`; en la interfaz, *Espesor* en cm). Un muro con espesor ya no usa la pérdida fija de su material. En su lugar atenúa como una losa homogénea de ese grosor con la εr y la σ del material (ITU-R P.2040, modelo de una capa con las reflexiones internas, a incidencia normal):
+
+T = (1 − R²)·e^(−jq) / (1 − R²·e^(−2jq)),  con R = (1 − n)/(1 + n), q = 2π·f·d·n/c y n = √(εr − j·σ/(2π·f·ε0)),
+
+y la pérdida es −20·log10|T|. Una losa muy delgada es casi transparente. Una gruesa pierde α·d más las dos interfaces. Los materiales que no obstruyen (muro ideal) o que son opacos (metal) no cambian con el espesor. Un muro sin espesor se comporta igual que antes.
+
+| Material | Espesor | Pérdida a 2412 MHz | Pérdida a 5500 MHz | Ley del material sin espesor (2.4 GHz) |
+|---|---|---|---|---|
+| Concreto | 10 cm | 8.1 dB | 14.0 dB | 14.6 dB |
+| Concreto | 15 cm | 11.4 dB | 20.2 dB | 14.6 dB |
+| Concreto | 30 cm | 21.1 dB | 39.0 dB | 14.6 dB |
+| Ladrillo | 12 cm | 3.5 dB | 4.2 dB | 10.0 dB |
+| Tablaroca | 1.25 cm | 1.1 dB | 1.0 dB | 3.0 dB |
+| Madera | 4 cm | 0.6 dB | 1.5 dB | 5.1 dB |
+| Vidrio | 0.3 cm | 0.7 dB | 2.3 dB | 2.5 dB |
+| Vidrio | 0.6 cm | 1.9 dB | 3.3 dB | 2.5 dB |
+
+En la interfaz, el panel del muro muestra la pérdida por cruce a la frecuencia de referencia. Los muros nuevos heredan el material, la altura y el espesor del último que dibujaste.
+
+**Modelo multimuro** (*Interiores: log-distancia + muros*, `Settings.mode = "multiwall"`):
+
+PL = FSPL(d0) + 10·n·log10(d/d0) + Σ L_muro.
+
+La suma incluye la pérdida de cada muro que cruza la línea recta del AP al punto (con la misma regla de cruce que el ray tracing; un muro opaco deja el punto sin señal). Es el modelo clásico de interiores (Motley–Keenan, COST 231 multimuro) y el tipo de modelo que usan las herramientas de planeación Wi-Fi.
+
+* **Exponente n:** 2 es el espacio libre; en interiores se usa de 2.5 a 3.5, porque los muebles y la gente atenúan aunque no estén dibujados.
+* **Sin rayos:** los muros no reflejan ni difractan, así que no hay respuesta al impulso. Para eso está el ray tracing.
+* **Rapidez:** es casi instantáneo (0.06 s para el restaurante de la práctica, 40 000 píxeles).
+* **Receptor de prueba:** dice qué muros cruza la línea directa de cada AP y cuánto pierde en cada uno.
+* **Calibración:** ajusta las pérdidas de los materiales y el exponente (`calibrate`, igual que en ray tracing y log-distancia). Los muros con espesor no se calibran, porque su pérdida sale de εr, σ y el grosor.
+
+**Antenas** (`ANTENNA_PRESETS`; en la interfaz, *Antena → Modelo*). Cada modelo pone el diagrama, la ganancia y los haces, que después se pueden ajustar:
+
+| Modelo | Diagrama | Haz horizontal × vertical |
+|---|---|---|
+| Omnidireccional 2.2 dBi | isotrópico con 2.2 dBi | — |
+| Omnidireccional 5 dBi | isotrópico con 5 dBi | — |
+| Yagi 13 dBi | sector 3GPP | 40° × 36° |
+| Sector 6 dBi | sector 3GPP | 120° × 60° |
+| Panel 8 dBi | sector 3GPP | 65° × 65° |
+
+Los haces dan esa ganancia con un ~70 % de eficiencia (G ≈ 0.7 · 41253 / (haz_h · haz_v)). Son modelos genéricos, no el diagrama medido de un producto. La orientación es el azimut: 0° apunta a la derecha (+x), 90° hacia arriba (+y) y 180° a la izquierda.
+
+**Potencia en mW.** El panel del transmisor tiene la potencia en dBm y en mW (9 mW = 9.5 dBm, 30 mW = 14.8 dBm, 40 mW = 16.0 dBm, 100 mW = 20 dBm). En Python está `mw_to_dbm`.
+
+**Estilo del mapa** (*Ver → Estilo del mapa…* o el botón *Estilo…*):
+
+* **Paleta:** azul (la de OpenRPS) o la de mapa de calor Wi-Fi, que va del azul marino (débil) al rojo oscuro (fuerte), como en las herramientas de *site survey*. Esta paleta no es perceptualmente uniforme; sirve para comparar con esas herramientas.
+* **Colores sólidos:** bandas, un color por paso de la paleta (con la de mapa de calor y la escala de −100 a 0 dBm, bandas de 6.7 dB). *Colores suaves* interpola el mapa.
+* **No pintar por debajo de** un valor, el *Min RSSI* de Acrylic. Lo que no tiene señal tampoco se pinta y se ve el plano.
+* **Solo dentro de los muros:** pinta lo que encierran los muros y los edificios. Los muros se pasan a la rejilla y se inunda desde el borde del área; lo que la inundación no alcanza está encerrado. Si el contorno tiene un hueco (una puerta sin muro), la inundación entra por él.
+* **Ocultar los AP:** quita los AP del mapa en 2D y 3D, salvo el seleccionado.
+* **Estilo Acrylic:** aplica todo de una vez. Potencia recibida, paleta de mapa de calor en bandas, escala de −100 a 0 dBm, sin pintar por debajo de −75 dBm, opacidad del 65 % y sin los AP.
+
+**Validación** (`tests/test_v1_9.py`):
+
+* **Losa:** el modelo coincide con un cálculo independiente por matriz de transferencia (a 10⁻⁹ dB) en seis materiales y tres frecuencias. También cumple los casos que se calculan a mano: una losa de media longitud de onda sin pérdidas es transparente, una de un cuarto pierde 10·log10((1 + n²)²/(4n²)), y en una gruesa la pérdida es α·d más las dos interfaces. La interfaz (JavaScript) da lo mismo que Python.
+* **Multimuro:** el mapa es exactamente el de log-distancia menos la pérdida de los muros cruzados (cero antes del primer muro, el concreto entre los dos y concreto más vidrio después). El receptor de prueba y la predicción en puntos coinciden con el mapa. La calibración recupera la pérdida (18 dB) y el exponente (2.7) con que se generaron las mediciones.
+* **Compatibilidad:** sin espesor y sin el modo multimuro, los ejemplos dan exactamente lo mismo que 1.8.0 (grillas y archivo).
+
 ---
 
 ## 2. Estructura del Proyecto
@@ -479,7 +551,8 @@ open_rps/
 │   ├── proyecto_oficina.orps.json  # Planta de oficinas con Wi-Fi a 5.2 GHz
 │   ├── plano_oficina.png           # Plano de esa oficina, para practicar el plano de fondo (1.7.0)
 │   ├── mediciones_oficina.csv      # 56 mediciones sintéticas de esa oficina, para practicar la calibración
-│   └── proyecto_wifi.orps.json     # Esa oficina con cuatro AP en canales que se enciman (1.8.0)
+│   ├── proyecto_wifi.orps.json     # Esa oficina con cuatro AP en canales que se enciman (1.8.0)
+│   └── restaurante_polanco.orps.json  # El restaurante de la práctica de Acrylic Wi-Fi (1.9.0, sin el plano)
 ├── tests/                # Tests unitarios (unittest de la librería estándar)
 └── output/               # Archivos de ejemplo generados (CSV, JSON, mapas SVG)
 ```
@@ -508,8 +581,8 @@ Cualquiera de las opciones instala la librería (`import open_rps`) y los comand
 Para generar un paquete distribuible (wheel) que se pueda compartir con los alumnos:
 
 ```bash
-pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.8.0-py3-none-any.whl
-pip install dist/open_rps-1.8.0-py3-none-any.whl
+pip wheel . --no-deps -w dist/      # crea dist/open_rps-1.9.0-py3-none-any.whl
+pip install dist/open_rps-1.9.0-py3-none-any.whl
 ```
 
 ---
@@ -658,6 +731,11 @@ El comando levanta un servidor local en `http://127.0.0.1:8765/`, que solo es ac
   * **Mapas:** *Wi-Fi: tasa de datos (PHY)*, *Wi-Fi: MCS* y *Wi-Fi: AP que comparten el canal*.
   * **Receptor de prueba.** Dice el servidor, el SINR, la MCS y la tasa, y qué AP interfieren: con cuánta potencia llegan, cuánto se enciman sus canales y cuánto aportan.
   * **Sugerencia de canales.** *Simulación → Sugerir canales Wi-Fi* compara el plan actual con el sugerido y lo aplica con un clic (se deshace con Ctrl+Z).
+* **Como en Acrylic** (1.9.0, sección 1.J):
+  * **Muros:** espesor en cm, con la pérdida por cruce a la vista.
+  * **AP:** potencia en dBm o en mW, y *Antena → Modelo* (omnidireccional, Yagi, sector, panel).
+  * **Modelo de interiores:** *Interiores: log-distancia + muros (multimuro)*.
+  * **Mapa:** *Ver → Estilo del mapa* con la paleta de mapa de calor Wi-Fi, las bandas, el RSSI mínimo, «solo dentro de los muros», ocultar los AP y el botón *Estilo Acrylic*.
 * **Archivo:** abrir y guardar proyectos `.orps.json`; el último proyecto se guarda además en el navegador. Hay ejemplos incluidos y se puede exportar el resultado como CSV, JSON o SVG (los mismos archivos que el CLI) o la vista como PNG.
 
 Cada edificio se convierte en el motor en un muro vertical por arista y un techo poligonal (sección 1.E). Con el material por defecto (concreto) las fachadas atenúan 14.6 dB a 2.4 GHz. Con "Metal" son opacas y con "Muro ideal" solo reflejan. Los modelos empíricos ignoran edificios y muros, como en la librería.
@@ -731,6 +809,37 @@ Un proyecto con canales Wi-Fi se guarda como versión 3 del formato. Sin ellos l
 
 `Project.from_dict` valida todo el documento. Rechaza campos desconocidos, polígonos que se cruzan, materiales inexistentes, `tx_id` repetidos y grillas de más de 4 millones de píxeles, y en cada caso lanza un `ProjectError` (subclase de `ValueError`) que dice qué elemento y qué campo fallan.
 
+### I. Práctica: planeación de una red Wi-Fi como con Acrylic Wi-Fi Heatmaps (nuevo en 1.9.0)
+
+La práctica «Planeación con Acrylic Wi-Fi» se hace con el plano `Restaurant Polanco.jpg`: tres salones y una terraza de vidrio, muros de concreto de 15 cm, ventanas de vidrio de 0.3 cm y tres AP en 2.4 GHz. En OpenRPS no hace falta instalar WebView2 ni activar una licencia (pasos 1 a 20). El resto se hace así:
+
+| Paso de la práctica (Acrylic) | En OpenRPS |
+|---|---|
+| 21. Proyecto: nombre, cliente y descripción | Selecciona el nombre del proyecto en el árbol y escribe nombre y descripción |
+| 22–28. *Upload image* y *Manual calibration* con dos puntos y 100 m | *Archivo → Plano de fondo (imagen)…*: carga el plano, haz clic en la esquina superior izquierda del salón mediano y en su esquina superior derecha, y escribe 100 m |
+| 29–31. *Add location* | No hace falta: el plano queda en el proyecto |
+| 33–35. *Wall Editor*: concreto, 15 cm | Herramienta *Muro* (W): clic en cada esquina. En el panel del muro, material *Concreto* y espesor 15 cm; los muros siguientes heredan los dos. Mantén Alt para no ajustar a la cuadrícula |
+| 36–37. Ventanas y terraza: vidrio de 0.3 cm | Selecciona cada muro: material *Vidrio*, espesor 0.3 cm |
+| 38–42. *Access Point Editor*: AP 1 | Herramienta *Transmisor* (T). *Antena → Modelo*: Omnidireccional 2.2 dBi. Potencia 9 mW. *Wi-Fi*: 2.4 GHz, 20 MHz, canal 1. El SSID va en el nombre («AP 1 · Resta_Polanco») |
+| 45. AP 2: Yagi 13 dBi a la derecha, canal 6, 30 mW, pegado al muro izquierdo del salón pequeño | *Modelo*: Yagi 13 dBi, azimut 0°, canal 6, 30 mW |
+| 46. AP 3: sector 6 dBi a la izquierda, canal 11, 40 mW, pegado al muro derecho del salón mediano | *Modelo*: Sector 6 dBi, azimut 180°, canal 11, 40 mW |
+| 43–44. *Heat Map*: *Signal Level*, Min RSSI −75, *Solid Colors*, *Hide APs*, opacidad 65 % | *Configuración → Modelo*: Interiores (multimuro), n = 2.5, estándar 802.11n. Ejecuta (F5) y aplica *Ver → Estilo del mapa → Estilo Acrylic* |
+| Entrega: video de la propagación de los 3 AP | Graba la pantalla (en Windows, Win+Alt+R o la Herramienta Recortes). Puedes mostrar también la vista 3D (tecla 3) y el receptor de prueba (S) |
+
+**Atajo:** *Archivo → Ejemplos → Restaurante Polanco (práctica Acrylic Wi-Fi)* abre el proyecto ya armado (`examples/restaurante_polanco.orps.json`), con 33 muros y los tres AP. El plano no viene incluido; para ponerlo debajo, carga `Restaurant Polanco.jpg` con *Plano de fondo* y escálalo así:
+
+* **Puntos:** las dos esquinas superiores del salón mediano (en la imagen de 587 × 496 px, (313, 255) y (512, 255)).
+* **Distancia real:** 100 m.
+* **Coordenadas del primer punto:** X = 130 m, Y = 115 m.
+
+Detalles que conviene conocer:
+
+* **La escala de la práctica es grande.** Con 100 m entre esas esquinas, el restaurante mide 227 × 164 m. Así está en la práctica y así está el ejemplo; si tu profesor da otra medida, cambia la distancia.
+* **El exponente 2.5** del ejemplo se eligió para que el AP 1 (9 mW) cubra su salón por arriba de −75 dBm, como en el resultado de la práctica. No es un valor calibrado; con mediciones reales se ajusta con *Calibrar*.
+* **Con ray tracing la cobertura es mayor.** Usa espacio libre más reflexiones, sin la pérdida de muebles y gente, así que a esta escala casi todo el restaurante queda por arriba de −75 dBm. Es útil para comparar los dos enfoques.
+* **Ventanas del salón mediano:** la práctica deja de concreto sus seis ventanas. En el ejemplo son muros aparte, para cambiarlos a vidrio con un clic.
+* **802.11 b/g/n:** OpenRPS modela 802.11n, ac y ax. Un AP b/g/n conecta a los clientes actuales en 802.11n, así que se elige ese estándar. El mapa de potencia no depende del estándar.
+
 ---
 
 ## 5. Tests
@@ -781,6 +890,14 @@ Cubren valores de referencia de FSPL, Hata y COST-231, la asíntota $d^4$ del mo
 * **Motor:** SINR calculado a mano con canales vecinos, mezcla de AP con y sin canal, receptor de prueba igual al mapa, CSV y resumen.
 * **Proyectos:** ida y vuelta por JSON, versión 3 solo con Wi-Fi, validación (6 GHz sin 802.11ax, anchos no permitidos) y la sugerencia de canales, también por la API de la interfaz.
 
+`tests/test_v1_9.py` cubre lo añadido en 1.9.0:
+
+* **Losa:** comparación con la matriz de transferencia, casos límite y los valores de la práctica.
+* **Muros con espesor:** pérdida del muro, del reflector y de sus aristas, el rayo directo que la paga, la validación, el formato (versión 4) y que la calibración no los toque.
+* **Multimuro:** el mapa contra log-distancia más los muros, el receptor de prueba y los puntos contra el mapa, un muro opaco y la calibración del material y el exponente.
+* **Antenas y potencia:** mW a dBm, ganancia y haces coherentes, y que la interfaz tenga los mismos modelos y la misma fórmula de la losa (con node, si está instalado).
+* **El ejemplo del restaurante:** muros, AP, la escala de la práctica, que el plano caiga sobre los muros y la cobertura de cada salón.
+
 `tests/test_gui_server.py` arranca el servidor de la interfaz en un puerto libre y prueba la API: archivos estáticos, protección frente a rutas `../`, simulación y decodificación de las grillas, exportaciones, receptor de prueba, errores y rechazo de peticiones de otros orígenes.
 
 Para repetir la comparación bit a bit contra una copia real de la versión 1.2.0 (el test se omite si la variable no está definida):
@@ -820,6 +937,8 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 * **Modelos empíricos.** Hata y COST-231 son ajustes estadísticos para macroceldas (1–20 km, antena base de 30–200 m). Usarlos a 2.4 GHz, con antenas más bajas o a menos de 1 km es extrapolar; por defecto el código avisa pero no lo impide (`strict=True` sí lo impide). Estos modos no producen dispersión de retardo ni angular.
 * **Sombra sin correlación espacial.** `shadow_fading_sigma_db` añade una muestra log-normal independiente en cada píxel y para cada transmisor. La sombra real está correlacionada a lo largo de decenas de metros y entre emplazamientos; aquí el mapa resultante tiene aspecto de "sal y pimienta". Es adecuada para estudiar estadísticas (márgenes, probabilidad de cobertura), no para obtener mapas de aspecto realista. No depende del entorno ni de la distancia.
 * **SINR simplificado.** Enlace descendente, todos los transmisores emitiendo siempre (carga completa), receptor ideal salvo por su figura de ruido. Sin canales Wi-Fi solo interfieren los transmisores con exactamente la misma frecuencia portadora. Con canales Wi-Fi (sección 1.I) también interfieren los canales vecinos, según la máscara espectral del estándar, que es una cota superior de lo que emite un equipo real. No hay reparto de recursos, control de potencia ni traspasos. El mejor servidor sigue siendo el de mayor potencia recibida (no el de mayor SINR). La dispersión de retardo y angular de cada píxel se refiere solo a los rayos del mejor servidor.
+* **Espesor y multimuro (1.9.0).** El espesor sigue el modelo de una losa homogénea a incidencia normal. Un muro real (varillas, huecos, varias capas, acabados) suele perder más que su losa equivalente; las leyes fijas de los materiales salen de mediciones de edificios reales. El espesor no cambia la reflexión, que sigue siendo la de un semiespacio (Fresnel) o la constante. El modelo multimuro solo sigue la línea directa: no hay reflexiones ni difracción, y el exponente n (2.5 a 3.5) resume lo que no está dibujado.
+* **Mapa de calor tipo Acrylic.** La paleta de mapa de calor Wi-Fi no es perceptualmente uniforme (el verde y el cian ocupan más que el amarillo). «Solo dentro de los muros» depende de que el contorno esté cerrado a la resolución de la rejilla.
 * **Wi-Fi simplificado.** La tasa es la PHY de la MCS que permite el SINR, no el throughput: no se restan cabeceras ni acuses, y la contención se cuenta pero no reparte la tasa. Los umbrales de SINR son los de la sensibilidad mínima del estándar; un equipo bueno conecta con unos dB menos. Los flujos espaciales multiplican la tasa sin comprobar el rango del canal, y no hay conformación de haz, OFDMA, canal primario ni 40 MHz en 2.4 GHz. Para el CCA se cuenta igual un AP del mismo canal que uno de un canal que solo se encima en parte (en un equipo real este último se detecta por energía, a −62 dBm). La sugerencia de canales usa las pérdidas de la simulación anterior, sin el pequeño cambio de frecuencia, y no sabe qué canales permite cada país.
 * **Banda estrecha.** Una única frecuencia por transmisor; los coeficientes no dependen del ancho de banda. El ancho solo interviene en la potencia de ruido y, con canales Wi-Fi, en cuánto se enciman los canales: un AP de 160 MHz se propaga con la pérdida de su frecuencia central.
 * **Materiales a una sola frecuencia.** Un muro lo comparten todos los transmisores, así que la conductividad y la penetración de un material se evalúan a la frecuencia de referencia del proyecto (sección 1.E) aunque haya transmisores en varias bandas. La pérdida por penetración sigue siendo un número fijo por cruce: no depende del ángulo ni del espesor.
@@ -829,6 +948,19 @@ OpenRPS es un simulador didáctico de primer orden. Antes de usar sus resultados
 ---
 
 ## 7. Historial de cambios
+
+### Versión 1.9.0
+
+* **Novedades** (secciones 1.J y 4.I):
+  * **Espesor de los muros** (`Wall.thickness_m`): pérdida de una losa del material con ese grosor (`slab_loss_db`, ITU-R P.2040), en el motor, la interfaz y el receptor de prueba.
+  * **Modelo de interiores multimuro** (`Settings.mode = "multiwall"`): log-distancia más los muros que cruza la línea directa (`run_empirical_simulation(wall_losses=True)`), con la lista de muros cruzados en el receptor de prueba y calibración de materiales y exponente.
+  * **Modelos de antena** (`ANTENNA_PRESETS`: omnidireccional 2.2 y 5 dBi, Yagi 13 dBi, sector 6 dBi, panel 8 dBi) y **potencia en mW** (`mw_to_dbm`).
+  * **Estilo del mapa:** paleta de mapa de calor Wi-Fi, bandas sólidas, valor bajo el que no se pinta, «solo dentro de los muros», ocultar los AP y el botón *Estilo Acrylic*.
+  * **Ejemplo** `examples/restaurante_polanco.orps.json` de la práctica de Acrylic Wi-Fi, y guía de la práctica (sección 4.I).
+* **Cambios que conviene conocer:**
+  * El formato de proyecto pasa a la versión 4 solo cuando algún muro tiene espesor. Sin espesor, el archivo es igual al de 1.8.0.
+  * Los muros nuevos heredan también el espesor del último muro.
+* **Simulación:** sin espesor ni el modo multimuro no cambia. Con el mismo proyecto da exactamente lo mismo que 1.8.0.
 
 ### Versión 1.8.0
 

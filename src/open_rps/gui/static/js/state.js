@@ -20,6 +20,8 @@ export class Store {
       rangeAuto: true, rangeMin: null, rangeMax: null, grid: true, snap: true, smooth: false, labels: true,
       relief: false, transparent: false, showBlocked: false, hoverRay: null,
       coverageThreshold: -85, sinrThreshold: 0,
+      // Estilo del mapa (1.9.0): paleta, bandas sólidas, umbral bajo el que no se pinta, solo dentro de los muros
+      palette: "blue", banded: false, hideBelowOn: false, hideBelow: -75, insideWalls: false, hideTx: false,
     };
     this.undoStack = [];
     this.redoStack = [];
@@ -94,9 +96,15 @@ export class Store {
     if (!wifi && Object.entries(WIFI_SETTINGS_DEFAULTS).every(([k, v]) => st[k] === undefined || st[k] === v)) {
       for (const k of Object.keys(WIFI_SETTINGS_DEFAULTS)) delete st[k];
     }
+    // El espesor de los muros (1.9) también: un muro sin espesor usa la pérdida de su material
+    let thickness = false;
+    for (const w of p.walls) {
+      if (w.thickness_m === null || w.thickness_m === undefined) delete w.thickness_m;
+      else thickness = true;
+    }
     // Versión del formato: 1 sin plano, mediciones ni Wi-Fi (lo abren OpenRPS 1.4 a 1.6), 2 con plano o
-    // mediciones (1.7), 3 con Wi-Fi (1.8)
-    p.version = wifi || "wifi_standard" in st ? 3 : p.floor_plan || p.measurements ? 2 : 1;
+    // mediciones (1.7), 3 con Wi-Fi (1.8), 4 con espesor de muros (1.9)
+    p.version = thickness ? 4 : wifi || "wifi_standard" in st ? 3 : p.floor_plan || p.measurements ? 2 : 1;
     return p;
   }
 

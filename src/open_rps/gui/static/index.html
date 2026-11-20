@@ -47,6 +47,7 @@
           <label class="menu-check"><input type="checkbox" id="opt-grid" checked> Cuadrícula</label>
           <label class="menu-check"><input type="checkbox" id="opt-snap" checked> Ajustar a la cuadrícula (1 m)</label>
           <label class="menu-check"><input type="checkbox" id="opt-smooth"> Mapa suavizado</label>
+          <button data-action="map-style" role="menuitem">Estilo del mapa (paleta, umbral, Acrylic)…</button>
           <label class="menu-check"><input type="checkbox" id="opt-labels" checked> Nombres en el mapa</label>
           <hr>
           <div class="menu-label">Vista 3D</div>
@@ -116,6 +117,7 @@
       <input type="number" id="range-min" class="narrow" step="any" aria-label="Mínimo de la escala" disabled>
       <span class="muted">a</span>
       <input type="number" id="range-max" class="narrow" step="any" aria-label="Máximo de la escala" disabled>
+      <button id="style-button" type="button" data-action="map-style" title="Paleta, bandas, umbral, solo dentro de los muros, ocultar AP">Estilo…</button>
     </div>
     <div class="tool-group view-switch" role="group" aria-label="Vista">
       <button data-action="view-2d" data-view="2d">2D</button>
