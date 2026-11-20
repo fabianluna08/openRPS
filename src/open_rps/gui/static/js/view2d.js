@@ -357,12 +357,14 @@ export class View2D {
           ctx.restore();
         }
         ctx.stroke();
-        if (r.path.length > 2) {
-          const [bx, by] = this.w2s(r.path[1][0], r.path[1][1]);
-          ctx.setLineDash([]);
+        ctx.setLineDash([]);
+        ctx.fillStyle = r.blocked ? MUTED : color;
+        for (let k = 1; k + 1 < r.path.length; k++) {
+          const [bx, by] = this.w2s(r.path[k][0], r.path[k][1]);
+          const size = isHover ? 4 : 2.5;
           ctx.beginPath();
-          ctx.arc(bx, by, isHover ? 4 : 2.5, 0, 2 * Math.PI);
-          ctx.fillStyle = r.blocked ? MUTED : color;
+          if (r.kind === "diffraction") ctx.rect(bx - size - 0.5, by - size - 0.5, 2 * size + 1, 2 * size + 1);
+          else ctx.arc(bx, by, size, 0, 2 * Math.PI);
           ctx.fill();
         }
       });

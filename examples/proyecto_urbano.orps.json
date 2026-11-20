@@ -25,7 +25,9 @@
     "bandwidth_hz": 20000000.0,
     "ground_eps_r": 15.0,
     "ground_sigma": 0.005,
-    "reference_frequency_hz": null
+    "reference_frequency_hz": null,
+    "diffraction": true,
+    "max_reflections": 1
   },
   "materials": [
     {

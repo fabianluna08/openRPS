@@ -20,6 +20,7 @@ from .multipath import (
 from .raytracer import (
     Transmitter,
     PlanarReflector,
+    DiffractionEdge,
     RayTracer,
     RayField,
 )
@@ -32,4 +33,4 @@ from .visualizer import (
     MapVisualizer,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"

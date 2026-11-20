@@ -282,9 +282,11 @@ export class View3D {
           const material = new THREE.MeshBasicMaterial({ color: isHover ? new THREE.Color(0x0b0b0b) : color,
             transparent: true, opacity: 0.35 + 0.65 * rel });
           for (let k = 0; k + 1 < points.length; k++) this.rayGroup.add(segment(points[k], points[k + 1], radius, material));
-          if (points.length > 2) {
-            const hit = new THREE.Mesh(new THREE.SphereGeometry(radius * 2.2, 10, 8), material);
-            hit.position.copy(points[1]);
+          for (let k = 1; k + 1 < points.length; k++) {
+            const geometry = r.kind === "diffraction" ? new THREE.BoxGeometry(radius * 4, radius * 4, radius * 4)
+              : new THREE.SphereGeometry(radius * 2.2, 10, 8);
+            const hit = new THREE.Mesh(geometry, material);
+            hit.position.copy(points[k]);
             this.rayGroup.add(hit);
           }
         });

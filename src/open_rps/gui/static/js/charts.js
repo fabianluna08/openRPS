@@ -298,7 +298,7 @@ export function renderStats(container, store, app) {
   table.append(el("tr", {}, el("td", { class: "muted", text: "Sin servidor" }), el("td", { class: "num", text: `${fmt((100 * none) / total, 1)} %` }), el("td")));
   share.append(table);
   const rep = r.report;
-  share.append(el("p", { class: "note", text: `${r.grid.nx} × ${r.grid.ny} píxeles · ${rep.transmitters} transmisores · ${rep.reflectors} muros en el motor (${rep.obstructing_reflectors} obstruyen) · ${fmt(rep.elapsed_s, 2)} s` }));
+  share.append(el("p", { class: "note", text: `${r.grid.nx} × ${r.grid.ny} píxeles · ${rep.transmitters} transmisores · ${rep.reflectors} muros en el motor (${rep.obstructing_reflectors} obstruyen) · ${rep.edges || 0} aristas · ${fmt(rep.elapsed_s, 2)} s` }));
   grid.append(share);
 }
 
