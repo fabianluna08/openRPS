@@ -70,6 +70,18 @@ export function renderTree(container, store, app) {
       `${fmt(Math.hypot(w.end[0] - w.start[0], w.end[1] - w.start[1]), 1)} m`,
       el("span", { class: "swatch", style: `background:${(store.material(w.material) || {}).color || "#999"}` }))),
   ));
+  const plan = p.floor_plan;
+  container.append(section(
+    head("Plano de fondo", null, null, () => app.pickFloorPlan(), plan ? "Cambiar la imagen del plano" : "Cargar la imagen de un plano (PNG, JPEG…)"),
+    plan ? item({ type: "floorplan" }, plan.name || "Plano", `${fmt(plan.width_m, 1)} × ${fmt(plan.width_m * plan.pixel_height / plan.pixel_width, 1)} m`,
+      el("span", { class: "swatch", style: "background:repeating-linear-gradient(45deg,#fcfcfb 0 2px,#898781 2px 3px)" }), !plan.visible)
+      : el("div", { class: "tree-empty", text: "Ninguno: + para cargar una imagen" }),
+  ));
+  const nMeas = (p.measurements || []).length;
+  container.append(section(
+    head("Mediciones", { type: "measurements" }, nMeas, () => app.pickMeasurementsCsv(), "Importar mediciones desde un CSV"),
+    nMeas ? null : el("div", { class: "tree-empty", text: "Ninguna: importa un CSV o usa la herramienta Medición (N)" }),
+  ));
   container.append(section(
     head("Materiales", null, p.materials.length, () => addMaterial(store), "Añadir material"),
     ...p.materials.map((m) => item({ type: "material", id: m.id }, m.name || m.id, penetrationSummary(m, refFrequency(p)),
@@ -136,14 +148,15 @@ function fieldRow(obj, spec, onCommit) {
     input.addEventListener("change", () => onCommit(spec.key, input.value));
   } else {
     const scale = spec.scale || 1;
-    input = el("input", { type: "number", step: spec.step ?? "any", min: spec.min });
+    input = el("input", { type: "number", step: spec.step ?? "any", min: spec.min, max: spec.max });
     input.value = value === null || value === undefined ? "" : +(value / scale).toPrecision(10);
     if (spec.nullable) input.placeholder = spec.placeholder || "auto";
     input.addEventListener("change", () => {
       const text = input.value.trim();
       if (text === "" && spec.nullable) { onCommit(spec.key, null); return; }
       const number = Number(text);
-      if (text === "" || !isFinite(number) || (spec.min !== undefined && number < spec.min)) {
+      if (text === "" || !isFinite(number) || (spec.min !== undefined && number < spec.min)
+          || (spec.max !== undefined && number > spec.max)) {
         input.value = value === null || value === undefined ? "" : +(value / scale).toPrecision(10);
         input.setCustomValidity("Valor no válido");
         input.reportValidity();
@@ -259,6 +272,28 @@ const MATERIAL_FIELDS = [
   { key: "note", label: "Nota", type: "textarea" },
 ];
 
+
+const PLAN_FIELDS = [
+  { key: "name", label: "Nombre", type: "text" },
+  { key: "visible", label: "Visible", type: "checkbox" },
+  { key: "opacity", label: "Opacidad", min: 0, max: 1, step: 0.05, help: "0 = invisible, 1 = opaco. Las zonas blancas del plano dejan ver el mapa." },
+  { section: "Posición y escala" },
+  { key: "x_m", label: "X (esquina inf. izq.)", unit: "m" },
+  { key: "y_m", label: "Y (esquina inf. izq.)", unit: "m" },
+  { key: "width_m", label: "Ancho", unit: "m", min: 0.001, help: "El alto sale de las proporciones de la imagen" },
+];
+
+const MEASUREMENT_FIELDS = (transmitters) => [
+  { key: "rssi_dbm", label: "Potencia medida", unit: "dBm" },
+  { key: "tx_id", label: "Transmisor", type: "select",
+    options: [["", "El más fuerte (mejor servidor)"], ...transmitters.map((t) => [t.tx_id, t.name || `Tx ${t.tx_id}`])] },
+  { key: "label", label: "Etiqueta", type: "text" },
+  { section: "Posición" },
+  { key: "x", label: "X", unit: "m" },
+  { key: "y", label: "Y", unit: "m" },
+  { key: "z", label: "Altura", unit: "m", min: 0, nullable: true, placeholder: "la del área" },
+];
+
 const PROJECT_FIELDS = [
   { key: "name", label: "Nombre", type: "text" },
   { key: "description", label: "Descripción", type: "textarea" },
@@ -330,6 +365,43 @@ export function renderProperties(container, titleEl, store, app) {
     } else {
       container.append(el("p", { class: "note", text: "Ray tracing de OpenRPS: rayo directo, reflexión en el suelo y rebotes especulares en los muros (uno, o hasta dos), difracción UTD en las aristas (una, o hasta dos por rayo), rayos que combinan un rebote con una difracción y obstrucción por los muros que tapan. Cada rayo tiene a lo más dos interacciones." }));
     }
+  } else if (s.type === "floorplan") {
+    titleEl.textContent = "Plano de fondo";
+    buildForm(container, obj, PLAN_FIELDS, commit((k, v) => { store.project.floor_plan[k] = v; }));
+    const h = obj.width_m * obj.pixel_height / obj.pixel_width;
+    container.append(el("div", { class: "readout", text: `${obj.pixel_width} × ${obj.pixel_height} px · ${fmt(obj.width_m, 2)} × ${fmt(h, 2)} m · ${fmt(100 * obj.width_m / obj.pixel_width, 2)} cm por píxel` }));
+    container.append(el("p", { class: "note", text: "Para escalarlo: marca dos puntos del plano cuya distancia real conozcas (una pared, una cota) y escribe esa distancia. Con el plano seleccionado, arrástralo con la herramienta Seleccionar para moverlo." }));
+    container.append(el("div", { class: "props-actions" },
+      el("button", { class: "btn", text: "Escalar con dos puntos", onclick: () => app.startPlanScale() }),
+      el("button", { class: "btn", text: "Área de predicción = plano", onclick: () => app.fitAreaToPlan() }),
+      el("button", { class: "btn", text: "Cambiar imagen…", onclick: () => app.pickFloorPlan() }),
+      el("button", { class: "btn danger", text: "Quitar", onclick: () => deleteSelection(store) })));
+  } else if (s.type === "measurements") {
+    titleEl.textContent = "Mediciones";
+    const n = obj.length;
+    const named = obj.filter((m) => m.tx_id !== null && m.tx_id !== undefined).length;
+    container.append(el("div", { class: "readout", text: n ? `${n} punto(s) · ${named} con transmisor indicado, ${n - named} comparados con el más fuerte` : "Sin mediciones" }));
+    container.append(el("p", { class: "note", text: "CSV con columnas x, y y la potencia (rssi, dbm, potencia o señal); opcionales: z o altura, tx (id o nombre del transmisor) y una etiqueta. Separador coma, punto y coma o tabulador." }));
+    container.append(el("div", { class: "props-actions" },
+      el("button", { class: "btn", text: "Importar CSV…", onclick: () => app.pickMeasurementsCsv() }),
+      el("button", { class: "btn", text: "Anotar en el mapa (N)", onclick: () => app.setTool("sample") }),
+      n ? el("button", { class: "btn", text: "Comparar y calibrar", onclick: () => app.showMeasurements() }) : null,
+      n ? el("button", { class: "btn danger", text: "Borrar todas", onclick: () => deleteSelection(store) }) : null));
+  } else if (s.type === "measurement") {
+    titleEl.textContent = `Medición ${s.id + 1}`;
+    const view = { ...obj, tx_id: obj.tx_id ?? "" };
+    buildForm(container, view, MEASUREMENT_FIELDS(p.transmitters), commit((k, v) => {
+      store.project.measurements[s.id][k] = k === "tx_id" ? (v === "" ? null : Number(v)) : v;
+    }));
+    const point = measurementResult(store, s.id);
+    if (point) {
+      container.append(el("div", { class: "readout", text: point.status === "ok"
+        ? `Predicho ${fmt(point.predicted_dbm, 1)} dBm · error ${point.error_db >= 0 ? "+" : "−"}${fmt(Math.abs(point.error_db), 1)} dB (predicho − medido)`
+        : `Sin comparación: ${point.status}` }));
+    }
+    container.append(el("div", { class: "props-actions" },
+      el("button", { class: "btn", text: "Centrar en el mapa", onclick: () => app.zoomTo(s) }),
+      el("button", { class: "btn danger", text: "Eliminar", onclick: () => deleteSelection(store) })));
   } else if (s.type === "project") {
     titleEl.textContent = "Proyecto";
     buildForm(container, obj, PROJECT_FIELDS, commit((k, v) => { store.project[k] = v; }));
@@ -396,9 +468,33 @@ function actions(store, app, s, deleteBlocked = null) {
   return row;
 }
 
+// Resultado de la última comparación para la medición k (si sigue vigente)
+export function measurementResult(store, k) {
+  const c = store.comparison;
+  if (!c || c.revision !== store.measurementRevision()) return null;
+  return c.data.points[k] || null;
+}
+
 export function deleteSelection(store) {
   const s = store.selection;
   if (!s) return false;
+  if (s.type === "floorplan") {
+    store.change((p) => { p.floor_plan = null; });
+    store.select(null);
+    return true;
+  }
+  if (s.type === "measurements") {
+    if (!store.project.measurements.length) return false;
+    if (!window.confirm(`¿Borrar las ${store.project.measurements.length} mediciones?`)) return false;
+    store.change((p) => { p.measurements = []; });
+    store.select(null);
+    return true;
+  }
+  if (s.type === "measurement") {
+    store.change((p) => { p.measurements.splice(s.id, 1); });
+    store.select(null);
+    return true;
+  }
   if (s.type === "material") {
     const used = store.project.buildings.some((b) => b.material === s.id) || store.project.walls.some((w) => w.material === s.id);
     if (used) return false;
@@ -451,6 +547,7 @@ export function objectCenter(store, s) {
   if (s.type === "tx") return [obj.x, obj.y];
   if (s.type === "building") return centroid(obj.footprint);
   if (s.type === "wall") return [(obj.start[0] + obj.end[0]) / 2, (obj.start[1] + obj.end[1]) / 2];
+  if (s.type === "measurement") return [obj.x, obj.y];
   return null;
 }
 

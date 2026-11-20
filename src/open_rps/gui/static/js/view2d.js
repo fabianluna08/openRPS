@@ -1,5 +1,5 @@
 // Vista 2D: plano del escenario, editor (transmisores, edificios, muros) y mapa de cobertura.
-import { INK, INK2, MUTED, SURFACE, fmt, niceStep, txColor } from "./colors.js";
+import { INK, INK2, MUTED, SURFACE, fmt, niceStep, rampColor, txColor } from "./colors.js";
 import { currentLayer, imageExtent, pixelAt } from "./coverage.js";
 import { centroid, distToSegment, isSimplePolygon, pointInPolygon, round, snap } from "./geometry.js";
 import { nextId, nextTxId } from "./state.js";
@@ -7,6 +7,7 @@ import { nextId, nextTxId } from "./state.js";
 const HANDLE_PX = 7;
 const TX_HIT_PX = 11;
 const WALL_HIT_PX = 7;
+const SAMPLE_HIT_PX = 8;
 const SNAP_M = 1;
 const SELECT = "#1c5cab";
 
@@ -25,6 +26,7 @@ export class View2D {
     this.drag = null;
     this.draft = null;       // polígono en construcción, o inicio de un muro
     this.measure = null;
+    this.planScale = null;   // primer punto al escalar el plano de fondo
     this.hover = null;       // [x, y] del cursor en metros
     this.spaceDown = false;
     this.pending = false;
@@ -132,6 +134,7 @@ export class View2D {
       ctx.drawImage(layer.image, ix0, iy1, ix1 - ix0, iy0 - iy1);
       ctx.restore();
     }
+    this.drawFloorPlan(p);
     if (v.grid) this.drawGrid(ax0, ax1, ay1, ay0);
     ctx.strokeStyle = INK2;
     ctx.lineWidth = 1;
@@ -139,12 +142,119 @@ export class View2D {
 
     this.drawBuildings(p, !!layer);
     this.drawWalls(p);
+    this.drawMeasurements(p);
     this.drawRays();
     this.drawTransmitters(p);
     this.drawProbe();
     this.drawDraft();
     this.drawMeasure();
+    this.drawPlanScale();
     this.drawScaleBar();
+  }
+
+  // Plano de fondo: en modo "multiply", lo blanco del plano deja ver el mapa y las líneas quedan oscuras
+  planRect(plan) {
+    const h = plan.width_m * plan.pixel_height / plan.pixel_width;
+    const [x0, y0] = this.w2s(plan.x_m, plan.y_m + h);
+    const [x1, y1] = this.w2s(plan.x_m + plan.width_m, plan.y_m);
+    return [x0, y0, x1 - x0, y1 - y0];
+  }
+
+  drawFloorPlan(p) {
+    const plan = p.floor_plan;
+    if (!plan) return;
+    const selected = this.store.isSelected("floorplan", undefined);
+    const img = plan.visible ? this.store.floorPlanImage() : null;
+    const [x, y, w, h] = this.planRect(plan);
+    const ctx = this.ctx;
+    if (img) {
+      ctx.save();
+      ctx.globalAlpha = plan.opacity;
+      ctx.globalCompositeOperation = "multiply";
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(img, x, y, w, h);
+      ctx.restore();
+    }
+    if (selected) {
+      ctx.save();
+      ctx.strokeStyle = SELECT;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(x, y, w, h);
+      ctx.restore();
+    }
+  }
+
+  // Puntos medidos: rombos rellenos con su valor en la escala del mapa (si el mapa es de potencia)
+  drawMeasurements(p) {
+    const ms = p.measurements || [];
+    if (!ms.length) return;
+    const ctx = this.ctx;
+    const layer = currentLayer(this.store);
+    const range = layer && layer.metric === "rx_power" && layer.range ? layer.range : null;
+    const c = this.store.comparison;
+    const points = c && c.revision === this.store.measurementRevision() ? c.data.points : null;
+    ctx.save();
+    ctx.font = "600 10.5px system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    ms.forEach((m, k) => {
+      const [sx, sy] = this.w2s(m.x, m.y);
+      if (sx < -20 || sy < -20 || sx > this.width + 20 || sy > this.height + 20) return;
+      const selected = this.store.isSelected("measurement", k);
+      const r = selected ? 7.5 : 6;
+      const diamond = (q) => {
+        ctx.beginPath();
+        ctx.moveTo(sx, sy - q);
+        ctx.lineTo(sx + q, sy);
+        ctx.lineTo(sx, sy + q);
+        ctx.lineTo(sx - q, sy);
+        ctx.closePath();
+      };
+      diamond(r + 2);                      // halo claro para separarlo del mapa
+      ctx.fillStyle = SURFACE;
+      ctx.fill();
+      diamond(r);
+      ctx.fillStyle = range ? rampColor((m.rssi_dbm - range[0]) / (range[1] - range[0] || 1)) : SURFACE;
+      ctx.fill();
+      ctx.lineWidth = selected ? 2 : 1.2;
+      ctx.strokeStyle = selected ? SELECT : INK;
+      ctx.stroke();
+      const pt = points && points[k];
+      if (this.store.view.labels && pt && pt.status === "ok" && this.scale * 1 > 0) {
+        const e = pt.error_db;
+        haloText(ctx, `${e >= 0 ? "+" : "−"}${fmt(Math.abs(e), 1)}`, sx + r + 3, sy, INK2);
+      }
+    });
+    ctx.restore();
+  }
+
+  drawPlanScale() {
+    const d = this.planScale;
+    if (!d || !this.hover) return;
+    const b = [round(this.hover[0], 3), round(this.hover[1], 3)];
+    const [x0, y0] = this.w2s(...d.a);
+    const [x1, y1] = this.w2s(...b);
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = SELECT;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    this.drawHandle(...d.a);
+    ctx.font = "600 12px system-ui, sans-serif";
+    haloText(ctx, `${fmt(Math.hypot(b[0] - d.a[0], b[1] - d.a[1]), 2)} m en el mapa`, (x0 + x1) / 2 + 8, (y0 + y1) / 2 - 8, INK);
+    ctx.restore();
+  }
+
+  sampleAt(sx, sy) {
+    const ms = this.store.project.measurements || [];
+    for (let k = ms.length - 1; k >= 0; k--) {
+      const [mx, my] = this.w2s(ms[k].x, ms[k].y);
+      if (Math.hypot(mx - sx, my - sy) <= SAMPLE_HIT_PX) return k;
+    }
+    return -1;
   }
 
   drawGrid(ax0, ax1, ay1, ay0) {
@@ -494,6 +604,8 @@ export class View2D {
       const [tx2, ty2] = this.w2s(tx.x, tx.y);
       if (Math.hypot(tx2 - sx, ty2 - sy) <= TX_HIT_PX) return { type: "tx", id: tx.tx_id };
     }
+    const sample = this.sampleAt(sx, sy);
+    if (sample >= 0) return { type: "measurement", id: sample };
     for (let k = p.walls.length - 1; k >= 0; k--) {
       const w = p.walls[k];
       if (distToSegment(x, y, w.start, w.end) * this.scale <= WALL_HIT_PX) return { type: "wall", id: w.id };
@@ -505,6 +617,12 @@ export class View2D {
       for (let i = 0; i < n; i++) {
         if (distToSegment(x, y, b.footprint[i], b.footprint[(i + 1) % n]) * this.scale <= 4) return { type: "building", id: b.id };
       }
+    }
+    // El plano solo se agarra cuando ya está seleccionado (si no, cualquier clic en el mapa lo tomaría)
+    const plan = p.floor_plan;
+    if (plan && this.store.isSelected("floorplan", undefined)) {
+      const [rx, ry, rw, rh] = this.planRect(plan);
+      if (sx >= rx && sx <= rx + rw && sy >= ry && sy <= ry + rh) return { type: "floorplan" };
     }
     return null;
   }
@@ -564,6 +682,16 @@ export class View2D {
     else if (tool === "wall") this.addWallPoint(p);
     else if (tool === "probe") { this.drag = { kind: "probe" }; this.app.setProbe(p); }
     else if (tool === "measure") { this.measure = { a: p, b: p }; this.drag = { kind: "measure" }; }
+    else if (tool === "sample") this.app.addMeasurementAt(p);
+    else if (tool === "plan-scale") {
+      const q = [round(w[0], 3), round(w[1], 3)];          // sin ajuste a la cuadrícula: hace falta precisión
+      if (!this.planScale) this.planScale = { a: q };
+      else {
+        const a = this.planScale.a;
+        this.planScale = null;
+        this.app.finishPlanScale(a, q);
+      }
+    }
     this.request();
   }
 
@@ -681,6 +809,9 @@ export class View2D {
   updateTooltip(s, w) {
     const layer = currentLayer(this.store);
     const tip = this.tooltip;
+    const tool = this.store.view.tool;
+    const sample = tool === "select" || tool === "probe" || tool === "pan" || tool === "sample" ? this.sampleAt(...s) : -1;
+    if (sample >= 0) { this.sampleTooltip(s, sample); return; }
     if (!layer || this.store.view.tool !== "select" && this.store.view.tool !== "probe" && this.store.view.tool !== "pan") {
       tip.hidden = true;
       return;
@@ -722,6 +853,24 @@ export class View2D {
     const th = tip.offsetHeight;
     tip.style.left = `${Math.min(s[0] + 16, box.width - tw - 6)}px`;
     tip.style.top = `${Math.min(s[1] + 16, box.height - th - 6)}px`;
+  }
+
+  sampleTooltip(s, k) {
+    const tip = this.tooltip;
+    const m = this.store.project.measurements[k];
+    const c = this.store.comparison;
+    const pt = c && c.revision === this.store.measurementRevision() ? c.data.points[k] : null;
+    const line = (cls, text) => { const d = document.createElement("div"); d.className = cls; d.textContent = text; return d; };
+    tip.replaceChildren(line("tt-value", `${fmt(m.rssi_dbm, 1)} dBm medidos`),
+      line("tt-label", `Medición ${k + 1}${m.label ? ` · ${m.label}` : ""} · ${m.tx_id === null || m.tx_id === undefined ? "el Tx más fuerte" : this.store.txName(m.tx_id)}`));
+    if (pt && pt.status === "ok") {
+      tip.append(line("tt-label", `Predicho ${fmt(pt.predicted_dbm, 1)} dBm · error ${pt.error_db >= 0 ? "+" : "−"}${fmt(Math.abs(pt.error_db), 1)} dB`));
+    } else if (pt) tip.append(line("tt-label", `Sin comparación: ${pt.status}`));
+    else tip.append(line("tt-label", "Ejecuta la predicción (F5) para compararla"));
+    tip.hidden = false;
+    const box = this.canvas.parentElement.getBoundingClientRect();
+    tip.style.left = `${Math.min(s[0] + 16, box.width - tip.offsetWidth - 6)}px`;
+    tip.style.top = `${Math.min(s[1] + 16, box.height - tip.offsetHeight - 6)}px`;
   }
 
   // ----- creación de objetos
@@ -798,6 +947,7 @@ export class View2D {
   cancelDraft() {
     this.draft = null;
     this.measure = null;
+    this.planScale = null;
     this.drag = null;
     this.app.updateHint();
     this.request();
@@ -820,6 +970,13 @@ function moveObject(proj, hit, orig, dx, dy) {
     const w = proj.walls.find((x) => x.id === hit.id);
     w.start = [round(orig.start[0] + dx, 3), round(orig.start[1] + dy, 3)];
     w.end = [round(orig.end[0] + dx, 3), round(orig.end[1] + dy, 3)];
+  } else if (hit.type === "measurement") {
+    const m = proj.measurements[hit.id];
+    m.x = round(orig.x + dx, 3);
+    m.y = round(orig.y + dy, 3);
+  } else if (hit.type === "floorplan") {
+    proj.floor_plan.x_m = round(orig.x_m + dx, 4);
+    proj.floor_plan.y_m = round(orig.y_m + dy, 4);
   }
 }
 

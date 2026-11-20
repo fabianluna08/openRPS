@@ -32,5 +32,12 @@ from .simulation import (
 from .visualizer import (
     MapVisualizer,
 )
+from .measurements import (
+    Measurement,
+    MeasurementError,
+    read_csv as read_measurements_csv,
+    compare as compare_measurements,
+    calibrate,
+)
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"

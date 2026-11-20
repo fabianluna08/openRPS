@@ -25,6 +25,7 @@ notebook = ["matplotlib", "jupyterlab"]
 [project.scripts]
 open-rps = "open_rps.cli:main"
 open-rps-gui = "open_rps.gui:main"
+open-rps-calibrate = "open_rps.calibrate_cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "open_rps.__version__" }

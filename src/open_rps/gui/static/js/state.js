@@ -23,6 +23,13 @@ export class Store {
     this.redoStack = [];
     this.listeners = {};
     this.log = [];
+    // Imágenes del plano de fondo: fuera del JSON del proyecto (que guarda "image:<n>"), para que el historial
+    // y las peticiones al servidor no copien megabytes en cada cambio
+    this.images = new Map();          // token -> data URL
+    this.imageElements = new Map();   // token -> HTMLImageElement ya cargado
+    this.imageSeq = 0;
+    this.comparison = null;           // {revision, data} de /api/compare
+    this.calibration = null;          // {revision, data} de /api/calibrate
   }
 
   on(event, fn) {
@@ -37,7 +44,9 @@ export class Store {
   setProject(project, { keepHistory = false } = {}) {
     if (keepHistory) this.checkpoint();
     else { this.undoStack = []; this.redoStack = []; }
-    this.project = project;
+    this.project = this.internImages(project);
+    this.comparison = null;
+    this.calibration = null;
     this.revision += 1;
     this.savedRevision = this.revision;
     this.selection = null;
@@ -52,6 +61,53 @@ export class Store {
 
   snapshot() {
     return JSON.stringify(this.project);
+  }
+
+  // ----- plano de fondo
+  internImage(dataUrl) {
+    const token = `image:${++this.imageSeq}`;
+    this.images.set(token, dataUrl);
+    return token;
+  }
+
+  internImages(project) {
+    if (project && !Array.isArray(project.measurements)) project.measurements = [];
+    const plan = project && project.floor_plan;
+    if (plan && typeof plan.image === "string" && plan.image.startsWith("data:")) plan.image = this.internImage(plan.image);
+    return project;
+  }
+
+  // Proyecto completo, con la imagen del plano: para guardar el archivo
+  fullProject() {
+    const p = JSON.parse(this.snapshot());
+    if (p.floor_plan) p.floor_plan.image = this.images.get(p.floor_plan.image) || p.floor_plan.image;
+    else delete p.floor_plan;
+    if (!p.measurements || !p.measurements.length) delete p.measurements;
+    // Sin plano ni mediciones el archivo sigue siendo de la versión 1 (lo abren OpenRPS 1.4 a 1.6)
+    p.version = p.floor_plan || p.measurements ? 2 : 1;
+    return p;
+  }
+
+  // Proyecto para el servidor: el plano solo se dibuja, así que no viaja
+  apiProject() {
+    const p = JSON.parse(this.snapshot());
+    delete p.floor_plan;
+    if (p.measurements && p.measurements.length) p.version = 2;
+    return p;
+  }
+
+  // <img> del plano (null mientras carga; al terminar se avisa con el evento "image")
+  floorPlanImage() {
+    const plan = this.project && this.project.floor_plan;
+    if (!plan) return null;
+    let img = this.imageElements.get(plan.image);
+    if (!img) {
+      img = new Image();
+      img.onload = () => this.emit("image");
+      img.src = this.images.get(plan.image) || plan.image;
+      this.imageElements.set(plan.image, img);
+    }
+    return img.complete && img.naturalWidth ? img : null;
   }
 
   // Guarda el estado actual en el historial (antes de modificarlo)
@@ -105,8 +161,17 @@ export class Store {
 
   autosave() {
     try {
-      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(this.project));
-    } catch (error) { /* almacenamiento no disponible: sin autoguardado */ }
+      localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(this.fullProject()));
+    } catch (error) {
+      // Sin espacio (un plano grande no cabe en el almacenamiento del navegador): se guarda sin él
+      try {
+        localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(this.apiProject()));
+        if (this.project.floor_plan && !this.warnedPlanAutosave) {
+          this.warnedPlanAutosave = true;
+          this.addLog("warn", "El plano de fondo es demasiado grande para el autoguardado del navegador: guarda el proyecto (Ctrl+S) para no perderlo.");
+        }
+      } catch (error2) { /* almacenamiento no disponible: sin autoguardado */ }
+    }
   }
 
   static restore() {
@@ -118,8 +183,26 @@ export class Store {
     }
   }
 
+  // Lo que usa la simulación (sin plano, mediciones, nombre ni descripción): si no cambia, el resultado sigue vigente
+  simulationKey() {
+    if (this.simKeyRevision !== this.revision) {
+      const p = JSON.parse(this.snapshot());
+      for (const key of ["floor_plan", "measurements", "name", "description", "version"]) delete p[key];
+      this.simKey = JSON.stringify(p);
+      this.measKey = `${this.simKey}|${JSON.stringify(this.project.measurements || [])}`;
+      this.simKeyRevision = this.revision;
+    }
+    return this.simKey;
+  }
+
+  // Vigencia de una comparación o calibración: la simulación y las mediciones
+  measurementRevision() {
+    this.simulationKey();
+    return this.measKey;
+  }
+
   get outdated() {
-    return !!this.result && this.result.revision !== this.revision;
+    return !!this.result && this.result.simKey !== this.simulationKey();
   }
 
   get modified() {
@@ -146,6 +229,9 @@ export class Store {
     if (s.type === "area") return this.project.area;
     if (s.type === "settings") return this.project.settings;
     if (s.type === "project") return this.project;
+    if (s.type === "floorplan") return this.project.floor_plan || null;
+    if (s.type === "measurements") return this.project.measurements;
+    if (s.type === "measurement") return (this.project.measurements || [])[s.id] || null;
     return null;
   }
 

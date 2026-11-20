@@ -1,7 +1,7 @@
 // Vista 3D (three.js): edificios extruidos, muros, antenas, mapa de cobertura (opcionalmente en relieve)
 // y los rayos hasta el receptor de prueba.  El eje z apunta hacia arriba, como en el motor.
 import * as THREE from "../vendor/three.bundle.min.js";
-import { MUTED, txColor } from "./colors.js";
+import { MUTED, rampColor, txColor } from "./colors.js";
 import { currentLayer, imageExtent } from "./coverage.js";
 import { numberOf } from "./view2d.js";
 
@@ -203,6 +203,23 @@ export class View3D {
         this.sceneGroup.add(label);
       }
     });
+    // Mediciones: un rombo (octaedro) a la altura medida, con su valor en la escala del mapa si es de potencia
+    const ms = p.measurements || [];
+    if (ms.length) {
+      const layer = currentLayer(this.store);
+      const range = layer && layer.metric === "rx_power" && layer.range ? layer.range : null;
+      const geom = new THREE.OctahedronGeometry(r * 0.7);
+      ms.forEach((m, k) => {
+        const z = m.z === null || m.z === undefined ? p.area.rx_height_m : m.z;
+        const color = range ? rampColor((m.rssi_dbm - range[0]) / (range[1] - range[0] || 1)) : "#fcfcfb";
+        const mesh = new THREE.Mesh(geom, new THREE.MeshLambertMaterial({ color: new THREE.Color(color) }));
+        mesh.position.set(m.x, m.y, z + r * 0.7);
+        const outline = new THREE.LineSegments(new THREE.EdgesGeometry(geom), new THREE.LineBasicMaterial({
+          color: this.store.isSelected("measurement", k) ? SELECT : 0x0b0b0b }));
+        outline.position.copy(mesh.position);
+        this.sceneGroup.add(mesh, outline);
+      });
+    }
     this.updateGround(true);
     this.updateRays();
     this.requestRender();
@@ -214,7 +231,10 @@ export class View3D {
     const v = this.store.view;
     // The layer is compared by identity: currentLayer() makes a new one whenever the result, the metric, the
     // transmitter or the scale change (a canvas in a joined string would always read "[object ...]")
-    const key = [v.relief, v.opacity, this.store.outdated, v.smooth, JSON.stringify(this.store.project.area)].join("|");
+    const plan = this.store.project.floor_plan;
+    const planImage = plan && plan.visible ? this.store.floorPlanImage() : null;
+    const key = [v.relief, v.opacity, this.store.outdated, v.smooth, JSON.stringify(this.store.project.area),
+      planImage ? [plan.image, plan.x_m, plan.y_m, plan.width_m, plan.opacity].join(",") : ""].join("|");
     if (!force && layer === this.layerRef && key === this.layerKey && this.groundGroup.children.length) return;
     this.layerKey = key;
     this.layerRef = layer;
@@ -228,6 +248,17 @@ export class View3D {
       new THREE.MeshLambertMaterial({ color: 0xf4f3ef }));
     area.position.set(cx, cy, -0.02);
     this.groundGroup.add(area);
+    if (planImage) {
+      // Plano de fondo sobre el suelo (z = 0), bajo el mapa de cobertura (que está a la altura del receptor)
+      const h = plan.width_m * plan.pixel_height / plan.pixel_width;
+      const texture = new THREE.Texture(planImage);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.needsUpdate = true;
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(plan.width_m, h), new THREE.MeshBasicMaterial({
+        map: texture, transparent: true, opacity: plan.opacity, depthWrite: false }));
+      mesh.position.set(plan.x_m + plan.width_m / 2, plan.y_m + h / 2, -0.005);
+      this.groundGroup.add(mesh);
+    }
     const z = a.rx_height_m;
     if (layer) {
       const texture = new THREE.CanvasTexture(layer.image);
